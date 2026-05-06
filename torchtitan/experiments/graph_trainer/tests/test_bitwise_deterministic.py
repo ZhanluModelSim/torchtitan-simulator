@@ -231,6 +231,7 @@ class BitwiseDeterministicBase(unittest.TestCase):
                     memory_policy="default",
                     inductor_compilation="regional",
                     numerics_changing_optim=False,
+                    enable_fsdp_ag_rs_overlap=False,
                     cpu_offload_prefetch_n_layers=1,
                     cpu_offload_defer_n_layers=1,
                     cpu_offload_budget_gb=100.0,
