@@ -31,6 +31,7 @@ from torchtitan.protocols.sharding import (
     NamedPlacement,
     ShardingConfig,
 )
+from torchtitan.protocols.types import MeshAxisName
 
 
 @contextmanager
@@ -58,9 +59,15 @@ def named_placement_to_spmd(named: NamedPlacement) -> NamedPlacement:
     mesh_names = spmd.current_mesh_names()
     if mesh_names is None:
         return dict(named)
+    resolved = dict(named)
+    if MeshAxisName.DP in resolved and MeshAxisName.DP not in mesh_names:
+        dp_value = resolved.pop(MeshAxisName.DP)
+        for axis_name in (MeshAxisName.DP_REPLICATE, MeshAxisName.DP_SHARD):
+            if axis_name in mesh_names:
+                resolved[axis_name] = dp_value
     return {
         axis_name: value
-        for axis_name, value in named.items()
+        for axis_name, value in resolved.items()
         if axis_name in mesh_names
     }
 
@@ -393,6 +400,7 @@ class Module(nn.Module, Configurable):
 
         SPMD values → physical TP shard (if applicable) + ``spmd.assert_type``.
         """
+        named_placement = named_placement_to_spmd(named_placement)
         # Validate and collect shards. Values must be raw per-axis types.
         shard_dims: dict[int, str] = {}
         for axis_name, value in named_placement.items():
