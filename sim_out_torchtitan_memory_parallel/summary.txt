@@ -1,0 +1,92 @@
+
+========================================================================
+  Compute Graph Summary
+========================================================================
+  Total ops : 262
+  Total edges: 243
+    comm_collective       : 14
+    compute               : 230
+    data_move             : 2
+    memory                : 16
+
+  By phase:
+    forward               : 4
+    step0_backward        : 74
+    step0_forward         : 40
+    step0_optimizer       : 17
+    step1_backward        : 74
+    step1_forward         : 40
+    step1_optimizer       : 13
+
+========================================================================
+  Communication Events
+========================================================================
+  Total comm events: 12
+    all_gather_into_tensor: 4
+    all_reduce            : 6
+    reduce_scatter_tensor : 2
+
+========================================================================
+  FSDP Events
+========================================================================
+  Total FSDP events: 0
+
+========================================================================
+  PP Events
+========================================================================
+  Total PP events: 0
+
+========================================================================
+  Training Schedule
+========================================================================
+  Total schedule events: 256
+  Total schedule deps  : 472
+    rank: all
+    has_pp: True
+    has_fsdp: True
+    has_tp: True
+    has_dp: True
+    dependency_model: monotonic semantic PP/FSDP2/TP/DP schedule over 8 logical ranks
+
+========================================================================
+  Memory Estimate
+========================================================================
+  Total memory events: 275
+  peak_live_bytes: 2.7 MiB
+  graph_peak_live_bytes: 2.7 MiB
+  parameter_bytes: 1.1 MiB
+  gradient_bytes: 1.1 MiB
+  optimizer_state_bytes: 2.2 MiB
+  model_state_total_bytes: 4.3 MiB
+  total_event_bytes: 22.3 MiB
+  by_category:
+    activation              : 18.0 MiB
+    allocation              : 5.5 KiB
+    comm_buffer             : 512 B
+    data_move               : 512 B
+    gradient                : 1.1 MiB
+    optimizer_state         : 2.2 MiB
+    parameter               : 1.1 MiB
+  by_phase:
+    backward                : 1.1 MiB
+    forward                 : 1.0 KiB
+    model_state             : 1.1 MiB
+    optimizer               : 2.2 MiB
+    step0_backward          : 5.6 MiB
+    step0_forward           : 2.3 MiB
+    step0_optimizer         : 1.1 MiB
+    step1_backward          : 5.6 MiB
+    step1_forward           : 2.3 MiB
+    step1_optimizer         : 1.1 MiB
+  by_device:
+    cpu                     : 19.1 MiB
+    unknown                 : 3.3 MiB
+
+========================================================================
+  Metadata
+========================================================================
+  mode: simulation
+  trace_kind: torchtitan_cpu_parallel_memory_demo
+  parallelism: {'pipeline_parallel_degree': 2, 'tensor_parallel_degree': 2, 'data_parallel_shard_degree': 2, 'data_parallel_replicate_degree': 1, 'fsdp_version': 'FSDP2 semantic schedule', 'num_train_steps': 2, 'num_microbatches': 2}
+  native_torchtitan_attempt: {'status': 'blocked_in_current_cpu_env', 'reason': 'torchtitan.train fake_backend reached DTensor RNG device_count()==0 on CPU-only host'}
+  memory: {'total_event_bytes': 23398856, 'by_category': {'activation': 18831296, 'allocation': 5640, 'comm_buffer': 512, 'data_move': 512, 'gradient': 1140224, 'optimizer_state': 2280448, 'parameter': 1140224}, 'by_phase': {'backward': 1140224, 'forward': 1024, 'model_state': 1140224, 'optimizer': 2280448, 'step0_backward': 5847764, 'step0_forward': 2429968, 'step0_optimizer': 1141248, 'step1_backward': 5847764, 'step1_forward': 2429968, 'step1_optimizer': 1140224}, 'by_device': {'cpu': 19978184, 'unknown': 3420672}, 'peak_live_bytes': 2865972, 'graph_peak_live_bytes': 2865972, 'parameter_bytes': 1140224, 'gradient_bytes': 1140224, 'optimizer_state_bytes': 2280448, 'model_state_total_bytes': 4560896}
