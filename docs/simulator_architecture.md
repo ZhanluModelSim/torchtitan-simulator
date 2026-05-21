@@ -80,8 +80,15 @@ Memory tracing is deterministic and decomposable rather than allocator-exact:
 The exported `metadata["memory"]` summary groups bytes by category, phase, and
 device, and keeps top-level fields such as `peak_live_bytes`,
 `parameter_bytes`, `gradient_bytes`, `optimizer_state_bytes`, and
-`model_state_total_bytes`. `trace.html` shows memory cards and the raw memory
-summary, while `summary.txt` includes a human-readable memory section.
+`model_state_total_bytes`. `trace.html` shows memory cards, a memory trace
+timeline, top memory-event details, and the raw memory summary, while
+`summary.txt` includes a human-readable memory section.
+
+The HTML memory timeline renders lifetimed activation/communication/data-move
+events as stacked live bytes over graph node order. Events without graph
+lifetimes, such as model parameters, gradients, and optimizer state, are shown
+as a steady resident baseline so memory can be inspected both temporally and by
+category.
 
 This model is intended for planning and comparison in CPU-only environments. It
 does not replace real CUDA/NPU allocator telemetry, and it intentionally avoids
@@ -96,6 +103,7 @@ HTML5 canvas rendering for:
 - train-step hierarchy,
 - scrollable/zoomable PP/FSDP2/TP/DP schedule swimlanes,
 - rank/strategy tabs,
+- scrollable/zoomable memory timeline and event breakdown,
 - left-to-right operator dependency DAGs.
 
 The page does not rely on external CDNs, which makes it portable across offline

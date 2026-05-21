@@ -512,7 +512,15 @@ class TestExport(unittest.TestCase):
                     bytes=32,
                     node_id="n1",
                     phase="forward",
-                )
+                    lifetime_start=0,
+                    lifetime_end=1,
+                ),
+                MemoryEvent(
+                    event_id="mem_2",
+                    category="parameter",
+                    bytes=64,
+                    phase="model_state",
+                ),
             ],
             metadata={
                 "mode": "test",
@@ -594,6 +602,10 @@ class TestExport(unittest.TestCase):
             assert "PP rank" in content
             assert "Estimated live memory peak" in content
             assert "Memory estimate summary" in content
+            assert "Memory trace timeline and event breakdown" in content
+            assert "memory-chart" in content
+            assert "drawMemoryTrace" in content
+            assert "memory-events-body" in content
 
 
 class TestTrainerRunnerExtensionHooks(unittest.TestCase):

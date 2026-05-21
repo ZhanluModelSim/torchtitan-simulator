@@ -382,6 +382,47 @@ def _render_operator_dag_canvas(
     """
 
 
+def _render_memory_trace_canvas(result: SimulationResult) -> str:
+    if not result.memory_events:
+        return '<p class="muted">No memory events captured.</p>'
+    lifetimed = sum(
+        1
+        for event in result.memory_events
+        if event.lifetime_start is not None and event.lifetime_end is not None
+    )
+    return f"""
+    <p class="muted">
+      Memory trace uses tensor lifetime estimates from producer/consumer order.
+      Events without explicit lifetimes, such as parameters, gradients, and
+      optimizer state, are rendered as a steady resident baseline.
+    </p>
+    <div class="chart-toolbar" data-target="memory-trace">
+      <button type="button" data-action="zoom-in">Zoom in</button>
+      <button type="button" data-action="zoom-out">Zoom out</button>
+      <button type="button" data-action="reset">Reset</button>
+      <span class="muted chart-note">{lifetimed} lifetimed events, {len(result.memory_events)} total memory events.</span>
+    </div>
+    <div class="chart-frame">
+      <canvas id="memory-trace" class="trace-chart memory-chart"></canvas>
+    </div>
+    <div class="memory-table-wrap">
+      <table class="memory-table">
+        <thead>
+          <tr>
+            <th>Event</th>
+            <th>Category</th>
+            <th>Phase</th>
+            <th>Bytes</th>
+            <th>Lifetime</th>
+            <th>Node</th>
+          </tr>
+        </thead>
+        <tbody id="memory-events-body"></tbody>
+      </table>
+    </div>
+    """
+
+
 def export_html(
     result: SimulationResult,
     path: str | os.PathLike,
@@ -472,6 +513,11 @@ def export_html(
     .chart-frame {{ overflow:auto; max-width:100%; border:1px solid var(--border); border-radius:10px; background:#f8fafc; cursor:grab; }}
     .chart-frame.dragging {{ cursor:grabbing; }}
     canvas.trace-chart {{ display:block; background:#f8fafc; }}
+    .memory-table-wrap {{ overflow:auto; margin-top:12px; border:1px solid var(--border); border-radius:10px; }}
+    .memory-table {{ width:100%; border-collapse:collapse; min-width:760px; background:#020617; }}
+    .memory-table th, .memory-table td {{ padding:8px 10px; border-bottom:1px solid #1e293b; text-align:left; font-size:12px; }}
+    .memory-table th {{ color:#bfdbfe; background:#0f172a; position:sticky; top:0; }}
+    .memory-table td {{ color:#d1d5db; }}
     pre {{ white-space:pre-wrap; color:#d1d5db; background:#020617; padding:12px; border-radius:8px; overflow:auto; }}
   </style>
 </head>
@@ -489,6 +535,10 @@ def export_html(
       <div class="card"><div class="num">{escape(_format_bytes(peak_memory))}</div><div>Estimated live memory peak</div></div>
       <div class="card"><div class="num">{len(result.memory_events)}</div><div>Memory events</div></div>
     </section>
+    <details open>
+      <summary>Memory trace timeline and event breakdown</summary>
+      {_render_memory_trace_canvas(result)}
+    </details>
     {step_sections}
     <details>
       <summary>Raw graph summary</summary>
@@ -524,6 +574,30 @@ def export_html(
       edge: '#94a3b8',
       explicit: '#dc2626',
     }};
+    const memoryPalette = {{
+      activation: '#60a5fa',
+      allocation: '#c084fc',
+      comm_buffer: '#f59e0b',
+      comm_event_buffer: '#fbbf24',
+      data_move: '#34d399',
+      parameter: '#22c55e',
+      gradient: '#fb7185',
+      optimizer_state: '#a78bfa',
+      unknown: '#94a3b8',
+    }};
+
+    function formatBytes(bytes) {{
+      if (bytes === null || bytes === undefined || Number.isNaN(Number(bytes))) return 'n/a';
+      let value = Number(bytes);
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      for (const unit of units) {{
+        if (Math.abs(value) < 1024 || unit === 'TiB') {{
+          return unit === 'B' ? Math.round(value) + ' B' : value.toFixed(1) + ' ' + unit;
+        }}
+        value /= 1024;
+      }}
+      return value.toFixed(1) + ' TiB';
+    }}
 
     function shortName(name, maxLen = 42) {{
       const cleaned = String(name || '').replace('aten.', '').replace('.default', '');
@@ -851,8 +925,198 @@ def export_html(
       }}
     }}
 
+    function memoryEvents() {{
+      return TRACE.memory_events || [];
+    }}
+
+    function memoryCategoryColor(category) {{
+      return memoryPalette[category] || memoryPalette.unknown;
+    }}
+
+    function memoryLifetimeLabel(event) {{
+      const start = event.lifetime_start;
+      const end = event.lifetime_end;
+      if (start === null || start === undefined || end === null || end === undefined) return 'resident';
+      return String(start) + ' → ' + String(end);
+    }}
+
+    function memoryCategories(events) {{
+      const preferred = [
+        'parameter',
+        'optimizer_state',
+        'gradient',
+        'activation',
+        'allocation',
+        'data_move',
+        'comm_buffer',
+        'comm_event_buffer',
+      ];
+      const present = new Set(events.map((event) => event.category || 'unknown'));
+      const ordered = preferred.filter((category) => present.has(category));
+      for (const category of Array.from(present).sort()) {{
+        if (!ordered.includes(category)) ordered.push(category);
+      }}
+      return ordered;
+    }}
+
+    function buildMemorySamples(events) {{
+      const lifetimed = events.filter((event) =>
+        event.lifetime_start !== null && event.lifetime_start !== undefined &&
+        event.lifetime_end !== null && event.lifetime_end !== undefined
+      );
+      const resident = events.filter((event) =>
+        event.lifetime_start === null || event.lifetime_start === undefined ||
+        event.lifetime_end === null || event.lifetime_end === undefined
+      );
+      const categories = memoryCategories(events);
+      const maxIndex = Math.max(0, ...lifetimed.map((event) => Number(event.lifetime_end || 0)));
+      const residentByCategory = new Map(categories.map((category) => [category, 0]));
+      for (const event of resident) {{
+        const category = event.category || 'unknown';
+        residentByCategory.set(category, (residentByCategory.get(category) || 0) + Number(event.bytes || 0));
+      }}
+
+      const samples = [];
+      let peak = 0;
+      for (let idx = 0; idx <= maxIndex; idx++) {{
+        const byCategory = new Map(residentByCategory);
+        for (const event of lifetimed) {{
+          const start = Number(event.lifetime_start);
+          const end = Number(event.lifetime_end);
+          if (idx < start || idx > end) continue;
+          const category = event.category || 'unknown';
+          byCategory.set(category, (byCategory.get(category) || 0) + Number(event.bytes || 0));
+        }}
+        const total = Array.from(byCategory.values()).reduce((acc, value) => acc + value, 0);
+        peak = Math.max(peak, total);
+        samples.push({{idx, byCategory, total}});
+      }}
+      return {{samples, categories, peak, residentTotal: Array.from(residentByCategory.values()).reduce((acc, value) => acc + value, 0)}};
+    }}
+
+    function drawMemoryTrace(canvas) {{
+      const state = chartState.get(canvas) || {{zoom: 1}};
+      chartState.set(canvas, state);
+      const events = memoryEvents();
+      const {{samples, categories, peak, residentTotal}} = buildMemorySamples(events);
+      const scale = 14 * state.zoom;
+      const plotLeft = 90;
+      const plotTop = 38;
+      const plotHeight = 250;
+      const legendTop = plotTop + plotHeight + 42;
+      const width = Math.max(980, plotLeft + 90 + Math.max(1, samples.length) * scale);
+      const height = 390;
+      const ctx = resizeCanvas(canvas, width, height);
+      ctx.clearRect(0, 0, width, height);
+      ctx.font = '12px ui-sans-serif, system-ui, sans-serif';
+      ctx.textBaseline = 'middle';
+
+      const note = document.querySelector('.chart-toolbar[data-target="' + canvas.id + '"] .chart-note');
+      if (note) {{
+        const lifetimedCount = events.filter((event) =>
+          event.lifetime_start !== null && event.lifetime_start !== undefined &&
+          event.lifetime_end !== null && event.lifetime_end !== undefined
+        ).length;
+        note.textContent = lifetimedCount + ' lifetimed events, ' + events.length +
+          ' total. Estimated total peak including resident baseline: ' + formatBytes(peak) +
+          ' (resident baseline ' + formatBytes(residentTotal) + ').';
+      }}
+
+      ctx.fillStyle = '#0f172a';
+      ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText('Estimated live memory by operator order', plotLeft, 18);
+      ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillStyle = '#475569';
+      ctx.fillText('x: graph node order, y: bytes. Resident model-state estimates are drawn as a baseline.', plotLeft, 34);
+
+      ctx.strokeStyle = '#94a3b8';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(plotLeft, plotTop);
+      ctx.lineTo(plotLeft, plotTop + plotHeight);
+      ctx.lineTo(width - 36, plotTop + plotHeight);
+      ctx.stroke();
+
+      const safePeak = Math.max(1, peak);
+      for (let tick = 0; tick <= 4; tick++) {{
+        const value = safePeak * tick / 4;
+        const y = plotTop + plotHeight - (value / safePeak) * plotHeight;
+        ctx.strokeStyle = tick === 0 ? '#94a3b8' : '#e2e8f0';
+        ctx.beginPath();
+        ctx.moveTo(plotLeft, y);
+        ctx.lineTo(width - 36, y);
+        ctx.stroke();
+        ctx.fillStyle = '#334155';
+        ctx.fillText(formatBytes(value), 8, y);
+      }}
+
+      for (const sample of samples) {{
+        let yTop = plotTop + plotHeight;
+        const x = plotLeft + sample.idx * scale;
+        const barW = Math.max(2, scale - 1);
+        for (const category of categories) {{
+          const bytes = sample.byCategory.get(category) || 0;
+          if (bytes <= 0) continue;
+          const h = bytes / safePeak * plotHeight;
+          yTop -= h;
+          ctx.fillStyle = memoryCategoryColor(category);
+          ctx.fillRect(x, yTop, barW, h);
+        }}
+      }}
+
+      ctx.fillStyle = '#334155';
+      ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
+      const maxIdx = Math.max(0, samples.length - 1);
+      for (const idx of [0, Math.floor(maxIdx / 2), maxIdx]) {{
+        const x = plotLeft + idx * scale;
+        ctx.fillText(String(idx), x, plotTop + plotHeight + 18);
+      }}
+
+      let legendX = plotLeft;
+      let legendY = legendTop;
+      for (const category of categories) {{
+        if (legendX > width - 220) {{
+          legendX = plotLeft;
+          legendY += 22;
+        }}
+        ctx.fillStyle = memoryCategoryColor(category);
+        ctx.fillRect(legendX, legendY - 6, 12, 12);
+        ctx.fillStyle = '#0f172a';
+        ctx.fillText(category, legendX + 18, legendY);
+        legendX += 150;
+      }}
+    }}
+
+    function populateMemoryTable() {{
+      const body = document.getElementById('memory-events-body');
+      if (!body) return;
+      body.textContent = '';
+      const events = memoryEvents()
+        .slice()
+        .sort((a, b) => Number(b.bytes || 0) - Number(a.bytes || 0))
+        .slice(0, 120);
+      for (const event of events) {{
+        const row = document.createElement('tr');
+        const values = [
+          event.event_id || '',
+          event.category || 'unknown',
+          event.phase || 'unknown',
+          formatBytes(event.bytes || 0),
+          memoryLifetimeLabel(event),
+          event.node_id || '',
+        ];
+        for (const value of values) {{
+          const cell = document.createElement('td');
+          cell.textContent = value;
+          row.appendChild(cell);
+        }}
+        body.appendChild(row);
+      }}
+    }}
+
     function redraw(canvas) {{
       if (canvas.classList.contains('schedule-chart')) drawSchedule(canvas);
+      else if (canvas.classList.contains('memory-chart')) drawMemoryTrace(canvas);
       else drawDag(canvas);
     }}
 
@@ -886,6 +1150,7 @@ def export_html(
     }}
 
     document.querySelectorAll('canvas.trace-chart').forEach(installChart);
+    populateMemoryTable();
     document.querySelectorAll('.chart-toolbar button').forEach((button) => {{
       button.addEventListener('click', () => {{
         const toolbar = button.closest('.chart-toolbar');
