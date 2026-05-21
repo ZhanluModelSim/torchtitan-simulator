@@ -95,10 +95,23 @@ class TestComputeGraph(unittest.TestCase):
 
 class TestSimulationResultSave(unittest.TestCase):
     def test_save_json(self):
-        from torchtitan.experiments.simulator.nodes import ComputeGraph, SimulationResult
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            MemoryEvent,
+            SimulationResult,
+        )
 
         result = SimulationResult(
             compute_graph=ComputeGraph(),
+            memory_events=[
+                MemoryEvent(
+                    event_id="mem_1",
+                    category="activation",
+                    bytes=128,
+                    node_id="n1",
+                    phase="forward",
+                )
+            ],
             metadata={"test": True},
         )
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -108,6 +121,65 @@ class TestSimulationResultSave(unittest.TestCase):
             with open(path) as f:
                 data = json.load(f)
             assert "metadata" in data
+            assert data["memory_events"][0]["bytes"] == 128
+
+
+class TestMemoryEstimator(unittest.TestCase):
+    def test_tensor_nbytes_and_graph_peak(self):
+        from torchtitan.experiments.simulator.memory_estimator import (
+            estimate_graph_memory,
+            tensor_nbytes,
+        )
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            TensorMeta,
+        )
+
+        assert tensor_nbytes(TensorMeta((2, 4), "torch.float32", "cpu")) == 32
+
+        graph = ComputeGraph()
+        graph.add_node(
+            OpNode(
+                "n1",
+                "aten.mm.default",
+                "compute",
+                "forward",
+                [],
+                [TensorMeta((2, 4), "torch.float32", "cpu")],
+            )
+        )
+        graph.add_node(
+            OpNode(
+                "n2",
+                "aten.relu.default",
+                "compute",
+                "forward",
+                [],
+                [TensorMeta((2, 4), "torch.float32", "cpu")],
+            )
+        )
+        graph.add_edge(DataEdge("n1", "n2", "data"))
+
+        events, summary = estimate_graph_memory(graph)
+        assert len(events) == 2
+        assert summary["by_category"]["activation"] == 64
+        assert summary["peak_live_bytes"] >= 32
+
+    def test_model_state_memory(self):
+        from torchtitan.experiments.simulator.memory_estimator import (
+            estimate_model_state_memory,
+        )
+
+        model = nn.Linear(4, 2)
+        param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        events, summary = estimate_model_state_memory([model], optimizer_name="AdamW")
+
+        assert len(events) == 4
+        assert summary["parameter_bytes"] == param_bytes
+        assert summary["gradient_bytes"] == param_bytes
+        assert summary["optimizer_state_bytes"] == 2 * param_bytes
 
 
 # ===========================================================================
@@ -411,6 +483,7 @@ class TestExport(unittest.TestCase):
         from torchtitan.experiments.simulator.nodes import (
             ComputeGraph,
             DataEdge,
+            MemoryEvent,
             OpNode,
             SimulationResult,
             TensorMeta,
@@ -432,7 +505,22 @@ class TestExport(unittest.TestCase):
         return SimulationResult(
             compute_graph=g,
             comm_events=[{"op": "all_reduce", "phase": "forward"}],
-            metadata={"mode": "test"},
+            memory_events=[
+                MemoryEvent(
+                    event_id="mem_1",
+                    category="activation",
+                    bytes=32,
+                    node_id="n1",
+                    phase="forward",
+                )
+            ],
+            metadata={
+                "mode": "test",
+                "memory": {
+                    "peak_live_bytes": 32,
+                    "by_category": {"activation": 32},
+                },
+            },
         )
 
     def test_export_json(self):
@@ -480,6 +568,8 @@ class TestExport(unittest.TestCase):
         summary = export_text_summary(result)
         assert "Compute Graph Summary" in summary
         assert "Communication Events" in summary
+        assert "Memory Estimate" in summary
+        assert "activation" in summary
         assert "Total ops" in summary
 
     def test_export_html(self):
@@ -502,6 +592,8 @@ class TestExport(unittest.TestCase):
             assert "rank-tabs" in content
             assert "Global rank" in content
             assert "PP rank" in content
+            assert "Estimated live memory peak" in content
+            assert "Memory estimate summary" in content
 
 
 class TestTrainerRunnerExtensionHooks(unittest.TestCase):

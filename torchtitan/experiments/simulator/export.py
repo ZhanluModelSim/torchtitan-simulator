@@ -254,6 +254,17 @@ def _json_script_payload(result: SimulationResult) -> str:
     return escape(json.dumps(result.to_dict(), default=str), quote=False)
 
 
+def _format_bytes(num_bytes: int | float | None) -> str:
+    if num_bytes is None:
+        return "n/a"
+    value = float(num_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024.0 or unit == "TiB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
 def _event_lane(ev: dict[str, Any]) -> str:
     event_type = str(ev.get("event_type", ""))
     metadata = ev.get("metadata", {}) or {}
@@ -394,6 +405,10 @@ def export_html(
     if not phases:
         phases = ["unknown"]
     graph_summary = result.compute_graph.summary()
+    memory_summary = result.metadata.get("memory", {}) or {}
+    peak_memory = memory_summary.get(
+        "peak_live_bytes", memory_summary.get("graph_peak_live_bytes", 0)
+    )
     data_payload = _json_script_payload(result)
     steps = sorted({_event_step(ev) for ev in schedule_events}) or [0]
 
@@ -471,11 +486,17 @@ def export_html(
       <div class="card"><div class="num">{len(result.compute_graph.edges)}</div><div>Graph edges</div></div>
       <div class="card"><div class="num">{len(schedule_events)}</div><div>Schedule events</div></div>
       <div class="card"><div class="num">{len(result.comm_events)}</div><div>Communication events</div></div>
+      <div class="card"><div class="num">{escape(_format_bytes(peak_memory))}</div><div>Estimated live memory peak</div></div>
+      <div class="card"><div class="num">{len(result.memory_events)}</div><div>Memory events</div></div>
     </section>
     {step_sections}
     <details>
       <summary>Raw graph summary</summary>
       <pre>{escape(json.dumps(graph_summary, indent=2, default=str))}</pre>
+    </details>
+    <details open>
+      <summary>Memory estimate summary</summary>
+      <pre>{escape(json.dumps(memory_summary, indent=2, default=str))}</pre>
     </details>
     <details>
       <summary>Embedded JSON trace payload</summary>
@@ -970,6 +991,28 @@ def export_text_summary(result: SimulationResult) -> str:
         if sched.metadata:
             for k, v in sched.metadata.items():
                 lines.append(f"    {k}: {v}")
+
+    section("Memory Estimate")
+    memory = result.metadata.get("memory", {}) or {}
+    lines.append(f"  Total memory events: {len(result.memory_events)}")
+    if memory:
+        for key in (
+            "peak_live_bytes",
+            "graph_peak_live_bytes",
+            "parameter_bytes",
+            "gradient_bytes",
+            "optimizer_state_bytes",
+            "model_state_total_bytes",
+            "total_event_bytes",
+        ):
+            if key in memory:
+                lines.append(f"  {key}: {_format_bytes(memory[key])}")
+        for group_key in ("by_category", "by_phase", "by_device"):
+            group = memory.get(group_key)
+            if group:
+                lines.append(f"  {group_key}:")
+                for name, value in sorted(group.items()):
+                    lines.append(f"    {name:<24}: {_format_bytes(value)}")
 
     section("Metadata")
     for k, v in result.metadata.items():

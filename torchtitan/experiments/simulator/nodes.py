@@ -241,6 +241,44 @@ class TrainingSchedule:
 
 
 @dataclass
+class MemoryEvent:
+    """
+    A memory allocation or residency estimate.
+
+    ``bytes`` is an estimate, not a device allocator measurement. Events can be
+    produced from runtime tensor metadata, model parameters, communication
+    buffers, or backend-specific semantic annotations.
+    """
+
+    event_id: str
+    category: str
+    bytes: int
+    phase: str = "unknown"
+    device: str = "unknown"
+    dtype: str | None = None
+    shape: tuple[int, ...] | None = None
+    node_id: str | None = None
+    lifetime_start: int | None = None
+    lifetime_end: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "category": self.category,
+            "bytes": self.bytes,
+            "phase": self.phase,
+            "device": self.device,
+            "dtype": self.dtype,
+            "shape": list(self.shape) if self.shape is not None else None,
+            "node_id": self.node_id,
+            "lifetime_start": self.lifetime_start,
+            "lifetime_end": self.lifetime_end,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
 class SimulationResult:
     """Aggregated results from one simulation run."""
 
@@ -250,6 +288,7 @@ class SimulationResult:
     comm_events: list[dict[str, Any]] = field(default_factory=list)
     fsdp_events: list[dict[str, Any]] = field(default_factory=list)
     pp_events: list[dict[str, Any]] = field(default_factory=list)
+    memory_events: list[MemoryEvent] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -260,6 +299,7 @@ class SimulationResult:
             "comm_events": self.comm_events,
             "fsdp_events": self.fsdp_events,
             "pp_events": self.pp_events,
+            "memory_events": [e.to_dict() for e in self.memory_events],
         }
 
     def save_json(self, path: str) -> None:

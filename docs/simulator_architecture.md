@@ -39,6 +39,7 @@ which trainer config is built, not the global training entry.
 | `comm_interceptor.py` | Monkey-patches `torch.distributed` collectives and records communication events. |
 | `runtime_capture.py` | Coordinates op, comm, FSDP, and PP capture scopes. |
 | `graph_assembler.py` | Builds `ComputeGraph` nodes/edges and merges communication events. |
+| `memory_estimator.py` | Estimates activation lifetimes, communication buffers, model parameters, gradients, and optimizer state memory. |
 | `pp_schedule_extractor.py` | Extracts semantic pipeline schedule events and dependencies. |
 | `fx_capture.py` | Optionally captures forward or joint forward/backward FX graphs. |
 | `export.py` | Writes JSON, DOT, Chrome Trace, text summary, and interactive HTML. |
@@ -52,6 +53,8 @@ which trainer config is built, not the global training entry.
 - `compute_graph`: ordered op nodes and directed dependencies.
 - `schedule`: coarse-grained schedule events and dependencies.
 - `comm_events`, `fsdp_events`, `pp_events`: raw event streams.
+- `memory_events`: decomposable memory estimates for activations, comm buffers,
+  parameters, gradients, and optimizer states.
 - `metadata`: run mode, rank, optional FX graphs, and extension metadata.
 
 Operator nodes record op name/type, phase, tensor input/output shapes, PP
@@ -59,6 +62,31 @@ context, microbatch index, and communication annotations. Data edges are
 producer-consumer dependencies from observed tensor flow. Scheduling edges are
 kept in `TrainingSchedule` so they do not introduce artificial cycles into the
 operator DAG.
+
+## Memory estimate model
+
+Memory tracing is deterministic and decomposable rather than allocator-exact:
+
+- graph output tensors become activation/data-move/communication buffer
+  `MemoryEvent`s, with lifetimes approximated from producer order to the last
+  observed consumer edge;
+- the graph peak is a scanline peak over those output lifetimes;
+- communication interceptor tensor metadata contributes separate
+  `comm_event_buffer` estimates;
+- model state is estimated from native model parameters after trainer
+  construction: parameter bytes, one gradient tensor per trainable parameter,
+  and Adam/AdamW-style first and second moment optimizer state.
+
+The exported `metadata["memory"]` summary groups bytes by category, phase, and
+device, and keeps top-level fields such as `peak_live_bytes`,
+`parameter_bytes`, `gradient_bytes`, `optimizer_state_bytes`, and
+`model_state_total_bytes`. `trace.html` shows memory cards and the raw memory
+summary, while `summary.txt` includes a human-readable memory section.
+
+This model is intended for planning and comparison in CPU-only environments. It
+does not replace real CUDA/NPU allocator telemetry, and it intentionally avoids
+pretending CPU simulation can observe backend-specific fragmentation or stream
+workspace behavior.
 
 ## HTML visualization
 
@@ -108,7 +136,7 @@ exporters, HTML generation, graph assembly, and extension hooks.
 - Runtime capture observes the current process. Multi-rank traces require
   multi-process execution or post-run trace aggregation.
 - CPU simulation does not reproduce GPU/NPU kernel performance or real device
-  memory pressure.
+  memory pressure. Memory values are trace estimates, not allocator truth.
 - Some operator-level aliasing and in-place behavior is approximated by tensor
   producer tracking.
 - Parallel schedules can be semantic when the actual backend cannot run in the

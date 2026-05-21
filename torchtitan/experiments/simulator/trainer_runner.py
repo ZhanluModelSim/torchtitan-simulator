@@ -25,6 +25,11 @@ from .export import (
 )
 from .extension_hooks import collect_extension_metadata, postprocess_extension_result
 from .fx_capture import capture_forward_fx, capture_joint_fx
+from .memory_estimator import (
+    estimate_model_state_memory,
+    merge_memory_summary,
+    summarize_memory_events,
+)
 from .pp_schedule_extractor import PPScheduleExtractor
 from .runtime_capture import RuntimeCapture
 
@@ -110,6 +115,22 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
             "rank": rank,
             **collect_extension_metadata(trainer, capture),
         }
+    )
+
+    model_memory_events, model_memory_summary = estimate_model_state_memory(
+        trainer.model_parts,
+        optimizer_name=getattr(trainer.config.optimizer, "name", None),
+    )
+    result.memory_events.extend(model_memory_events)
+    memory_metadata = {
+        key: value
+        for key, value in (result.metadata.get("memory", {}) or {}).items()
+        if key not in {"total_event_bytes", "by_category", "by_phase", "by_device"}
+    }
+    result.metadata["memory"] = merge_memory_summary(
+        summarize_memory_events(result.memory_events),
+        memory_metadata,
+        model_memory_summary,
     )
 
     pp_schedule = getattr(trainer, "pp_schedule", None)
