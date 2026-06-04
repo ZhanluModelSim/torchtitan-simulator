@@ -175,10 +175,13 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         raise RuntimeError("simulation requires at least one microbatch")
     first_input_dict, first_labels = microbatches[0]
     example_inputs = (first_input_dict["input"],)
-    result.metadata["fx_forward_graph"] = capture_forward_fx(
-        trainer.model_parts[0],
-        example_inputs,
-    ).to_dict()
+    try:
+        result.metadata["fx_forward_graph"] = capture_forward_fx(
+            trainer.model_parts[0],
+            example_inputs,
+        ).to_dict()
+    except Exception as exc:
+        result.metadata["fx_forward_graph_error"] = str(exc)
     if sim_opts.capture_joint_fx:
         def _trainer_loss_adapter(pred: Any, labels: torch.Tensor) -> torch.Tensor:
             try:

@@ -268,15 +268,15 @@ class MoE(Module):
 
         self.router = TokenChoiceTopKRouter.Config(
             dim=dim,
-            layer_id=layer_id,
-            args=moe_args,
             num_experts=num_experts,
             top_k=moe_args.top_k,
+            layer_id=layer_id,
+            args=moe_args,
             score_func=moe_args.score_func,
             route_norm=moe_args.route_norm,
-            route_scale=moe_args.route_scale,
+            route_scale=getattr(moe_args, "route_scale", 1.0),
             vocab_size=vocab_size,
-            debug_force_load_balance=moe_args.debug_force_load_balance,
+            debug_force_load_balance=getattr(moe_args, "debug_force_load_balance", False),
         ).build()
 
         self.reorderer = TokenReorderer(

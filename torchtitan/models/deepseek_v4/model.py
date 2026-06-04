@@ -1478,7 +1478,7 @@ class DeepSeekV4Model(BaseModel):
                 trainer_config.debug.moe_force_load_balance
             )
             self.moe_args.load_balance_coeff = self.load_balance_coeff
-            self.moe_args.n_hash_layers = getattr(self.moe_args, "n_hash_layers", 3)
+            self.moe_args.n_hash_layers = 0
             self.use_sfa = False
             self.num_mtp_modules = getattr(trainer_config.training, "num_mtp_modules", 0)
 
@@ -1554,6 +1554,7 @@ class DeepSeekV4Model(BaseModel):
         input_ids: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        _skip_lm_head: bool = False,
     ):
         """
         Forward pass for the Transformer model.
@@ -1561,9 +1562,12 @@ class DeepSeekV4Model(BaseModel):
         Args:
             tokens (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
             input_ids (torch.Tensor): Input tensor of token IDs with shape (batch_size, seq_len).
+            _skip_lm_head: If True, return the hidden states before the output
+                projection (used by ChunkedCELoss).
 
         Returns:
-            torch.Tensor: Logits tensor of shape (batch_size, seq_len, vocab_size).
+            torch.Tensor: Logits tensor of shape (batch_size, seq_len, vocab_size),
+            or hidden states if _skip_lm_head is True.
         """
         seq_len = tokens.shape[1]
         seq_len -= self.model_args.num_mtp_modules
@@ -1600,6 +1604,8 @@ class DeepSeekV4Model(BaseModel):
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h.float()) if self.output is not None else h
         if self.model_args.num_mtp_modules <= 0:
+            if getattr(self, "_skip_lm_head", False):
+                return h
             return output
         else:
             output_list = [None] * (1 + self.model_args.num_mtp_modules)
