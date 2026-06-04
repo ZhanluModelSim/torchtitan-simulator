@@ -58,12 +58,14 @@ def llama3_sim_1024gpu() -> SimulationTrainer.Config:
     """
     1024-GPU simulation config with PP / TP / DP / FSDP2 semantics.
 
-    Topology: pp=16, tp=8, dp_shard=4, dp_replicate=2 → 16×8×4×2 = 1024
+    Topology: pp=4, tp=8, dp_shard=4, dp_replicate=8 → 4×8×4×8 = 1024
 
-    The semantic Interleaved1F1B schedule mirrors a real 1024-GPU run:
-      16 pipeline ranks × 2 virtual stages = 32 pipeline stages,
+    The real PP schedule is created through ``_cpu_pipeline`` (splits the
+    model into stages and builds a ``ScheduleInterleaved1F1B``) so that
+    ``attach_pp_hooks`` can capture native TorchTitan PP events.
+      4 pipeline ranks × 2 virtual stages = 8 pp_stages (fits debugmodel layers),
       8 tensor-parallel ranks per TP group,
-      4 FSDP shard ranks × 2 HSDP replicas per DP group,
+      4 FSDP shard ranks × 8 HSDP replicas per DP group,
       8 microbatches for PP interleaving.
 
     Usage::
@@ -88,11 +90,11 @@ def llama3_sim_1024gpu() -> SimulationTrainer.Config:
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         parallelism=ParallelismConfig(
-            pipeline_parallel_degree=16,
+            pipeline_parallel_degree=4,
             pipeline_parallel_schedule="Interleaved1F1B",
             tensor_parallel_degree=8,
             data_parallel_shard_degree=4,
-            data_parallel_replicate_degree=2,
+            data_parallel_replicate_degree=8,
         ),
         checkpoint=CheckpointManager.Config(enable=False),
         activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
