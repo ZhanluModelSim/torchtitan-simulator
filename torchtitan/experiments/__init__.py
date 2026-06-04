@@ -15,5 +15,6 @@ _supported_experiments = frozenset(
         "ft.llama3",
         "rl",
         "simulator.llama3",
+        "simulator.deepseek_v4",
     ]
 )
