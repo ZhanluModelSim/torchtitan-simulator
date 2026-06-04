@@ -218,13 +218,31 @@ Example outputs with a richer PP/TP/DP/FSDP2 schedule are committed at:
 - `sim_out_torchtitan_memory_parallel/` — parallel trace with memory summary
 - `sim_out_torchtitan_memory_trace/` — parallel trace with memory timeline
 
-### Native TorchTitan entry (known limitation)
+### Native TorchTitan entry (via run_train.sh)
 
-The side-loaded native path (``train.py --module simulator.llama3``) reaches
-Trainer construction (DeviceMemoryMonitor, FSDP, DeviceMesh all pass on CPU),
-but ``loss.backward()`` inside ``fake_backend`` hits a meta-tensor allocation
-error from FSDP's unshard path.  This is a pre-existing PyTorch limitation
-on CPU-only hosts and does not affect the standalone runtime capture path.
+Use the standard launcher with a simulation module/config.  On CPU-only
+hosts, set ``PYTHON`` to a Python that has ``torch`` installed (e.g.
+``~/.local/bin/python3.11``):
+
+```bash
+PYTHON=~/.local/bin/python3.11 \
+  NGPU=1 MODULE=simulator.llama3 CONFIG=llama3_sim_debugmodel \
+  COMM_MODE=fake_backend ./run_train.sh
+```
+
+To customise the output directory and other simulation options:
+
+```bash
+PYTHON=~/.local/bin/python3.11 \
+  NGPU=1 MODULE=simulator.llama3 CONFIG=llama3_sim_debugmodel \
+  COMM_MODE=fake_backend ./run_train.sh \
+  --simulation.output_dir ./my_sim_output
+```
+
+The ``SimulationTrainer`` replaces the model's ``parallelize_fn`` /
+``pipelining_fn`` with CPU-only stubs before ``Trainer.__init__`` runs,
+so FSDP/TP/PP wrappers are never applied.  Parallelisation semantics
+are captured through the ``TrainingSchedule`` instead of runtime hooks.
 
 ## Limitations
 
@@ -236,7 +254,3 @@ on CPU-only hosts and does not affect the standalone runtime capture path.
   producer tracking.
 - Parallel schedules can be semantic when the actual backend cannot run in the
   current environment.
-- The native ``train.py --module simulator.llama3`` path uses FSDP's
-  ``fully_shard`` which allocates meta tensors that cannot be materialized on
-  CPU-only builds.  Use the standalone Python trace generation script (above)
-  for end-to-end validation in CPU environments.

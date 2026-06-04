@@ -154,10 +154,13 @@ MODULE=llama3 CONFIG=llama3_8b ./run_train.sh
 ### Start a simulation run (side-loaded experiment)
 
 Use the standard TorchTitan entrypoint and side-load the simulation trainer via
-experiment module/config:
+experiment module/config.  On CPU-only hosts set ``PYTHON`` to a Python with
+``torch`` and dependencies installed:
 
 ```bash
-MODULE=simulator.llama3 CONFIG=llama3_sim_debugmodel ./run_train.sh
+PYTHON=~/.local/bin/python3.11 \
+  NGPU=1 MODULE=simulator.llama3 CONFIG=llama3_sim_debugmodel \
+  COMM_MODE=fake_backend ./run_train.sh
 ```
 
 Simulation writes `simulation_result.json`, `compute_graph.dot`, `trace.json`,
