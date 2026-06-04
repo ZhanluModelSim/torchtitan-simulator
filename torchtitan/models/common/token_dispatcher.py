@@ -82,11 +82,9 @@ class LocalTokenDispatcher(Configurable):
         # application) into a shared helper — it's duplicated in
         # AllToAllTokenDispatcher.dispatch.
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+        num_tokens_per_expert = torch.bincount(
+            selected_experts_indices.view(-1).long(),
+            minlength=self.num_experts,
         )
 
         # Reorder the token indices to match the order of the experts
@@ -251,11 +249,9 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
         # application) into a shared helper — it's duplicated in
         # LocalTokenDispatcher.dispatch.
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+        num_tokens_per_expert = torch.bincount(
+            selected_experts_indices.view(-1).long(),
+            minlength=self.num_experts,
         )
 
         # Reorder the token indices to match the order of the experts

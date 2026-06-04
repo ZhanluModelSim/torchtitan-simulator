@@ -574,7 +574,9 @@ class GetWindowTopkIdxs(Module):
         window_topk = (base - window_size + 1).clamp(0) + torch.arange(
             min(seqlen, window_size)
         )
-        window_topk = torch.where(window_topk > base, -1, window_topk)
+        # Use seqlen as the "invalid" sentinel instead of -1 because
+        # newer PyTorch validates scatter_ indices strictly.
+        window_topk = torch.where(window_topk > base, seqlen, window_topk)
         return window_topk.unsqueeze(0).expand(bsz, -1, -1)
 
 
@@ -591,7 +593,9 @@ class GetCompressTopkIdxs(Module):
         bsz, seqlen = x.shape[0], x.shape[1]
         matrix = torch.arange(seqlen // self.ratio).repeat(seqlen, 1)
         mask = matrix >= torch.arange(1, seqlen + 1).unsqueeze(1) // self.ratio
-        compress_topk = torch.where(mask, -1, matrix + offset)
+        # Use offset + seqlen as sentinel (maps to the attention sink slot),
+        # avoiding -1 which triggers bounds errors in newer PyTorch scatter.
+        compress_topk = torch.where(mask, offset + seqlen, matrix + offset)
         return compress_topk.unsqueeze(0).expand(bsz, -1, -1)
 
 
@@ -764,7 +768,7 @@ class LiCompute(Module):
             min(self.index_topk, end_pos // self.ratio), dim=-1
         )
         mask = topk_idxs >= (base + 1) // self.ratio
-        compress_topk_idxs = torch.where(mask, -1, topk_idxs + offset)
+        compress_topk_idxs = torch.where(mask, offset + seqlen, topk_idxs + offset)
         return compress_topk_idxs, index_score
 
 

@@ -34,13 +34,22 @@ class TokenReorderer(Module):
         self,
         top_scores: torch.Tensor,
         selected_experts_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        permuted_indices = selected_experts_indices
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Group tokens by expert: sort by expert index so that tokens
+        # for the same expert are contiguous.  Divide by top_k because
+        # the downstream code indexes into x_flat (shape [bs*seqlen, dim])
+        # while expert indices are (bs, seqlen, top_k).
+        _, token_indices_experts_sorted = torch.sort(
+            selected_experts_indices.reshape(-1), stable=True
+        )
+        token_indices_experts_sorted = (
+            token_indices_experts_sorted // self.top_k
+        )
         token_counts = torch.bincount(
-            selected_experts_indices.flatten(),
+            selected_experts_indices.flatten().long(),
             minlength=self.num_experts,
         )
-        return top_scores, permuted_indices, selected_experts_indices, token_counts
+        return top_scores, token_indices_experts_sorted, token_counts
 
 
 @dataclass
@@ -208,11 +217,9 @@ class TokenChoiceTopKRouter(common_moe.TokenChoiceTopKRouter):
         top_scores = top_scores * self.route_scale
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.histc(
-            selected_experts_indices.view(-1),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
+        num_tokens_per_expert = torch.bincount(
+            selected_experts_indices.view(-1).long(),
+            minlength=self.num_experts,
         )
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
@@ -366,48 +373,15 @@ class MoE(Module):
         with torch.no_grad():
             self.tokens_per_expert.add_(num_tokens_per_expert)
 
-        (
-            top_scores_experts_sorted,
-            token_indices_experts_sorted,
-            num_tokens_per_expert,
-        ) = self.reorderer(top_scores, selected_experts_indices)
-
-        # token_indices_experts_sorted is already token-level: upstream
-        # TokenReorderer divides the argsort permutation by top_k internally.
-        # shape (bs*slen*top_k, dim)
-        routed_input = x_flat[token_indices_experts_sorted]
-
-        if self.score_before_experts:
-            routed_input = (
-                routed_input.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
-            ).to(x.dtype)
-
-        # shape (bs*slen*top_k, dim)
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
-
-        # Shared expert
-        shared_output = (
-            self.shared_experts(x_flat) if self.shared_experts is not None else None
+        # Use torchtitan's GroupedExperts API, which handles dispatch,
+        # expert computation, score weighting, and combine internally.
+        out_experts = self.experts(
+            x_flat,
+            top_scores,
+            selected_experts_indices,
+            shared_experts=self.shared_experts,
         )
 
-        if not self.score_before_experts:
-            routed_output = (
-                routed_output.to(torch.float32)
-                * top_scores_experts_sorted.reshape(-1, 1)
-            ).to(x.dtype)
-
-        # Scatter-add each token's top_k expert outputs back to its position.
-        out_experts = torch.zeros_like(x_flat)
-        out_experts = out_experts.scatter_add(
-            0,
-            token_indices_experts_sorted.reshape(-1, 1).expand(-1, dim),
-            routed_output,
-        )
-
-        if shared_output is None:
-            output = out_experts.reshape(bs, slen, dim)
-        else:
-            output = (shared_output + out_experts).reshape(bs, slen, dim)
+        output = out_experts.reshape(bs, slen, dim)
 
         return output
