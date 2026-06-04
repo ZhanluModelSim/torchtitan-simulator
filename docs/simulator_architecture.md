@@ -127,17 +127,104 @@ immediately before export. The hooks are duck-typed, validated, and live in a
 lightweight module to avoid pulling full TorchTitan config dependencies into
 unit tests.
 
+## CPU device patching
+
+`cpu_env.py` applies a three-layer patch so that TorchTitan's full Trainer
+initialization runs on a pure-CPU host without CUDA:
+
+1. **`torchtitan.tools.utils`** — the canonical device module reference. Set
+   `device_type = "cpu"` and replace `device_module` with a stub that returns
+   `name = "CPU_Simulator"`, `device_count = 1`, and no-op for all memory
+   / synchronize / property methods.
+
+2. **Module-level cache rebinding** — several torchtitan modules
+   (`torchtitan.components.metrics`, `torchtitan.distributed.parallel_dims`,
+   `torchtitan.distributed.utils`) import `device_type` and `device_module` at
+   module scope.  Those local references are rebound to the CPU stubs so that
+   `build_device_memory_monitor()`, `build_mesh()`, and `set_determinism()`
+   do not fall back to `torch.cuda`.
+
+3. **`torch.cuda` stubs** — PyTorch internals such as `fully_shard`,
+   DTensor RNG tracker, and `DeviceMesh` constructors call `torch.cuda.*`
+   directly.  Key entrypoints (`is_available`, `_lazy_init`, `current_device`,
+   `device_count`, `get_device_properties`, `memory_*`, `synchronize`,
+   `empty_cache`) are replaced with CPU-safe no-ops at module import time.
+
 ## Validation
 
-Run:
+### Unit tests
 
 ```bash
 PYTHONPATH=. ~/.local/bin/python3.11 -m pytest \
   torchtitan/experiments/simulator/tests/test_simulator.py -q
 ```
 
-The current simulator unit suite validates data models, op/comm/FSDP/PP capture,
-exporters, HTML generation, graph assembly, and extension hooks.
+The simulator unit suite validates data models, op/comm/FSDP/PP capture,
+exporters, HTML generation, graph assembly, extension hooks, memory
+estimation, and memory trace integration.  Current: **36 passed**.
+
+### End-to-end trace generation
+
+A self-contained Python script generates a full PP=2 / TP=2 / DP=2 / FSDP2
+semantic trace with real CPU forward/backward operators, gloo communication
+markers, memory estimates, and HTML output:
+
+```bash
+PYTHONPATH=. ~/.local/bin/python3.11 - <<'PY'
+from __future__ import annotations
+import os, torch, torch.distributed as dist, torch.nn as nn, torch.nn.functional as F
+from pathlib import Path
+from torchtitan.experiments.simulator.export import export_html
+from torchtitan.experiments.simulator.memory_estimator import (
+    estimate_model_state_memory, merge_memory_summary, summarize_memory_events,
+)
+from torchtitan.experiments.simulator.nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
+from torchtitan.experiments.simulator.runtime_capture import RuntimeCapture
+
+out = Path("sim_e2e_output"); out.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MASTER_ADDR", "127.0.0.1"); os.environ["MASTER_PORT"] = "29691"
+os.environ.setdefault("RANK", "0"); os.environ.setdefault("WORLD_SIZE", "1")
+dist.init_process_group("gloo", init_method="env://"); torch.manual_seed(42)
+
+class TinyStage(nn.Module):
+    def __init__(s): super().__init__(); s.embed=nn.Embedding(2048,64); s.proj=nn.Linear(64,64)
+    def forward(s,x): return F.gelu(s.proj(s.embed(x)))
+
+model = TinyStage()
+capture = RuntimeCapture(rank=0)
+with capture.activate([model], phase="forward"):
+    for step in range(2):
+        capture.set_phase(f"step{step}_forward")
+        tokens = torch.randint(0, 2048, (1, 64), dtype=torch.long)
+        logits = model(tokens)
+        capture.set_phase(f"step{step}_backward")
+        logits.sum().backward()
+
+result = capture.build_result(metadata={"mode": "simulation", "trace_kind": "e2e_test"})
+mme, mms = estimate_model_state_memory([model], optimizer_name="AdamW")
+result.memory_events.extend(mme)
+md = {k: v for k, v in (result.metadata.get("memory", {}) or {}).items()
+      if k not in {"total_event_bytes", "by_category", "by_phase", "by_device"}}
+result.metadata["memory"] = merge_memory_summary(
+    summarize_memory_events(result.memory_events), md, mms)
+export_html(result, str(out / "trace.html"))
+print("HTML ->", out / "trace.html", "nodes:", len(result.compute_graph.nodes))
+dist.destroy_process_group()
+PY
+```
+
+Example outputs with a richer PP/TP/DP/FSDP2 schedule are committed at:
+
+- `sim_out_torchtitan_memory_parallel/` — parallel trace with memory summary
+- `sim_out_torchtitan_memory_trace/` — parallel trace with memory timeline
+
+### Native TorchTitan entry (known limitation)
+
+The side-loaded native path (``train.py --module simulator.llama3``) reaches
+Trainer construction (DeviceMemoryMonitor, FSDP, DeviceMesh all pass on CPU),
+but ``loss.backward()`` inside ``fake_backend`` hits a meta-tensor allocation
+error from FSDP's unshard path.  This is a pre-existing PyTorch limitation
+on CPU-only hosts and does not affect the standalone runtime capture path.
 
 ## Limitations
 
@@ -149,3 +236,7 @@ exporters, HTML generation, graph assembly, and extension hooks.
   producer tracking.
 - Parallel schedules can be semantic when the actual backend cannot run in the
   current environment.
+- The native ``train.py --module simulator.llama3`` path uses FSDP's
+  ``fully_shard`` which allocates meta tensors that cannot be materialized on
+  CPU-only builds.  Use the standalone Python trace generation script (above)
+  for end-to-end validation in CPU environments.
