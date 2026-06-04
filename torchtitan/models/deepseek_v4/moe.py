@@ -17,7 +17,7 @@ from torchtitan.protocols.module import Module
 GroupedExperts = common_moe.GroupedExperts
 
 
-class TokenReorderer(nn.Module):
+class TokenReorderer(Module):
     """Minimal CPU-compatible token reorderer (NPU patching removed).
 
     In the original NPU fork this was patched by ``npu_gmm`` to use

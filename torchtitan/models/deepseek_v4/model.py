@@ -1529,6 +1529,7 @@ class DeepSeekV4Model(BaseModel):
             out_features=model_args.vocab_size,
             bias=False,
         ).build()
+        self.lm_head = self.output  # ChunkedCELoss requires lm_head reference
         self.register_buffer(
             "freqs_cis", precompute_freqs_cis(model_args, True), persistent=False
         )
