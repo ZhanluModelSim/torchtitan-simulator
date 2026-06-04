@@ -244,7 +244,76 @@ The ``SimulationTrainer`` replaces the model's ``parallelize_fn`` /
 so FSDP/TP/PP wrappers are never applied.  Parallelisation semantics
 are captured through the ``TrainingSchedule`` instead of runtime hooks.
 
-## Limitations
+## Design compromises and limitations
+
+### Why the simulator cannot run real PP / FSDP / TP on CPU
+
+TorchTitan's native parallelism wrappers have hard dependencies on CUDA:
+
+| Wrapper | CPU blocker |
+|---|---|
+| `apply_fsdp → fully_shard` | Allocates `torch.empty(0, device=cuda)` internally; `FSDPParamGroup` requires CUDA device handles |
+| `pipeline_llm → _pipeline_module_split` | Creates `PipelineStage` objects with `pp_mesh`; the schedule's `step()` calls P2P ops that require multi-rank execution |
+| `_PipelineSchedule.step()` | Calls `_split_inputs` → `split_args_kwargs_into_chunks` which expects multi-process distributed tensors |
+| `set_determinism → DTensor RNG` | `torch.distributed.tensor._random.manual_seed` calls `torch.cuda.device_count()` internally |
+
+The simulator works around these by:
+
+1. **Replacing `parallelize_fn` and `pipelining_fn`** with CPU no-ops before
+   `Trainer.__init__` runs. The model is built on CPU without any FSDP/TP/PP
+   wrappers, so the actual forward/backward executes as plain PyTorch.
+
+2. **Semantic schedule generation** (`schedule_generator.py`) creates a
+   ``TrainingSchedule`` that mirrors what Interleaved1F1B (or any other
+   TorchTitan schedule) would produce across the full multi-rank topology.
+   Dependencies (PP send/recv, TP all-reduce, FSDP all-gather/reduce-scatter,
+   DP gradient sync) are explicit.
+
+3. **No op modification** — the op trace captured by
+   ``dispatch_interceptor.py`` records the actual PyTorch operators that
+   execute on CPU, which is the ground truth for that single process.
+
+### What the semantic schedule is and is not
+
+``schedule_generator.py`` produces a ``TrainingSchedule`` that:
+
+- ✅ Reflects the correct Interleaved1F1B warmup / 1F1B steady-state /
+  cooldown order
+- ✅ Encodes correct PP send→recv, TP all-reduce, FSDP all-gather/reduce-scatter,
+  and DP gradient-sync dependencies
+- ✅ Respects the virtual-stage topology and microbatch count
+- ❌ Is not derived from a real ``_PipelineSchedule`` object (the schedule is
+  synthetic, though structurally equivalent)
+- ❌ Does not capture dynamic scheduling decisions (e.g., ZB zero-bubble
+  adaptive scheduling)
+
+On GPU/NPU hardware where TorchTitan can fully initialise, the
+``pp_schedule_extractor`` and ``attach_pp_hooks`` in ``runtime_capture.py``
+take over and record native events from the real schedule object.
+
+### Parallelism topology constraints
+
+- The ``_set_fake_world_size`` mechanism inflates ``NGPU``/``WORLD_SIZE``
+  to match parallelism degree products so that ``ParallelDims`` validation
+  passes on a single process.
+- ``dp_enabled``, ``tp_enabled``, and ``pp_enabled`` are disabled after
+  ``Trainer.__init__`` to keep ``forward_backward_step`` on the non-PP
+  single-model code path.
+- Virtual stages × pp_degree must not exceed the model's layer count.
+  For the debugmodel (8 layers), the maximum ``Interleaved1F1B``
+  configuration is ``pp=4, virtual=2`` (8 stages ≤ 8 layers).
+
+### Memory estimation limits
+
+- Activation memory is approximated by output tensor sizes with
+  producer→consumer lifetimes.  Python eager-mode aliasing and in-place
+  ops are not modelled, so the estimate is conservative.
+- Model-state memory (parameters, gradients, optimizer state) assumes a
+  standard Adam/AdamW moment structure.
+- No backend-specific fragmentation, allocator overhead, or NPU HCCL
+  workspace memory is modelled.
+
+### General limits
 
 - Runtime capture observes the current process. Multi-rank traces require
   multi-process execution or post-run trace aggregation.
@@ -252,5 +321,3 @@ are captured through the ``TrainingSchedule`` instead of runtime hooks.
   memory pressure. Memory values are trace estimates, not allocator truth.
 - Some operator-level aliasing and in-place behavior is approximated by tensor
   producer tracking.
-- Parallel schedules can be semantic when the actual backend cannot run in the
-  current environment.
