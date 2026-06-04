@@ -1,119 +1,141 @@
-# TorchTitan Development Guide
+# TorchTitan Simulator Development Guide
+
+This is the **simulator fork** of torchtitan — it adds a CPU-only training trace/simulation experiment (`torchtitan/experiments/simulator/`) to the upstream torchtitan LLM training platform. The NPU simulator fork lives in a separate sub-repo at `torchtitan-npu-simulator/` (its own git root).
 
 ## Build & Test
 
 ```bash
-# Install dev dependencies
 pip install -r requirements.txt -r requirements-dev.txt
-
-# Lint and format (required before any PR)
 pre-commit run --all-files
-
-# Run unit tests
-pytest tests/ -x
+pytest tests/unit_tests -x
 ```
 
-### Run GPU integration tests (requires GPUs)
-Integration tests override default config for Llama 3 debug model.
-See tests/integration_tests/ for `OverrideDefinitions`.
+Pre-commit enforces: ufmt (black 22.12 + usort 1.0), flake8 (with torchfix, bugbear, pep585, new-union-types), pydoclint, codespell, license headers, and **pyrefly** type checking (not mypy/pyright). CI also runs lychee link checking.
 
-### Validating Numerics
-Non-computation changes (e.g. activation checkpointing, refactoring) must produce
-**identical loss** before vs. after with `--debug.seed=42` and `--debug.deterministic`.
-Computation changes require loss convergence on representative datasets (e.g. C4).
+Run a single test file:
+```bash
+pytest tests/unit_tests/test_config_manager.py -s
+```
 
-With the same parallelisms, GPU settings, and the debug options, two runs should produce
-bit-wise identical loss and grad_norm. Note that stdout only prints the most
-significant five digits, which may not be enough. Follow `scripts/loss_compare.py` to
-enable profiling and check loss and grad_norm from the TensorBoard results.
+Run simulator unit tests:
+```bash
+pytest torchtitan/experiments/simulator/tests/test_simulator.py -v
+```
 
-You should NEVER use `--debug.deterministic_warn_only`.
+Integration tests require GPUs and use a custom runner:
+```bash
+python -m tests.integration_tests.run_tests <output_dir> [--module MODULE] [--config CONFIG] [--test_suite features]
+```
+
+## Validating Numerics
+
+Non-computation changes must produce **identical loss** before vs. after with `--debug.seed=42` and `--debug.deterministic`. Use `scripts/loss_compare.py` and TensorBoard for full-precision comparison — stdout only shows 5 significant digits.
+
+**NEVER** use `--debug.deterministic_warn_only`.
+
+## Running Training & Simulation
+
+Normal training (8 GPU, Llama 3 debug):
+```bash
+MODULE=llama3 CONFIG=llama3_debugmodel ./run_train.sh
+```
+
+CPU simulation (side-loaded experiment):
+```bash
+MODULE=simulator.llama3 CONFIG=llama3_sim_debugmodel ./run_train.sh
+```
+
+NPU simulation (separate sub-repo):
+```bash
+cd torchtitan-npu-simulator
+TRAIN_FILE=torchtitan_npu.entry MODULE=torchtitan_npu.simulator.llama3 CONFIG=llama3_npu_sim_debugmodel ./scripts/run_train.sh --training.steps=1
+```
+
+Debug modes (no GPU needed):
+```bash
+NGPU=32 COMM_MODE="fake_backend" ./run_train.sh   # config validation, no execution
+NGPU=32 COMM_MODE="local_tensor" ./run_train.sh    # single-GPU debug with simulated multi-GPU
+```
+
+## Simulator Architecture
+
+The simulator is side-loaded as an experiment — `train.py` remains unchanged. `SimulationTrainer` subclasses `Trainer`, patches device helpers to CPU, and overrides `train()` for one instrumented step. Entry: config_registry returns `SimulationTrainer.Config` which the normal config system builds.
+
+Key components in `torchtitan/experiments/simulator/`:
+
+| File | Role |
+| --- | --- |
+| `cpu_env.py` | Forces device helpers to CPU |
+| `dispatch_interceptor.py` | Captures runtime ops with tensor metadata |
+| `comm_interceptor.py` | Monkey-patches `torch.distributed` collectives |
+| `runtime_capture.py` | Coordinates op/comm/FSDP/PP capture |
+| `graph_assembler.py` | Builds ComputeGraph nodes/edges |
+| `memory_estimator.py` | Estimates activation, comm buffer, model state memory |
+| `pp_schedule_extractor.py` | Extracts pipeline schedule events |
+| `fx_capture.py` | Optional FX graph capture |
+| `export.py` | Writes JSON, DOT, Chrome Trace, HTML, text |
+| `trainer_runner.py` | Runs one simulated step and exports |
+| `extension_hooks.py` | Duck-typed hooks for external extensions |
+
+Outputs: `simulation_result.json`, `compute_graph.dot`, `trace.json`, `trace.html`, `summary.txt`. The HTML trace is self-contained (no CDN dependency).
 
 ## Core Principles
 
-1. **PyTorch-native training techniques.** Core torchtitan's training infrastructure
-   and parallelism code must not depend on non-PyTorch libraries. Techniques with
-   moderate-to-large complexity belong in their proper upstream repo (pytorch/pytorch
-   for parallelisms, pytorch/data for data loaders, etc.).
-
-2. **Investigate root cause before patching.** Don't land band-aid fixes. Understand
-   *why* something fails before proposing a solution. If a change seems to help but
-   you can't explain why, dig deeper.
-
-3. **Reuse over duplication.** Before writing new code, check if existing implementations
-   already handle the case. Unify similar code paths across models rather than creating
-   per-model wrappers. If upstream (torchao, PyTorch) already provides functionality,
-   use it.
-
-4. **Don't leak experiments into core.** The `torchtitan/experiments/` folder exists for
-   a reason. Don't modify core torchtitan code to accommodate experiment-specific needs
-   (e.g. don't add `if experiment_x:` branches to core files). Deprecated files should
-   be removed, not updated.
-
-5. **Protect battle-tested code paths.** Be cautious changing converged behavior. Flag
-   potential silent breakage of existing user code or checkpoints. When in doubt, ask.
-
-6. **Audit all callsites.** When changing shared code (common model components, config
-   fields, distributed utilities), check and update every callsite. This includes all
-   model variants: llama3, llama4, qwen3, deepseek_v3, gpt_oss, flux, etc.
+1. **PyTorch-native.** Core training/parallelism code must not depend on non-PyTorch libraries. Complex techniques belong upstream.
+2. **Root cause first.** Don't land band-aid fixes. Understand *why* before proposing.
+3. **Reuse over duplication.** Unify across models. Use upstream (torchao, PyTorch) when available.
+4. **Don't leak experiments into core.** No `if experiment_x:` in core files. Experiment code stays in `torchtitan/experiments/`.
+5. **Protect converged paths.** Flag silent breakage of checkpoints or user code.
+6. **Audit all callsites.** Shared code changes must update every model variant: llama3, llama4, qwen3, deepseek_v3, gpt_oss, flux.
 
 ## Code Style
 
-### Naming
-- Names must be **accurate, descriptive, and reflect actual scope**. Don't use
-  "toy/test/temp" in production names — put that context in docstrings instead.
-- Follow upstream conventions: match torchao and PyTorch naming where applicable.
-  E.g. if torchao calls it `Float8Linear`, use `Float8Linear` not `Float8Config`.
-- Use `num_` prefix for counts (e.g. `num_expert_groups` not `n_expert_groups`)
-  when not directly matching an upstream API.
-- **`axis` names a specific mesh axis; `dim` is for tensors and mesh shape.**
-  In any name we own — variables, parameters, attributes, helpers, comments,
-  docstrings, error messages — use ``axis``/``axes`` when referring to a
-  specific ``DeviceMesh`` axis (TP axis, ``dp_shard`` axis, the list of axes
-  a spec references). Use ``dim``/``dimensional`` for the mesh's *shape*
-  ("1D mesh", "multi-dimensional SPMD mesh") and for tensor dimensions; bare
-  ``dim`` on its own should refer to a tensor dimension. The exception is
-  when calling into PyTorch upstream APIs (``DeviceMesh.mesh_dim_names``,
-  ``DataParallelMeshDims``, etc.): match the upstream spelling at the call
-  site, then assign into a locally named ``mesh_axis_names`` if the value
-  flows through our code.
+### `axis` vs `dim` (critical convention)
+- **`axis`/`axes`** = specific `DeviceMesh` axis (TP axis, `dp_shard` axis, axes a spec references)
+- **`dim`/`dimensional`** = mesh *shape* ("1D mesh", "multi-dimensional SPMD mesh") and tensor dimensions
+- Exception: match upstream API spelling at callsite (`DeviceMesh.mesh_dim_names`, `DataParallelMeshDims`), then assign into locally named `mesh_axis_names`
 
-### Code Placement
-- Put code in the **most general applicable location**:
-  - Model-agnostic parallelism helpers → `torchtitan/distributed/`
-  - Shared model components (attention, MoE, embeddings) → `torchtitan/models/common/`
-  - Model-specific code → the specific model folder
-- Don't put model-agnostic functionality in model-specific files just because
-  that's where you first needed it.
+### Other naming
+- `num_` prefix for counts (`num_expert_groups` not `n_expert_groups`) unless matching upstream API
+- Match torchao/PyTorch naming (e.g. `Float8Linear` not `Float8Config`)
+- No "toy/test/temp" in production names — context goes in docstrings
 
-### Assertions and Error Handling
-- **`ValueError`** for user-facing errors (bad config, invalid input).
-- **`assert`** only for internal invariants that indicate programmer error.
-- Always validate mesh axes, tensor placements, and config values explicitly
-  in distributed code — don't assume a 1D mesh or specific placements.
-- When a code path silently skips user configuration, **emit a warning**.
+### Code placement
+- Model-agnostic parallelism helpers → `torchtitan/distributed/`
+- Shared model components (attention, MoE, embeddings) → `torchtitan/models/common/`
+- Model-specific code → that model's folder
+- Experiment code → `torchtitan/experiments/<name>/`
 
-### Parameters and Config
-- Important parameters first; less important ones later.
-- Prefer keyword-only arguments after the first positional arg.
-- No `None` defaults for required config fields.
-- `dataclasses.replace()` is a shallow copy: nested dataclasses and list/dict
-  fields are shared by reference. Be explicit when deep copies are needed.
+### Error handling
+- `ValueError` for user-facing errors; `assert` only for internal invariants
+- Validate mesh axes, placements, config values explicitly — never assume 1D mesh
+- Silently skipped config → emit a warning
 
-### Comments and Documentation
-- Add comments only for genuinely non-obvious things: dimension semantics,
-  parallelism gradient placements, why a workaround exists.
-- Use TODO comments for known limitations with a brief explanation.
-- Put descriptions in docstrings, not in names.
+### Comments
+- Only for non-obvious things: dimension semantics, gradient placements, workaround reasons
+- Descriptions in docstrings, not names
 
-## PR Expectations
+### Config system
+- `Configurable` base class with `Config` dataclass pattern
+- No `None` defaults for required fields
+- `dataclasses.replace()` is shallow — be explicit about deep copies
+- Experiments must use torchtitan's existing config system, not custom arg parsing
 
-1. **Lint first.** Run `pre-commit run --all-files` and fix all issues before
-   requesting review. CI linting failures waste everyone's time.
-2. **Show numerical proof.** Include loss comparison for any non-trivial change.
-3. **Explain "why" not just "what"** in the PR description.
-4. **Add tests.** New features need CPU unit tests at minimum; GPU integration
-   tests when involving parallelism. Verify CI actually runs the intended test
-   config (check `--model.name` and other flags).
-5. **Keep model code minimal.** After model changes, ensure original checkpoints
-   still load correctly. Document reasons for model changes.
+### Model folder pattern
+Each model: `config_registry.py` → `parallelize.py` → architecture files
+
+## Pre-commit / CI Gotchas
+
+- CI installs PyTorch nightly + torchao nightly + torchdata nightly (CPU wheels)
+- CI unit tests path is `tests/unit_tests` (not `tests/`)
+- CI lint runs on changed files only; `pre-commit run --all-files` is the local equivalent
+- Lychee link checker is optional locally (gracefully skipped if not installed)
+- Pre-commit blocks commits to `main` branch (`no-commit-to-branch` hook)
+- Max file size: 500KB (`check-added-large-files`)
+
+## Experiments Rules
+
+- Must still pass `pre-commit run --all-files`
+- Must not modify core torchtitan code
+- Must use torchtitan's config system
+- Keep distinct features in separate folders

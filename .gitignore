@@ -12,6 +12,8 @@ dist/*
 data
 out
 wandb
+sim_out*
+simulator_output
 
 torchtitan/datasets/**/*.model
 

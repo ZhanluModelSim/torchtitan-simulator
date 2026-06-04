@@ -1,1 +1,0 @@
-OK: schedule deps are acyclic and logical clocks are monotonic.
