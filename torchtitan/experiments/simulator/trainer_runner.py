@@ -27,6 +27,7 @@ from .fx_capture import capture_forward_fx, capture_joint_fx
 from .memory_estimator import attach_model_state_memory
 from .pp_schedule_extractor import PPScheduleExtractor
 from .runtime_capture import RuntimeCapture
+from .schedule_generator import generate_interleaved_1f1b_schedule
 
 
 def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> None:
@@ -43,6 +44,54 @@ def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> N
     if "text" in output_formats:
         with open(os.path.join(output_dir, "summary.txt"), "w", encoding="utf-8") as f:
             f.write(export_text_summary(result))
+
+
+def _inject_semantic_schedule(result: Any, config: Any) -> None:
+    """Append a semantic PP / TP / DP / FSDP2 schedule to *result*.
+
+    Reads parallelism settings from *config* so the HTML visualisation
+    shows the full multi-rank topology even when the simulator runs on a
+    single CPU process.
+    """
+    from .nodes import TrainingSchedule
+
+    parallelism = getattr(config, "parallelism", None)
+    if parallelism is None:
+        return
+
+    pp_degree = int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1)
+    tp_degree = int(getattr(parallelism, "tensor_parallel_degree", 1) or 1)
+    dp_shard = int(getattr(parallelism, "data_parallel_shard_degree", 1) or 1)
+    # dp_shard == -1 means "use remaining ranks"
+    if dp_shard < 0:
+        dp_shard = 1
+    dp_repl = int(getattr(parallelism, "data_parallel_replicate_degree", 1) or 1)
+    num_mb = int(getattr(parallelism, "pipeline_parallel_microbatch_size", 8) or 8)
+
+    schedule = getattr(parallelism, "pipeline_parallel_schedule", "1F1B") or "1F1B"
+    virtual = 2 if "Interleaved" in str(schedule) else 1
+
+    training = getattr(config, "training", None)
+    num_steps = int(getattr(training, "steps", 1) or 1) if training else 1
+
+    semantic = generate_interleaved_1f1b_schedule(
+        pp_degree=pp_degree,
+        tp_degree=tp_degree,
+        dp_shard_degree=dp_shard,
+        dp_replicate_degree=dp_repl,
+        num_microbatches=num_mb,
+        num_steps=num_steps,
+        virtual_stages_per_rank=virtual,
+    )
+
+    existing = result.schedule
+    if existing is None:
+        result.schedule = semantic
+    elif isinstance(existing, TrainingSchedule):
+        for ev in semantic.events:
+            existing.add_event(ev)
+        for dep in semantic.deps:
+            existing.add_dep(dep)
 
 
 def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
@@ -126,6 +175,9 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
             world_size=int(os.environ.get("WORLD_SIZE", "1")),
         )
         result.schedule = extractor.extract()
+
+    if sim_opts.semantic_schedule:
+        _inject_semantic_schedule(result, trainer.config)
 
     if not microbatches:
         raise RuntimeError("simulation requires at least one microbatch")
