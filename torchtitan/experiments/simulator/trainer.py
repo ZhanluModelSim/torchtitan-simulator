@@ -28,9 +28,9 @@ def _cpu_noop_parallelize(model, **__):
     """CPU-only parallelize stub: return model unchanged.
 
     The real ``parallelize_llama`` calls ``apply_fsdp`` / ``fully_shard``
-    which allocate meta tensors that cannot be materialised on CPU-only
-    builds.  Simulation captures parallelisation semantics through the
-    ``TrainingSchedule`` instead, so skipping FSDP/TP here is safe.
+    which allocate CUDA tensors that cannot be materialised on CPU-only
+    builds.  Skipping FSDP/TP is safe because the interception-based
+    runtime capture records the actual ops that execute.
     """
     return model
 
@@ -76,28 +76,28 @@ class SimulationTrainer(Trainer):
     def __init__(self, config: Config):
         patch_device_type_to_cpu()
 
-        # When semantic_schedule is requested, set WORLD_SIZE to the
-        # product of parallelism degrees so that ParallelDims validates
-        # correctly even though we run on a single CPU process.
-        if config.simulation.semantic_schedule:
+        pp = int(getattr(config.parallelism, "pipeline_parallel_degree", 1) or 1)
+        tp = int(getattr(config.parallelism, "tensor_parallel_degree", 1) or 1)
+        ds = int(getattr(config.parallelism, "data_parallel_shard_degree", -1) or -1)
+        dr = int(getattr(config.parallelism, "data_parallel_replicate_degree", 1) or 1)
+        if ds < 0:
+            ds = 1
+        if pp * tp * ds * dr > 1:
             _set_fake_world_size(config)
 
-        # Override the model's parallelize / pipelining callables so that
-        # Trainer.__init__ does not invoke FSDP/TP/PP wrappers which rely
-        # on CUDA device handles deep inside PyTorch.
         config.model_spec.parallelize_fn = _cpu_noop_parallelize
         config.model_spec.pipelining_fn = _cpu_noop_pipeline
 
         super().__init__(config)
 
-        # After Trainer.__init__, disable PP/tp flags so that
-        # forward_backward_step uses the non-PP code path (single model,
-        # no schedule.step call).  The semantic schedule injected later
-        # carries the full topology; the runtime only needs one CPU pass.
         self.parallel_dims.pp = 0
         self.parallel_dims.tp = 1
         self.parallel_dims.dp_shard = 1
         self.parallel_dims.dp_replicate = 1
+
+    def train(self):
+        patch_device_type_to_cpu()
+        run_trainer_simulation(self, self.config.simulation)
 
     def train(self):
         patch_device_type_to_cpu()

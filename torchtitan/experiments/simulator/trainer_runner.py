@@ -122,12 +122,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     else:
         global_valid_tokens = local_valid_tokens.float()
 
-    pp_schedule = getattr(trainer, "pp_schedule", None)
+    pp_stages = getattr(trainer, "_sim_stages", None) or trainer.model_parts
     with capture.activate(
         trainer.model_parts,
         phase="forward",
-        pp_schedule=pp_schedule,
-        pp_stages=trainer.model_parts,
+        pp_schedule=None,
+        pp_stages=pp_stages,
     ):
         for mb_idx, (input_dict, labels) in enumerate(microbatches):
             capture.set_microbatch(mb_idx)
@@ -167,16 +167,8 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         optimizer_name=getattr(trainer.config.optimizer, "name", None),
     )
 
-    pp_schedule = getattr(trainer, "pp_schedule", None)
-    if pp_schedule is not None:
-        extractor = PPScheduleExtractor(
-            schedule=pp_schedule,
-            pp_rank=rank,
-            world_size=int(os.environ.get("WORLD_SIZE", "1")),
-        )
-        result.schedule = extractor.extract()
-
     if sim_opts.semantic_schedule:
+        _inject_semantic_schedule(result, trainer.config)
         _inject_semantic_schedule(result, trainer.config)
 
     if not microbatches:
