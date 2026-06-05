@@ -154,8 +154,8 @@ def _op_to_chrome_event(
         "ph": "X",
         "pid": pid,
         "tid": tid,
-        "ts": ts_us,
-        "dur": dur_us,
+        "ts": ts_us / 1000.0,
+        "dur": dur_us / 1000.0,
         "name": node.op_name,
         "cat": node.op_type,
         "args": {
@@ -178,18 +178,19 @@ def export_chrome_trace(
     Write a ``chrome://tracing``-compatible JSON trace file.
 
     Each op becomes a duration event (``"ph": "X"``).  Events are laid out
-    sequentially per phase on separate *threads* (tid).  The timeline is
-    purely logical (not wall-clock time): each event is assigned a
-    *us_per_op* microsecond slot.
+    sequentially per phase on separate *threads* (tid).  When
+    :attr:`OpNode.perf_result` is available the duration reflects the
+    estimated compute / communication time; otherwise events fall back to
+    *us_per_op* microsecond slots.
 
     Args:
         result: The simulation result to render.
         path: Output JSON file path.
-        us_per_op: Duration in microseconds to assign each op slot.
+        us_per_op: Duration in microseconds to assign each op slot when no
+            :class:`PerfResult` is available.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-    phase_order = ["forward", "backward", "optimizer", "unknown", "joint"]
     phase_tid: dict[str, int] = {}
     tid_counter = [0]
 
@@ -201,26 +202,32 @@ def export_chrome_trace(
 
     phase_ts: dict[str, float] = {}
 
+    def _node_dur_us(node: OpNode) -> float:
+        """Return per-node duration from PerfResult, or fall back to us_per_op."""
+        if node.perf_result is not None and node.perf_result.total_time_us > 0:
+            return node.perf_result.total_time_us
+        return us_per_op
+
     events: list[dict[str, Any]] = []
     for node in result.compute_graph.nodes.values():
         phase = node.phase or "unknown"
         tid = _get_tid(phase)
         ts = phase_ts.get(phase, 0.0)
-        events.append(_op_to_chrome_event(node, pid=0, tid=tid, ts_us=ts, dur_us=us_per_op))
-        phase_ts[phase] = ts + us_per_op
+        dur = _node_dur_us(node)
+        events.append(_op_to_chrome_event(node, pid=0, tid=tid, ts_us=ts, dur_us=dur))
+        phase_ts[phase] = ts + dur
 
     # Add FSDP events as a separate process
     for ev in result.fsdp_events:
         phase = ev.get("phase", "unknown")
-        tid = _get_tid(f"fsdp_{phase}")
         ts = phase_ts.get(f"fsdp_{phase}", 0.0)
         events.append(
             {
                 "ph": "X",
                 "pid": 1,
                 "tid": _get_tid(f"fsdp_{phase}"),
-                "ts": ts,
-                "dur": us_per_op,
+                "ts": ts / 1000.0,
+                "dur": us_per_op / 1000.0,
                 "name": ev.get("event_type", "fsdp_event"),
                 "cat": "fsdp",
                 "args": ev,
@@ -228,7 +235,11 @@ def export_chrome_trace(
         )
         phase_ts[f"fsdp_{phase}"] = ts + us_per_op
 
-    # Metadata events
+    # Add schedule events as Chrome trace duration events
+    if result.schedule is not None:
+        _add_schedule_trace_events(events, result, _get_tid)
+
+    # Metadata events (thread_name for each tid)
     for phase, tid in phase_tid.items():
         events.append(
             {
@@ -240,9 +251,183 @@ def export_chrome_trace(
             }
         )
 
-    trace = {"traceEvents": events, "displayTimeUnit": "us"}
+    trace = {"traceEvents": events, "displayTimeUnit": "ms"}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(trace, f, indent=2, default=str)
+
+
+def _add_schedule_trace_events(
+    events: list[dict[str, Any]],
+    result: SimulationResult,
+    _get_tid: Any,
+) -> None:
+    """Add schedule events + aggregated phase-level events as Chrome trace events.
+
+    pid layout:
+      pid=0:  individual OpNode events (existing)
+      pid=1:  FSDP events
+      pid=2:  PP schedule events
+      pid=3:  FSDP schedule events
+      pid=4:  TP schedule events
+      pid=5:  DP schedule events
+      pid=6:  Optimizer schedule events
+      pid=7:  Aggregated whole-graph phase blocks (forward / backward / optimizer)
+    """
+    # ── pid=7: Aggregated whole-graph phase blocks ──────────────────
+    _add_aggregated_phase_events(events, result)
+
+    if result.schedule is None:
+        return
+
+    # Collect events by strategy
+    by_strategy: dict[str, list[dict[str, Any]]] = {}
+    for ev in result.schedule.events:
+        d = ev.to_dict()
+        strategy = d.get("metadata", {}).get("strategy", "")
+        et = d.get("event_type", "")
+        if et.startswith("pp_") or et.startswith("loss"):
+            strategy = "pp"
+        elif et.startswith("fsdp2_"):
+            strategy = "fsdp"
+        elif et.startswith("tp_"):
+            strategy = "tp"
+        elif et.startswith("dp_"):
+            strategy = "dp"
+        elif et.startswith("optimizer"):
+            strategy = "optim"
+        by_strategy.setdefault(strategy, []).append(d)
+
+    pid_map = {"pp": 2, "fsdp": 3, "tp": 4, "dp": 5, "optim": 6}
+
+    for strategy, ev_list in by_strategy.items():
+        pid = pid_map.get(strategy, 7)
+        # One tid per lane within strategy
+        tid_map: dict[str, int] = {}
+        tid_counter = [0]
+        for ev in ev_list:
+            lane = _schedule_event_lane_for_trace(ev, strategy)
+            if lane not in tid_map:
+                tid_map[lane] = tid_counter[0]
+                tid_counter[0] += 1
+            tid = pid * 100 + tid_map[lane]
+            ts = ev.get("perf_cumulative_start_us", ev.get("logical_clock", 0))
+            dur = ev.get("perf_total_time_us", 1.0)
+            if dur <= 0:
+                dur = 1.0
+            events.append({
+                "ph": "X",
+                "pid": pid,
+                "tid": tid,
+                "ts": ts / 1000.0,
+                "dur": dur / 1000.0,
+                "name": ev.get("event_type", "event"),
+                "cat": strategy,
+                "args": {
+                    "pp_stage": ev.get("pp_stage"),
+                    "mb": ev.get("microbatch_idx"),
+                    "rank": ev.get("rank"),
+                },
+            })
+
+    # Metadata events for each strategy
+    strategy_names = {"pp": "PP Schedule", "fsdp": "FSDP", "tp": "TP", "dp": "DP", "optim": "Optimizer"}
+    for strategy, pid in pid_map.items():
+        events.append({
+            "ph": "M",
+            "pid": pid,
+            "tid": 0,
+            "name": "process_name",
+            "args": {"name": strategy_names.get(strategy, strategy)},
+        })
+
+
+def _schedule_event_lane_for_trace(ev: dict[str, Any], strategy: str) -> str:
+    """One lane per physical rank (card)."""
+    return f"Rank {ev.get('rank', 0)}"
+
+
+def _add_aggregated_phase_events(
+    events: list[dict[str, Any]],
+    result: SimulationResult,
+) -> None:
+    """Add pid=7 aggregated whole-graph phase blocks.
+
+    Groups all OpNodes by (phase, pp_stage, microbatch_idx) and emits one
+    duration event per group so that chrome://tracing shows a coarse
+    forward / backward / optimizer overview without operator-level noise.
+    """
+    graph = result.compute_graph
+
+    # Group by (phase, pp_stage, microbatch)
+    from collections import defaultdict
+
+    groups: dict[tuple[str, int, int], list[float]] = defaultdict(list)
+    # Also track the earliest logical position for each group
+    group_indices: dict[tuple[str, int, int], list[int]] = defaultdict(list)
+
+    node_list = list(graph.nodes.values())
+    for idx, node in enumerate(node_list):
+        if node.perf_result is None:
+            continue
+        key = (node.phase or "unknown", node.pp_stage or 0, node.microbatch_idx or 0)
+        groups[key].append(node.perf_result.total_time_us)
+        group_indices[key].append(idx)
+
+    # Phase display order and colors
+    phase_order = ["forward", "backward", "optimizer"]
+    phase_colors: dict[str, str] = {
+        "forward": "#93c5fd",
+        "backward": "#fca5a5",
+        "optimizer": "#86efac",
+        "unknown": "#d5d8dc",
+    }
+
+    pid = 7
+    tid = 0
+    cumulative_ts_us = 0.0
+
+    for phase in phase_order:
+        # Find all groups for this phase
+        phase_groups = [(k, sum(times), min(group_indices[k]))
+                        for k, times in groups.items()
+                        if k[0] == phase]
+        if not phase_groups:
+            continue
+
+        for key, total_us, _ in phase_groups:
+            pp_stage, mb = key[1], key[2]
+            op_count_val = len(groups[key])
+            name = phase
+            if pp_stage or mb:
+                name += f" (s{pp_stage} mb{mb})"
+
+            events.append({
+                "ph": "X",
+                "pid": pid,
+                "tid": tid,
+                "ts": cumulative_ts_us / 1000.0,
+                "dur": total_us / 1000.0,
+                "name": name,
+                "cat": "aggregated",
+                "args": {
+                    "phase": phase,
+                    "pp_stage": pp_stage,
+                    "microbatch": mb,
+                    "op_count": len(groups[key]),
+                    "total_us": round(total_us, 3),
+                },
+            })
+            cumulative_ts_us += total_us
+            tid += 1
+
+    # Metadata
+    events.append({
+        "ph": "M",
+        "pid": pid,
+        "tid": 0,
+        "name": "process_name",
+        "args": {"name": "Aggregated Phases"},
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +436,99 @@ def export_chrome_trace(
 
 
 def _json_script_payload(result: SimulationResult) -> str:
-    return escape(json.dumps(result.to_dict(), default=str), quote=False)
+    data = result.to_dict()
+    # ── Inject schedule timing from OpNode perf_results ───────────────
+    _inject_schedule_timing(data, result)
+    return escape(json.dumps(data, default=str), quote=False)
+
+
+def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> None:
+    """Pre-compute per-schedule-event timing by aggregating OpNode perf_results.
+
+    Since the simulator runs on a single CPU process, OpNodes share
+    ``pp_stage=None`` and ``microbatch_idx=0``.  Schedule events are
+    therefore matched by *phase* only — all forward events split the
+    forward phase total evenly, all backward events split the backward
+    total, etc.
+
+    Adds ``data["perf_schedule"]`` with:
+    * ``events`` — each schedule event enriched with ``perf_total_time_us``
+    * ``phase_totals`` — per-phase aggregates
+    * ``grand_total_us`` — sum of all annotated OpNode times
+    """
+    graph = result.compute_graph
+    # Aggregate OpNode times by phase only (pp_stage/microbatch are None/0)
+    phase_totals: dict[str, float] = {}
+    for node in graph.nodes.values():
+        if node.perf_result is None:
+            continue
+        phase = node.phase or "unknown"
+        phase_totals[phase] = phase_totals.get(phase, 0.0) + node.perf_result.total_time_us
+    grand_total = sum(phase_totals.values())
+
+    # Count schedule events per mapped phase
+    event_counts: dict[str, int] = {}
+    schedule = data.get("schedule")
+    if schedule and schedule.get("events"):
+        for ev in schedule["events"]:
+            ev_type = ev.get("event_type", "")
+            metadata = ev.get("metadata", {}) or {}
+            strategy = metadata.get("strategy", "")
+            phase = _schedule_event_to_phase(ev_type, strategy)
+            event_counts[phase] = event_counts.get(phase, 0) + 1
+
+    # Enrich schedule events with timing
+    enriched_events: list[dict[str, Any]] = []
+    if schedule and schedule.get("events"):
+        cumulative_per_phase: dict[str, float] = {}
+        for ev in schedule["events"]:
+            ev_type = ev.get("event_type", "")
+            metadata = ev.get("metadata", {}) or {}
+            strategy = metadata.get("strategy", "")
+            phase = _schedule_event_to_phase(ev_type, strategy)
+
+            count = event_counts.get(phase, 1)
+            phase_total = phase_totals.get(phase, 0.0)
+            per_event = phase_total / max(count, 1)
+
+            ev_copy = dict(ev)
+            ev_copy["perf_total_time_us"] = round(per_event, 3)
+            ev_copy["perf_cumulative_start_us"] = round(cumulative_per_phase.get(phase, 0.0), 3)
+            cumulative_per_phase[phase] = cumulative_per_phase.get(phase, 0.0) + per_event
+            enriched_events.append(ev_copy)
+
+        schedule["events"] = enriched_events
+        schedule["perf_grand_total_us"] = round(grand_total, 3)
+
+    data["perf_schedule"] = {
+        "grand_total_us": round(grand_total, 3),
+        "phase_totals": {p: round(t, 3) for p, t in sorted(phase_totals.items())},
+    }
+
+
+def _schedule_event_to_phase(event_type: str, strategy: str) -> str:
+    """Map a schedule event type to an OpNode phase string."""
+    et = event_type.lower()
+    strategy_lower = (strategy or "").lower()
+    # Direct phase matches
+    if "bwd" in et or "backward" in et or "backward" in strategy_lower:
+        return "backward"
+    if "fwd" in et or "forward" in et:
+        return "forward"
+    if "optim" in et:
+        return "optimizer"
+    # Strategy-based mapping
+    if strategy_lower in ("pp", "compute"):
+        return "forward"
+    # Comm/FSDP/TP events: assign to the phase of surrounding ops.
+    # "reduce_scatter" and "gradient" events happen during backward.
+    if "reduce" in et or "gradient" in et:
+        return "backward"
+    if strategy_lower in ("fsdp2", "tp", "dp"):
+        return "forward"  # all-gather/reduce scatter split: default forward
+    if "loss" in et:
+        return "forward"
+    return "forward"  # default
 
 
 def _format_bytes(num_bytes: int | float | None) -> str:
@@ -268,21 +545,22 @@ def _format_bytes(num_bytes: int | float | None) -> str:
 def _event_lane(ev: dict[str, Any]) -> str:
     event_type = str(ev.get("event_type", ""))
     metadata = ev.get("metadata", {}) or {}
-    if event_type.startswith("pp_") or ev.get("pp_stage") is not None or ev.get("pp_rank") is not None:
-        pp_rank = ev.get("pp_rank", ev.get("pp_stage", ev.get("rank", 0)))
-        pp_stage = ev.get("pp_stage")
-        if pp_stage is not None and pp_stage != pp_rank:
-            return f"PP rank {pp_rank} / stage {pp_stage}"
-        return f"PP rank {pp_rank}"
-    strategy = metadata.get("strategy")
-    if strategy:
-        return f"{strategy.upper()} rank {ev.get('rank', 0)}"
-    if ev.get("event_type", "").startswith("fsdp_"):
-        return f"FSDP rank {ev.get('rank', 0)}"
-    if event_type.startswith("tp_"):
-        return f"TP rank {ev.get('rank', 0)}"
-    if event_type.startswith("dp_"):
+    strategy = str(metadata.get("strategy", "")).lower()
+
+    if event_type.startswith("dp_") or strategy == "dp":
         return f"DP rank {ev.get('rank', 0)}"
+    if event_type.startswith("optimizer") or "step" in event_type:
+        return f"Optim rank {ev.get('rank', 0)}"
+    if event_type.startswith("tp_") or strategy == "tp":
+        return f"TP rank {ev.get('rank', 0)}"
+    if event_type.startswith("fsdp_") or strategy in ("fsdp2", "fsdp"):
+        return f"FSDP rank {ev.get('rank', 0)}"
+    if event_type.startswith("pp_") or ev.get("pp_stage") is not None:
+        pp_rank = ev.get("pp_rank", 0)
+        pp_stage = ev.get("pp_stage")
+        return f"PP stage {pp_stage or pp_rank} (rank {pp_rank})"
+    if event_type.startswith("loss") or strategy == "compute":
+        return f"Loss (pp rank {ev.get('pp_rank', 0)})"
     if ev.get("op"):
         return f"Comm rank {ev.get('rank', 0)}"
     return f"Rank {ev.get('rank', 0)}"
@@ -330,20 +608,28 @@ def _render_swimlane_canvas(
     *,
     step: int,
 ) -> str:
+    """Render a Chrome-trace-compatible timeline as an HTML canvas."""
     if not events:
         return '<p class="muted">No schedule events captured.</p>'
-    dep_count = len(deps or [])
     return f"""
-    <div class="rank-tabs" data-target="schedule-step-{step}"></div>
-    <div class="chart-toolbar" data-target="schedule-step-{step}">
-      <button type="button" data-action="zoom-in">Zoom in</button>
-      <button type="button" data-action="zoom-out">Zoom out</button>
-      <button type="button" data-action="reset">Reset</button>
-      <span class="muted chart-note">{len(events)} events, {dep_count} explicit deps. Drag or use the horizontal scrollbar to pan.</span>
-    </div>
-    <div class="chart-frame">
-      <canvas id="schedule-step-{step}" class="trace-chart schedule-chart" data-step="{step}"></canvas>
-    </div>
+    <details open>
+      <summary>Chrome Trace Timeline</summary>
+      <p class="muted">
+        Schedule events rendered in Chrome Trace format.  Each process (pid)
+        groups a parallelism strategy; threads (tid) are lanes within that
+        strategy.  Open <code>trace.json</code> in <code>chrome://tracing</code>
+        for the full interactive viewer.
+      </p>
+      <div class="chart-toolbar" data-target="chrome-trace-step-{step}">
+        <button type="button" data-action="zoom-in">Zoom in</button>
+        <button type="button" data-action="zoom-out">Zoom out</button>
+        <button type="button" data-action="reset">Reset</button>
+        <span class="muted chart-note">Drag or use horizontal scrollbar to pan.</span>
+      </div>
+      <div class="chart-frame">
+        <canvas id="chrome-trace-step-{step}" class="trace-chart chrome-trace-chart" data-step="{step}"></canvas>
+      </div>
+    </details>
     """
 
 
@@ -450,6 +736,9 @@ def export_html(
     peak_memory = memory_summary.get(
         "peak_live_bytes", memory_summary.get("graph_peak_live_bytes", 0)
     )
+    # Compute perf grand total for summary card
+    cost_summary = result.metadata.get("cost_model", {}) or {}
+    perf_grand_total_us = cost_summary.get("step_time_us", 0)
     data_payload = _json_script_payload(result)
     steps = sorted({_event_step(ev) for ev in schedule_events}) or [0]
 
@@ -534,6 +823,7 @@ def export_html(
       <div class="card"><div class="num">{len(result.comm_events)}</div><div>Communication events</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(peak_memory))}</div><div>Estimated live memory peak</div></div>
       <div class="card"><div class="num">{len(result.memory_events)}</div><div>Memory events</div></div>
+      <div class="card"><div class="num">{_format_time_us(perf_grand_total_us)}</div><div>Predicted step time</div></div>
     </section>
     <details open>
       <summary>Memory trace timeline and event breakdown</summary>
@@ -614,17 +904,35 @@ def export_html(
     function eventLane(ev) {{
       const eventType = String(ev.event_type || '');
       const metadata = ev.metadata || {{}};
-      if (eventType.startsWith('pp_') || ev.pp_stage !== null && ev.pp_stage !== undefined || ev.pp_rank !== null && ev.pp_rank !== undefined) {{
-        const ppRank = ev.pp_rank ?? ev.pp_stage ?? ev.rank ?? 0;
-        const ppStage = ev.pp_stage;
-        if (ppStage !== null && ppStage !== undefined && Number(ppStage) !== Number(ppRank)) return 'PP rank ' + ppRank + ' / stage ' + ppStage;
-        return 'PP rank ' + ppRank;
+      const strategy = String(metadata.strategy || '').toLowerCase();
+
+      // DP gradient sync — separate lane per DP rank
+      if (eventType.startsWith('dp_') || strategy === 'dp') {{
+        return 'DP rank ' + (ev.rank ?? 0);
       }}
-      if (metadata.strategy) return String(metadata.strategy).toUpperCase() + ' rank ' + (ev.rank ?? 0);
-      if (eventType.startsWith('fsdp_')) return 'FSDP rank ' + (ev.rank ?? 0);
-      if (eventType.startsWith('tp_')) return 'TP rank ' + (ev.rank ?? 0);
-      if (eventType.startsWith('dp_')) return 'DP rank ' + (ev.rank ?? 0);
-      if (ev.op) return 'Comm rank ' + (ev.rank ?? 0);
+      // Optimizer step — separate lane per rank
+      if (eventType.startsWith('optimizer') || eventType.includes('step')) {{
+        return 'Optim rank ' + (ev.rank ?? 0);
+      }}
+      // TP all-reduce — separate lane
+      if (eventType.startsWith('tp_') || strategy === 'tp') {{
+        return 'TP rank ' + (ev.rank ?? 0);
+      }}
+      // FSDP events
+      if (eventType.startsWith('fsdp_') || strategy === 'fsdp2' || strategy === 'fsdp') {{
+        return 'FSDP rank ' + (ev.rank ?? 0);
+      }}
+      // PP events (and anything else with pp_stage / pp_rank)
+      if (eventType.startsWith('pp_') || ev.pp_stage !== null && ev.pp_stage !== undefined) {{
+        const ppRank = ev.pp_rank ?? 0;
+        const ppStage = ev.pp_stage;
+        return 'PP stage ' + (ppStage ?? ppRank) + ' (rank ' + ppRank + ')';
+      }}
+      // Loss compute on last stage
+      if (eventType.startsWith('loss') || strategy === 'compute') {{
+        return 'Loss (pp rank ' + (ev.pp_rank ?? 0) + ')';
+      }}
+      // Fallback
       return 'Rank ' + (ev.rank ?? 0);
     }}
 
@@ -636,7 +944,9 @@ def export_html(
       if (eventType.startsWith('tp_')) return 'tp';
       if (eventType.startsWith('dp_')) return 'dp';
       if (eventType.startsWith('pp_') || ev.pp_stage !== null && ev.pp_stage !== undefined) return 'pp';
-      return null;
+      if (eventType.startsWith('loss')) return 'compute';
+      if (eventType.startsWith('optimizer')) return 'optim';
+      return 'other';
     }}
 
     function scheduleRankViews(events) {{
@@ -766,83 +1076,144 @@ def export_html(
       return palette.explicit;
     }}
 
-    function drawSchedule(canvas) {{
-      const state = chartState.get(canvas) || {{zoom: 1, rankView: 'all'}};
+    function drawChromeTrace(canvas) {{
+      const state = chartState.get(canvas) || {{zoom: 1}};
       chartState.set(canvas, state);
       const step = Number.parseInt(canvas.dataset.step || '0', 10);
       const allEvents = scheduleEvents().filter((ev) => eventStep(ev) === step);
-      const views = scheduleRankViews(allEvents);
-      const selectedView = views.find((view) => view.key === state.rankView) || views[0];
-      const events = allEvents.filter((ev) => rankViewMatches(ev, selectedView));
-      const eventIds = new Set(events.map((ev) => ev.event_id));
-      const deps = (TRACE.schedule?.deps || []).filter((dep) => eventIds.has(dep.from) && eventIds.has(dep.to));
-      const lanes = Array.from(new Set(events.map(eventLane))).sort();
-      const maxClock = Math.max(0, ...events.map((ev) => Number(ev.logical_clock || 0)));
-      const scale = 58 * state.zoom;
-      const width = Math.max(980, 220 + (maxClock + 3) * scale);
-      const height = Math.max(160, 80 + lanes.length * 64);
+      const hasTiming = allEvents.some(ev => ev.perf_cumulative_start_us !== undefined);
+
+      // Build Chrome-trace-style event list: group by (pid, tid) = lane
+      const laneMap = new Map();
+      for (const ev of allEvents) {{
+        const lane = chromeTraceLane(ev);
+        if (!laneMap.has(lane)) laneMap.set(lane, []);
+        laneMap.get(lane).push(ev);
+      }}
+
+      // Sort lanes
+      const lanes = Array.from(laneMap.keys()).sort();
+      // Sort events within each lane by cumulative start time
+      for (const [lane, items] of laneMap) {{
+        items.sort((a, b) => {{
+          const ta = a.perf_cumulative_start_us !== undefined ? a.perf_cumulative_start_us : Number(a.logical_clock || 0);
+          const tb = b.perf_cumulative_start_us !== undefined ? b.perf_cumulative_start_us : Number(b.logical_clock || 0);
+          return ta - tb;
+        }});
+      }}
+
+      // Compute time bounds
+      const maxTime = hasTiming
+        ? Math.max(1, ...allEvents.map(ev => (ev.perf_cumulative_start_us || 0) + (ev.perf_total_time_us || 0)))
+        : Math.max(0, ...allEvents.map(ev => Number(ev.logical_clock || 0)));
+      const pixelsPerUnit = hasTiming ? Math.max(0.005, 58 * state.zoom / 50) : 58 * state.zoom;
+      const laneH = 28;
+      const padTop = 40;
+      const labelW = 170;
+      const width = Math.max(980, labelW + 80 + (maxTime + 10) * pixelsPerUnit);
+      const height = Math.max(160, padTop + lanes.length * laneH + 24);
       const ctx = resizeCanvas(canvas, width, height);
       ctx.clearRect(0, 0, width, height);
-      ctx.font = '13px ui-sans-serif, system-ui, sans-serif';
+      ctx.font = '12px ui-sans-serif, system-ui, sans-serif';
       ctx.textBaseline = 'middle';
-      const note = document.querySelector('.chart-toolbar[data-target="' + canvas.id + '"] .chart-note');
-      if (note) note.textContent = events.length + ' visible events, ' + deps.length + ' visible deps. Current view: ' + selectedView.label + '. Drag or use the horizontal scrollbar to pan.';
 
-      const laneY = new Map();
+      // Note
+      const note = document.querySelector('.chart-toolbar[data-target=\"' + canvas.id + '\"] .chart-note');
+      const totalLabel = hasTiming ? (maxTime >= 1000 ? (maxTime / 1000).toFixed(2) + 'ms' : maxTime.toFixed(0) + 'µs') : maxTime + ' clocks';
+      if (note) note.textContent = allEvents.length + ' events in ' + lanes.length + ' lanes. Total span: ' + totalLabel + '. Drag or use scrollbar to pan.';
+
+      // Lane labels + backgrounds
       lanes.forEach((lane, idx) => {{
-        const y = 52 + idx * 64;
-        laneY.set(lane, y);
-        ctx.fillStyle = '#0f172a';
-        ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
-        ctx.fillText(lane, 14, y);
-        ctx.strokeStyle = '#cbd5e1';
-        ctx.lineWidth = 1;
+        const y = padTop + idx * laneH;
+        if (idx % 2 === 0) {{
+          ctx.fillStyle = '#f8fafc';
+          ctx.fillRect(labelW, y - laneH / 2, width - labelW - 30, laneH);
+        }}
+        // Show rank + PP annotation
+        const rankNum = lane.replace('Rank ', '');
+        const sample = laneMap.get(lane)?.[0];
+        let annotation = lane;
+        if (sample) {{
+          const ppR = sample.pp_rank;
+          const ppS = sample.pp_stage;
+          if (ppR !== null && ppR !== undefined) {{
+            annotation = 'Rank ' + rankNum + '  [PP' + ppR;
+            if (ppS !== null && ppS !== undefined && ppS !== ppR) annotation += ' v' + ppS;
+            annotation += ']';
+          }}
+        }}
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 10px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillText(annotation, 6, y);
+        ctx.strokeStyle = '#e2e8f0';
         ctx.beginPath();
-        ctx.moveTo(160, y);
-        ctx.lineTo(width - 30, y);
+        ctx.moveTo(labelW, y + laneH / 2);
+        ctx.lineTo(width - 30, y + laneH / 2);
         ctx.stroke();
       }});
 
-      const positions = new Map();
-      const prevByLane = new Map();
-      for (const ev of events) {{
-        const lane = eventLane(ev);
-        const clock = Number(ev.logical_clock || 0);
-        const x = 180 + clock * scale;
-        const y = laneY.get(lane);
-        positions.set(ev.event_id, {{x, y}});
-        if (prevByLane.has(lane)) {{
-          const prev = prevByLane.get(lane);
-          arrowLine(ctx, prev.x + 10, prev.y, x - 12, y, '#64748b', true, 1);
-        }}
-        prevByLane.set(lane, {{x, y}});
-      }}
-
-      for (const dep of deps) {{
-        const src = positions.get(dep.from);
-        const dst = positions.get(dep.to);
-        if (!src || !dst) continue;
-        arrowLine(ctx, src.x + 12, src.y, dst.x - 14, dst.y, depColor(dep.type || 'data'), dep.type === 'control', 1.8);
-      }}
-
-      for (const ev of events) {{
-        const pos = positions.get(ev.event_id);
-        const name = String(ev.name || ev.event_type || 'event');
-        const lower = name.toLowerCase();
-        let fill = palette.fwd;
-        if (lower.includes('fsdp')) fill = palette.fsdp;
-        else if (lower.includes('send') || lower.includes('recv') || lower.includes('all_') || lower.includes('scatter')) fill = palette.comm;
-        else if (lower.includes('bwd') || lower.includes('backward')) fill = palette.bwd;
+      // Time axis
+      const axisY = padTop + lanes.length * laneH + 8;
+      ctx.strokeStyle = '#94a3b8';
+      ctx.beginPath();
+      ctx.moveTo(labelW, axisY);
+      ctx.lineTo(width - 30, axisY);
+      ctx.stroke();
+      const numTicks = Math.min(10, Math.ceil(maxTime / (hasTiming ? 500 : 5)));
+      const tickInterval = Math.max(1, maxTime / numTicks);
+      for (let t = 0; t <= maxTime; t += tickInterval) {{
+        const tx = labelW + t * pixelsPerUnit;
+        ctx.fillStyle = '#64748b';
+        ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+        const tickLabel = hasTiming ? (t >= 1000 ? (t / 1000).toFixed(1) + 'ms' : Math.round(t) + 'µs') : Math.round(t);
+        ctx.fillText(tickLabel, tx, axisY + 10);
         ctx.beginPath();
-        ctx.arc(pos.x, pos.y, 10, 0, Math.PI * 2);
-        ctx.fillStyle = fill;
-        ctx.fill();
-        ctx.strokeStyle = '#0f172a';
+        ctx.moveTo(tx, axisY);
+        ctx.lineTo(tx, axisY + 4);
         ctx.stroke();
-        ctx.fillStyle = '#1f2937';
-        ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
-        ctx.fillText(shortName(name, 30), pos.x + 14, pos.y + 1);
       }}
+
+      // Draw bars
+      for (const [lane, items] of laneMap) {{
+        const laneIdx = lanes.indexOf(lane);
+        const y = padTop + laneIdx * laneH;
+        for (const ev of items) {{
+          const tStart = hasTiming ? (ev.perf_cumulative_start_us || 0) : Number(ev.logical_clock || 0);
+          const tDur = hasTiming ? Math.max(1, ev.perf_total_time_us || 0) : 1;
+          const x = labelW + tStart * pixelsPerUnit;
+          const barW = Math.max(4, tDur * pixelsPerUnit);
+          const barH = laneH - 6;
+
+          const name = String(ev.name || ev.event_type || '');
+          let fill = palette.fwd;
+          if (name.toLowerCase().includes('bwd')) fill = palette.bwd;
+          else if (name.toLowerCase().includes('fsdp')) fill = palette.fsdp;
+          else if (name.toLowerCase().includes('optim')) fill = '#86efac';
+          else if (name.toLowerCase().includes('gradient')) fill = '#c084fc';
+          else if (name.toLowerCase().includes('all_reduce')) fill = palette.comm;
+          else if (name.toLowerCase().includes('send') || name.toLowerCase().includes('recv')) fill = '#f97316';
+
+          ctx.fillStyle = fill;
+          ctx.fillRect(x, y - barH / 2, barW, barH);
+          ctx.strokeStyle = '#334155';
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(x, y - barH / 2, barW, barH);
+
+          // Name inside bar (if wide enough) or beside
+          if (barW > 50) {{
+            ctx.fillStyle = '#1e293b';
+            ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+            ctx.fillText(shortName(name, 18), x + 3, y);
+          }}
+        }}
+      }}
+    }}
+
+    function chromeTraceLane(ev) {{
+      // One lane per physical card (rank).  All parallelism events on the
+      // same card — PP forward/backward, FSDP, TP, DP, optimizer — are
+      // inherently sequential and rendered in a single horizontal lane.
+      return 'Rank ' + (ev.rank ?? 0);
     }}
 
     function drawDag(canvas) {{
@@ -903,13 +1274,24 @@ def export_html(
         const src = positions.get(edge.src);
         const dst = positions.get(edge.dst);
         if (!src || !dst) continue;
-        arrowLine(ctx, src.x + 200, src.y + 26, dst.x - 6, dst.y + 26, edge.type === 'data' ? '#2563eb' : '#64748b', edge.type === 'control', 1);
+        const srcNode = phaseNodes.find(n => n.node_id === edge.src);
+        const dstNode = phaseNodes.find(n => n.node_id === edge.dst);
+        const srcDur = Number(((srcNode || {{}}).perf_result || {{}}).total_time_us || 0);
+        const maxDur = Math.max(1, ...phaseNodes.map(n => Number((n.perf_result || {{}}).total_time_us || 0)));
+        const srcW = 140 + (srcDur > 0 ? Math.max(0.15, Math.log2(1 + srcDur) / Math.log2(1 + maxDur)) * 120 : 0);
+        arrowLine(ctx, src.x + srcW, src.y + 28, dst.x - 6, dst.y + 28, edge.type === 'data' ? '#2563eb' : '#64748b', edge.type === 'control', 1);
       }}
 
       for (const node of phaseNodes) {{
         const pos = positions.get(node.node_id);
         const fill = palette[node.op_type] || palette.unknown;
-        roundedRect(ctx, pos.x, pos.y, 205, 54, 8);
+        const pr = node.perf_result || {{}};
+        const durUs = Number(pr.total_time_us || 0);
+        // Scale node width by relative duration (log scale clamped)
+        const maxDur = Math.max(1, ...phaseNodes.map(n => Number((n.perf_result || {{}}).total_time_us || 0)));
+        const logScale = durUs > 0 ? Math.max(0.15, Math.log2(1 + durUs) / Math.log2(1 + maxDur)) : 0.15;
+        const nodeW = 140 + logScale * 120;
+        roundedRect(ctx, pos.x, pos.y, nodeW, 56, 8);
         ctx.fillStyle = fill;
         ctx.fill();
         ctx.strokeStyle = '#334155';
@@ -917,11 +1299,18 @@ def export_html(
         ctx.stroke();
         ctx.fillStyle = '#0f172a';
         ctx.font = '700 12px ui-sans-serif, system-ui, sans-serif';
-        ctx.fillText(shortName(node.op_name, 30), pos.x + 8, pos.y + 19);
+        ctx.fillText(shortName(node.op_name, 28), pos.x + 8, pos.y + 17);
         const shape = (node.outputs || []).slice(0, 1).map((t) => '[' + (t.shape || []).join(',') + ']').join(', ');
         ctx.fillStyle = '#334155';
         ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
-        ctx.fillText(shortName((node.op_type || 'unknown') + ' ' + shape, 34), pos.x + 8, pos.y + 39);
+        ctx.fillText(shortName((node.op_type || 'unknown') + ' ' + shape, 32), pos.x + 8, pos.y + 32);
+        // Perf timing annotation
+        if (durUs > 0) {{
+          const timeLabel = durUs >= 1000 ? (durUs / 1000).toFixed(2) + 'ms' : durUs.toFixed(1) + 'µs';
+          ctx.fillStyle = durUs > 50 ? '#b91c1c' : '#047857';
+          ctx.font = 'italic 10px ui-sans-serif, system-ui, sans-serif';
+          ctx.fillText(timeLabel, pos.x + 8, pos.y + 47);
+        }}
       }}
     }}
 
@@ -1115,7 +1504,7 @@ def export_html(
     }}
 
     function redraw(canvas) {{
-      if (canvas.classList.contains('schedule-chart')) drawSchedule(canvas);
+      if (canvas.classList.contains('chrome-trace-chart')) drawChromeTrace(canvas);
       else if (canvas.classList.contains('memory-chart')) drawMemoryTrace(canvas);
       else drawDag(canvas);
     }}
@@ -1145,7 +1534,9 @@ def export_html(
         event.preventDefault();
         frame.scrollLeft += event.deltaX || event.deltaY;
       }}, {{passive: false}});
-      if (canvas.classList.contains('schedule-chart')) renderRankTabs(canvas);
+      if (canvas.classList.contains('chrome-trace-chart')) {{
+        // No rank tabs needed for Chrome trace view
+      }}
       redraw(canvas);
     }}
 
@@ -1279,8 +1670,47 @@ def export_text_summary(result: SimulationResult) -> str:
                 for name, value in sorted(group.items()):
                     lines.append(f"    {name:<24}: {_format_bytes(value)}")
 
+    # ------------------------------------------------------------------
+    # Performance estimate (from CostModel / PerfResult)
+    # ------------------------------------------------------------------
+    cost_summary = result.metadata.get("cost_model", {}) or {}
+    if cost_summary:
+        section("Performance Estimate (CostModel)")
+        lines.append(f"  Predicted step time : {_format_time_us(cost_summary.get('step_time_us', 0))}")
+        lines.append(f"  Total compute time : {_format_time_us(cost_summary.get('total_compute_time_us', 0))}")
+        lines.append(f"  Total comm time    : {_format_time_us(cost_summary.get('total_comm_time_us', 0))}")
+        per_phase = cost_summary.get("per_phase", {}) or {}
+        if per_phase:
+            lines.append("")
+            lines.append("  Per-phase breakdown:")
+            for phase, times in sorted(per_phase.items()):
+                comp = _format_time_us(times.get("compute_time_us", 0))
+                comm = _format_time_us(times.get("comm_time_us", 0))
+                total = _format_time_us(times.get("total_time_us", 0))
+                lines.append(f"    {phase:<14}: compute={comp}  comm={comm}  total={total}")
+
+        # Annotated node count
+        annotated = sum(
+            1 for n in result.compute_graph.nodes.values()
+            if n.perf_result is not None
+        )
+        lines.append(f"  Nodes with perf data: {annotated} / {len(result.compute_graph.nodes)}")
+
     section("Metadata")
     for k, v in result.metadata.items():
+        if k == "cost_model":
+            continue  # already rendered above
         lines.append(f"  {k}: {v}")
 
     return "\n".join(lines)
+
+
+def _format_time_us(us: float | int) -> str:
+    """Format a time in microseconds to a human-readable string."""
+    us = float(us)
+    if us >= 1e6:
+        return f"{us / 1e6:.3f} s"
+    elif us >= 1e3:
+        return f"{us / 1e3:.3f} ms"
+    else:
+        return f"{us:.1f} µs"

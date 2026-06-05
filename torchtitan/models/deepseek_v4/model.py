@@ -9,7 +9,6 @@ import logging
 import math
 from dataclasses import dataclass, field
 
-import scipy
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -1645,6 +1644,7 @@ class DeepSeekV4Model(BaseModel):
         with torch.device(buffer_device):
             self.freqs_cis = precompute_freqs_cis(self.model_args, True)
             self.freqs_cis_wo_compressor = precompute_freqs_cis(self.model_args, False)
+            import scipy  # lazy import — only needed for hadamard matrix
             self.hadamard_mat = torch.tensor(
                 # pyrefly: ignore [implicit-import]
                 scipy.linalg.hadamard(self.model_args.index_head_dim, float),

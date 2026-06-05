@@ -30,6 +30,7 @@ Quick start::
     export_json(result, "output/result.json")
 """
 
+from .cost_model import CostModel, MockCostModel, apply_cost_model
 from .export import (
     export_chrome_trace,
     export_dot,
@@ -41,6 +42,7 @@ from .nodes import (
     ComputeGraph,
     DataEdge,
     OpNode,
+    PerfResult,
     ScheduleDep,
     ScheduleEvent,
     SimulationResult,
@@ -61,6 +63,11 @@ __all__ = [
     "TensorMeta",
     "ScheduleEvent",
     "ScheduleDep",
+    # Cost model
+    "CostModel",
+    "MockCostModel",
+    "PerfResult",
+    "apply_cost_model",
     # Export helpers
     "export_json",
     "export_dot",

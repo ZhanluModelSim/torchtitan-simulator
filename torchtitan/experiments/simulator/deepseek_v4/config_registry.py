@@ -26,6 +26,7 @@ def deepseek_v4_sim_smoketest() -> SimulationTrainer.Config:
         parallelism=ParallelismConfig(
             pipeline_parallel_degree=2,
             pipeline_parallel_schedule="Interleaved1F1B",
+            pipeline_parallel_microbatch_size=8,
             tensor_parallel_degree=2,
             data_parallel_shard_degree=2,
             data_parallel_replicate_degree=1,
@@ -35,5 +36,6 @@ def deepseek_v4_sim_smoketest() -> SimulationTrainer.Config:
             output_dir="./simulator_output",
             output_formats=["json", "dot", "chrome_trace", "html", "text"],
             semantic_schedule=True,
+            cost_model=True,
         ),
     )

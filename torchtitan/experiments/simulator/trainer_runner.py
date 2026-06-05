@@ -15,6 +15,7 @@ from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools.logging import logger
 
+from .cost_model import MockCostModel, apply_cost_model
 from .export import (
     export_chrome_trace,
     export_dot,
@@ -129,18 +130,32 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         pp_schedule=None,
         pp_stages=pp_stages,
     ):
-        for mb_idx, (input_dict, labels) in enumerate(microbatches):
-            capture.set_microbatch(mb_idx)
-            capture.set_phase("forward")
-            for k, v in input_dict.items():
-                if isinstance(v, torch.Tensor):
-                    input_dict[k] = v.to(trainer.device)
-            labels = labels.to(trainer.device)
-            trainer.forward_backward_step(
-                input_dict=input_dict,
-                labels=labels,
-                global_valid_tokens=global_valid_tokens,
-            )
+        # Monkey-patch Tensor.backward to detect backward pass phase
+        _original_backward = torch.Tensor.backward
+
+        def _backward_with_phase(self, *args: Any, **kwargs: Any) -> None:
+            capture.set_phase("backward")
+            try:
+                _original_backward(self, *args, **kwargs)
+            finally:
+                capture.set_phase("forward")
+
+        torch.Tensor.backward = _backward_with_phase  # type: ignore[assignment]
+        try:
+            for mb_idx, (input_dict, labels) in enumerate(microbatches):
+                capture.set_microbatch(mb_idx)
+                capture.set_phase("forward")
+                for k, v in input_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        input_dict[k] = v.to(trainer.device)
+                labels = labels.to(trainer.device)
+                trainer.forward_backward_step(
+                    input_dict=input_dict,
+                    labels=labels,
+                    global_valid_tokens=global_valid_tokens,
+                )
+        finally:
+            torch.Tensor.backward = _original_backward  # type: ignore[assignment]
 
         capture.set_phase("optimizer")
         dist_utils.clip_grad_norm_(
@@ -167,8 +182,20 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         optimizer_name=getattr(trainer.config.optimizer, "name", None),
     )
 
+    # ── CostModel ──────────────────────────────────────────────────────
+    cost_model_enabled = getattr(sim_opts, "cost_model", False)
+    if cost_model_enabled:
+        cost_model = MockCostModel()
+        cost_summary = apply_cost_model(result, cost_model)
+        result.metadata["cost_model"] = cost_summary
+        logger.info(
+            "CostModel: step_time=%.1f us, compute=%.1f us, comm=%.1f us",
+            cost_summary["step_time_us"],
+            cost_summary["total_compute_time_us"],
+            cost_summary["total_comm_time_us"],
+        )
+
     if sim_opts.semantic_schedule:
-        _inject_semantic_schedule(result, trainer.config)
         _inject_semantic_schedule(result, trainer.config)
 
     if not microbatches:

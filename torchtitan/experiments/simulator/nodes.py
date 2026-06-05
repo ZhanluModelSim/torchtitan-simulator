@@ -63,6 +63,48 @@ class TensorMeta:
 
 
 @dataclass
+class PerfResult:
+    """Performance estimation for a single :class:`OpNode`.
+
+    Produced by a :class:`CostModel` and attached to each node.  All time
+    fields are in microseconds (µs).  Fields can be left at their defaults
+    when a cost model is not available.
+    """
+
+    compute_time_us: float = 0.0
+    """Estimated compute time in microseconds."""
+
+    comm_time_us: float = 0.0
+    """Estimated communication time in microseconds (non-zero only for comm ops)."""
+
+    total_time_us: float = 0.0
+    """Total estimated time (compute + comm)."""
+
+    flops: int = 0
+    """Estimated floating-point operations."""
+
+    bytes_read: int = 0
+    """Estimated bytes read from memory (or received over the network)."""
+
+    bytes_written: int = 0
+    """Estimated bytes written to memory (or sent over the network)."""
+
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Optional extra data from the cost model (e.g. roofline utilisation, bandwidth)."""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "compute_time_us": self.compute_time_us,
+            "comm_time_us": self.comm_time_us,
+            "total_time_us": self.total_time_us,
+            "flops": self.flops,
+            "bytes_read": self.bytes_read,
+            "bytes_written": self.bytes_written,
+            "metadata": self.metadata,
+        }
+
+
+@dataclass
 class OpNode:
     """
     A node in the computation graph representing a single operation.
@@ -89,9 +131,11 @@ class OpNode:
     # For comm ops
     comm_op: str | None = None  # e.g. "all_reduce", "all_gather", "send", "recv"
     comm_group_size: int | None = None
+    # Performance estimation (filled by CostModel)
+    perf_result: PerfResult | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "node_id": self.node_id,
             "op_name": self.op_name,
             "op_type": self.op_type,
@@ -105,6 +149,9 @@ class OpNode:
             "comm_op": self.comm_op,
             "comm_group_size": self.comm_group_size,
         }
+        if self.perf_result is not None:
+            d["perf_result"] = self.perf_result.to_dict()
+        return d
 
 
 @dataclass

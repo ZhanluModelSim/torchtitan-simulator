@@ -50,6 +50,7 @@ def llama3_sim_debugmodel() -> SimulationTrainer.Config:
             output_dir="./simulator_output",
             output_formats=["json", "dot", "chrome_trace", "html", "text"],
             capture_joint_fx=False,
+            cost_model=True,
         ),
     )
 
@@ -92,6 +93,7 @@ def llama3_sim_1024gpu() -> SimulationTrainer.Config:
         parallelism=ParallelismConfig(
             pipeline_parallel_degree=4,
             pipeline_parallel_schedule="Interleaved1F1B",
+            pipeline_parallel_microbatch_size=8,
             tensor_parallel_degree=8,
             data_parallel_shard_degree=4,
             data_parallel_replicate_degree=8,
@@ -103,5 +105,6 @@ def llama3_sim_1024gpu() -> SimulationTrainer.Config:
             output_formats=["json", "dot", "chrome_trace", "html", "text"],
             capture_joint_fx=False,
             semantic_schedule=True,
+            cost_model=True,
         ),
     )

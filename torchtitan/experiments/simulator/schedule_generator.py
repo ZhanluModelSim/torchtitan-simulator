@@ -239,126 +239,57 @@ def generate_interleaved_1f1b_schedule(
         bwd_grad_sent: dict[tuple[int, int], str] = {}  # (stage, mb) → send_grad_event_id
 
         # --- Warmup: pipeline fill ---
-        for i in range(total_stages):
-            stage = i
-            mb = i
-            if mb >= num_microbatches:
-                break
-            pp_rank = stage_to_pp_rank[stage]
-
-            pp_recv_dep = None
-            if stage > 0:
-                pp_recv_dep = fwd_sent.get((stage - 1, mb))
-
-            fsdp_dep = None
-            if stage > 0 and (stage - 1, mb) in fwd_done:
-                # Previous stage's fwd must finish before this stage's
-                # FSDP all-gather (if same rank).
-                prev_pp = stage_to_pp_rank.get(stage - 1)
-                if prev_pp == pp_rank:
-                    fsdp_dep = fwd_done[(stage - 1, mb)]
-
-            fwd_eid = _forward_pass(
-                step, pp_rank, stage, mb,
-                fsdp_dep=fsdp_dep, pp_recv_dep=pp_recv_dep,
-            )
-            send_eid = _send_activation(step, pp_rank, stage, mb, fwd_eid)
-            fwd_done[(stage, mb)] = fwd_eid
-            fwd_sent[(stage, mb)] = send_eid
-
-        # --- Steady state: 1 forward + 1 backward ---
-        for j in range(total_stages, num_microbatches):
-            # Forward microbatch j on stage 0
-            fwd_eid = _forward_pass(
-                step, stage_to_pp_rank[0], 0, j,
-            )
-            send_eid = _send_activation(step, stage_to_pp_rank[0], 0, j, fwd_eid)
-            fwd_done[(0, j)] = fwd_eid
-            fwd_sent[(0, j)] = send_eid
-
-            # Shift forward through pipeline (like a conveyor belt)
-            for s in range(1, total_stages):
-                src_mb = j - s
-                if src_mb < 0 or src_mb >= num_microbatches:
+        # Each pipeline "clock" step introduces a new microbatch and shifts
+        # existing ones forward.  Stage 's' at clock 'clock' processes
+        # microbatch 'clock - s' (if it hasn't reached the end yet).
+        for clock in range(total_stages + num_microbatches - 1):
+            microbatch = clock
+            for s in range(min(total_stages, clock + 1)):
+                stage = s
+                mb = clock - s
+                if mb >= num_microbatches:
                     continue
-                pp_rank = stage_to_pp_rank[s]
-                pp_recv_dep = fwd_sent.get((s - 1, src_mb))
-                fsdp_dep = None
-                prev_pp = stage_to_pp_rank.get(s - 1)
-                if prev_pp == pp_rank and (s - 1, src_mb) in fwd_done:
-                    fsdp_dep = fwd_done[(s - 1, src_mb)]
+                if (stage, mb) in fwd_done:
+                    continue
+                pp_rank = stage_to_pp_rank[stage]
+
+                pp_recv_dep = None
+                if stage > 0:
+                    pp_recv_dep = fwd_sent.get((stage - 1, mb))
+
                 fwd_eid = _forward_pass(
-                    step, pp_rank, s, src_mb,
-                    fsdp_dep=fsdp_dep, pp_recv_dep=pp_recv_dep,
+                    step, pp_rank, stage, mb,
+                    pp_recv_dep=pp_recv_dep,
                 )
-                send_eid = _send_activation(step, pp_rank, s, src_mb, fwd_eid)
-                fwd_done[(s, src_mb)] = fwd_eid
-                fwd_sent[(s, src_mb)] = send_eid
+                send_eid = _send_activation(step, pp_rank, stage, mb, fwd_eid)
+                fwd_done[(stage, mb)] = fwd_eid
+                fwd_sent[(stage, mb)] = send_eid
 
-            # Backward the oldest microbatch
-            bwd_mb = j - total_stages
-            # Backward on last stage
-            last_stage = total_stages - 1
-            pp_rank = stage_to_pp_rank[last_stage]
+                # Once a microbatch reaches the last stage, trigger backward
+                if stage == total_stages - 1:
+                    loss_eid = _add(
+                        pp_rank * tp_degree * dp_degree, "loss_compute", "compute",
+                        pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+                    )
+                    rs_eid = _backward_pass(
+                        step, pp_rank, stage, mb,
+                        bwd_trigger_dep=loss_eid,
+                    )
+                    bwd_done[(stage, mb)] = rs_eid
+                    send_grad_eid = _send_gradient(step, pp_rank, stage, mb, rs_eid)
+                    bwd_grad_sent[(stage, mb)] = send_grad_eid
 
-            # Trigger: loss on last stage for the completed microbatch
-            loss_eid = _add(
-                pp_rank * tp_degree * dp_degree, "loss_compute", "compute",
-                pp_rank=pp_rank, pp_stage=last_stage, mb=bwd_mb, step=step,
-            )
-
-            bwd_recv = None
-            if last_stage + 1 < total_stages:
-                bwd_recv = bwd_grad_sent.get((last_stage + 1, bwd_mb))
-            rs_eid = _backward_pass(
-                step, pp_rank, last_stage, bwd_mb,
-                bwd_trigger_dep=loss_eid,
-                pp_recv_grad_dep=bwd_recv,
-            )
-            bwd_done[(last_stage, bwd_mb)] = rs_eid
-            send_grad_eid = _send_gradient(step, pp_rank, last_stage, bwd_mb, rs_eid)
-            bwd_grad_sent[(last_stage, bwd_mb)] = send_grad_eid
-
-            # Shift backward up the pipeline
-            for s in range(total_stages - 2, -1, -1):
-                pp_rank = stage_to_pp_rank[s]
-                pp_recv_grad = bwd_grad_sent.get((s + 1, bwd_mb))
-                rs_eid = _backward_pass(
-                    step, pp_rank, s, bwd_mb,
-                    pp_recv_grad_dep=pp_recv_grad,
-                )
-                bwd_done[(s, bwd_mb)] = rs_eid
-                send_grad_eid = _send_gradient(step, pp_rank, s, bwd_mb, rs_eid)
-                bwd_grad_sent[(s, bwd_mb)] = send_grad_eid
-
-        # --- Cooldown: drain backward pipeline ---
-        for i in range(num_microbatches - total_stages, num_microbatches):
-            bwd_mb = i
-            last_stage = total_stages - 1
-            pp_rank = stage_to_pp_rank[last_stage]
-            loss_eid = _add(
-                pp_rank * tp_degree * dp_degree, "loss_compute", "compute",
-                pp_rank=pp_rank, pp_stage=last_stage, mb=bwd_mb, step=step,
-            )
-            bwd_recv = bwd_grad_sent.get((last_stage + 1, bwd_mb)) if last_stage + 1 < total_stages else None
-            rs_eid = _backward_pass(
-                step, pp_rank, last_stage, bwd_mb,
-                bwd_trigger_dep=loss_eid, pp_recv_grad_dep=bwd_recv,
-            )
-            bwd_done[(last_stage, bwd_mb)] = rs_eid
-            send_grad = _send_gradient(step, pp_rank, last_stage, bwd_mb, rs_eid)
-            bwd_grad_sent[(last_stage, bwd_mb)] = send_grad
-
-            for s in range(total_stages - 2, -1, -1):
-                pp_rank = stage_to_pp_rank[s]
-                pp_recv_grad = bwd_grad_sent.get((s + 1, bwd_mb))
-                rs_eid = _backward_pass(
-                    step, pp_rank, s, bwd_mb,
-                    pp_recv_grad_dep=pp_recv_grad,
-                )
-                bwd_done[(s, bwd_mb)] = rs_eid
-                send_grad = _send_gradient(step, pp_rank, s, bwd_mb, rs_eid)
-                bwd_grad_sent[(s, bwd_mb)] = send_grad
+                    # Shift backward up the pipeline for this microbatch
+                    for bs in range(total_stages - 2, -1, -1):
+                        bwd_pp_rank = stage_to_pp_rank[bs]
+                        pp_recv_grad = bwd_grad_sent.get((bs + 1, mb))
+                        rs_eid = _backward_pass(
+                            step, bwd_pp_rank, bs, mb,
+                            pp_recv_grad_dep=pp_recv_grad,
+                        )
+                        bwd_done[(bs, mb)] = rs_eid
+                        send_grad = _send_gradient(step, bwd_pp_rank, bs, mb, rs_eid)
+                        bwd_grad_sent[(bs, mb)] = send_grad
 
         # --- Per-step DP gradient sync + optimizer ---
         for rank in range(total_ranks):
@@ -374,5 +305,53 @@ def generate_interleaved_1f1b_schedule(
                 pp_rank=pp_rank, pp_stage=stage, step=step,
                 deps=[(dp_sync, "control")],
             )
+
+    # ── Post-hoc: replicate PP-group schedule across TP/DP ranks ─────
+    # PP/FSDP/TP events are generated for the base rank of each PP group.
+    # We copy them to sibling ranks so the swimlane shows balanced work.
+    # dp_gradient_sync and optimizer_step are already emitted per-rank.
+    group_size = tp_degree * dp_degree
+    original_events = [e for e in schedule.events
+                       if e.metadata.get("strategy") in ("pp", "fsdp2", "tp", "compute")]
+    original_deps = list(schedule.deps)
+
+    eid_remap: dict[str, dict[int, str]] = {}
+    for ev in original_events:
+        base_rank = ev.rank
+        pp_group_base = (base_rank // group_size) * group_size
+        for r in range(pp_group_base, pp_group_base + group_size):
+            if r == base_rank:
+                continue
+            new_eid = nid(ev.event_type)
+            new_ev = ScheduleEvent(
+                event_id=new_eid,
+                event_type=ev.event_type,
+                rank=r,
+                pp_rank=ev.pp_rank,
+                pp_stage=ev.pp_stage,
+                microbatch_idx=ev.microbatch_idx,
+                logical_clock=rank_clock.get(r, 0),
+                metadata=dict(ev.metadata),
+            )
+            schedule.add_event(new_ev)
+            rank_clock[r] = rank_clock.get(r, 0) + 1
+
+            if ev.event_id not in eid_remap:
+                eid_remap[ev.event_id] = {}
+            eid_remap[ev.event_id][r] = new_eid
+
+            if r in prev_per_rank:
+                schedule.add_dep(ScheduleDep(prev_per_rank[r], new_eid, "control"))
+            prev_per_rank[r] = new_eid
+
+    for dep in original_deps:
+        from_eid = dep.from_event_id
+        to_eid = dep.to_event_id
+        remap_from = eid_remap.get(from_eid, {})
+        remap_to = eid_remap.get(to_eid, {})
+        for r, to_copy in remap_to.items():
+            from_copy = remap_from.get(r)
+            if from_copy:
+                schedule.add_dep(ScheduleDep(from_copy, to_copy, dep.dep_type))
 
     return schedule

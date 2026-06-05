@@ -592,9 +592,9 @@ class TestExport(unittest.TestCase):
                 content = f.read()
             assert "TorchTitan Simulation Trace" in content
             assert "operator dependency DAG" in content
-            assert "schedule swimlanes" in content
+            assert "Chrome Trace Timeline" in content
             assert "canvas" in content
-            assert "drawSchedule" in content
+            assert "drawChromeTrace" in content
             assert "drawDag" in content
             assert "Zoom in" in content
             assert "rank-tabs" in content
