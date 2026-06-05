@@ -44,6 +44,9 @@ def _get_cost_model_kwargs(sim_opts: Any) -> dict[str, Any]:
         import json
         return json.loads(raw)
     return {}
+
+
+def _import_cost_model(class_path: str, kwargs: dict[str, Any] | None = None) -> CostModel:
     """Dynamically import a CostModel from a fully-qualified path.
 
     Supports two patterns:
