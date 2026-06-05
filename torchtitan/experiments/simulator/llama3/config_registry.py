@@ -51,6 +51,7 @@ def llama3_sim_debugmodel() -> SimulationTrainer.Config:
             output_formats=["json", "dot", "chrome_trace", "html", "text"],
             capture_joint_fx=False,
             cost_model=True,
+            comm_backend="gloo",
         ),
     )
 
@@ -106,5 +107,6 @@ def llama3_sim_1024gpu() -> SimulationTrainer.Config:
             capture_joint_fx=False,
             semantic_schedule=True,
             cost_model=True,
+            comm_backend="gloo",
         ),
     )

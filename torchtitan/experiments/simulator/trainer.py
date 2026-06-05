@@ -9,6 +9,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import torch
+import torch.distributed as dist
+
 from torchtitan.trainer import Trainer
 
 from .cpu_env import patch_device_type_to_cpu
@@ -73,61 +76,35 @@ def _cpu_noop_parallelize(model, **__):
     return model
 
 
-def _cpu_gloo_parallelize(model: Any, **__: Any) -> Any:
-    """CPU+gloo parallelize: apply DTensor TP on CPU mesh.
 
-    Unlike ``_cpu_noop_parallelize``, this actually shards the model so that
-    real all-reduce / all-gather collectives fire and can be captured by
-    :class:`CommRecorder`.
+
+
+def _cpu_gloo_parallelize_llama(model: Any, **__: Any) -> Any:
+    """CPU+gloo Llama3 parallelize: apply FSDP1 on CPU.
+
+    Uses ``torch.distributed.fsdp.FullyShardedDataParallel`` (FSDP1) with
+    ``SHARD_GRAD_OP`` sharding, which works on CPU with the gloo backend.
+    This captures real all_gather / reduce_scatter communication events
+    with correct tensor shapes.
     """
-    try:
-        from torch.distributed.device_mesh import DeviceMesh
-    except ImportError:
-        return model
-
-    import torch
     import torch.distributed as dist
-    from torch.distributed._tensor import Replicate
-
-    if not dist.is_initialized():
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return model
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import ShardingStrategy
+        return FSDP(
+            model,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            device_id=torch.device("cpu"),
+        )
+    except Exception:
         return model
 
-    world_size = dist.get_world_size()
-    if world_size <= 1:
-        return model
 
-    # Use the world as a combined tp×dp mesh
-    mesh = DeviceMesh("cpu", torch.arange(world_size).tolist())
-    # Wrap parameters as DTensors so that TP ops (all_reduce on
-    # RowwiseParallel output, all_gather on ColwiseParallel input)
-    # are triggered during forward/backward.
-    from torch.distributed._tensor import distribute_module
-    from torch.distributed.tensor.parallel import (
-        ColwiseParallel,
-        RowwiseParallel,
-        parallelize_module,
-    )
-
-    # Collect linear layers and apply Colwise/Rowwise in alternating pairs
-    import torch.nn as nn
-
-    linear_plan: dict[str, Any] = {}
-    linear_modules: list[tuple[str, nn.Linear]] = []
-    for name, mod in model.named_modules():
-        if isinstance(mod, nn.Linear) and not name.endswith(".output"):
-            linear_modules.append((name, mod))
-
-    for i in range(0, len(linear_modules) - 1, 2):
-        linear_plan[linear_modules[i][0]] = ColwiseParallel()
-        linear_plan[linear_modules[i + 1][0]] = RowwiseParallel()
-
-    if linear_plan:
-        try:
-            model = parallelize_module(model, mesh, linear_plan)
-        except Exception:
-            pass  # Fall back to Replicate if parallelize fails
-
-    return model
+def _cpu_gloo_parallelize_dsv4(model: Any, **__: Any) -> Any:
+    """CPU+gloo DeepSeek V4 parallelize: apply FSDP1 on CPU."""
+    return _cpu_gloo_parallelize_llama(model, **__)
 
 
 def _cpu_noop_pipeline(model, **__):
@@ -181,7 +158,16 @@ class SimulationTrainer(Trainer):
         if pp * tp * ds * dr > 1:
             _set_fake_world_size(config)
 
-        config.model_spec.parallelize_fn = _cpu_noop_parallelize
+        # Select parallelize strategy based on comm_backend
+        comm_backend = getattr(sim_opts, "comm_backend", "") or ""
+        if comm_backend == "gloo":
+            model_name = getattr(config.model_spec, "name", "")
+            if "deepseek" in model_name.lower():
+                config.model_spec.parallelize_fn = _cpu_gloo_parallelize_dsv4
+            else:
+                config.model_spec.parallelize_fn = _cpu_gloo_parallelize_llama
+        else:
+            config.model_spec.parallelize_fn = _cpu_noop_parallelize
         config.model_spec.pipelining_fn = _cpu_noop_pipeline
 
         super().__init__(config)

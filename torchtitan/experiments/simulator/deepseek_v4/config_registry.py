@@ -37,5 +37,6 @@ def deepseek_v4_sim_smoketest() -> SimulationTrainer.Config:
             output_formats=["json", "dot", "chrome_trace", "html", "text"],
             semantic_schedule=True,
             cost_model=True,
+            comm_backend="gloo",
         ),
     )
