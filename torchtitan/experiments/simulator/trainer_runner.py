@@ -26,6 +26,7 @@ from .export import (
 from .extension_hooks import collect_extension_metadata, postprocess_extension_result
 from .fx_capture import capture_forward_fx, capture_joint_fx
 from .memory_estimator import attach_model_state_memory
+from .nodes import OpNode, TensorMeta
 from .pp_schedule_extractor import PPScheduleExtractor
 from .runtime_capture import RuntimeCapture
 from .schedule_generator import generate_interleaved_1f1b_schedule
@@ -162,15 +163,187 @@ def _inject_semantic_schedule(result: Any, config: Any) -> None:
             existing.add_dep(dep)
 
 
-def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
-    """
-    Run one simulated training step using an already-built Trainer instance.
+def _inject_synthetic_comm_events(
+    result: Any,
+    trainer: Any,
+    sim_opts: Any,
+) -> None:
+    """Inject synthetic communication events for fake_backend mode.
 
-    This keeps full compatibility with the native TorchTitan entry path:
-    model build, distributed init, dataloader, and parallelism setup are
-    unchanged; only execution is switched from `trainer.train()` to one-step
-    instrumented capture.
+    When running with fake_backend (no real distributed communication),
+    this function creates :class:`OpNode` entries for the FSDP all-gather,
+    FSDP reduce-scatter, TP all-reduce, and other collectives that
+    *would* be triggered by real parallelism.  Shapes and group sizes are
+    derived from the model's parameter structure and the parallelism config.
     """
+    if getattr(sim_opts, "comm_backend", "") == "gloo":
+        import torch.distributed as dist
+        if dist.is_initialized() and dist.get_backend() == dist.Backend.GLOO:
+            return  # Real comm already captured via gloo; skip synthetic injection
+
+    graph = result.compute_graph
+    parallelism = trainer.config.parallelism
+    model_parts = trainer.model_parts
+
+    # Read parallelism degrees
+    tp = int(getattr(parallelism, "tensor_parallel_degree", 1) or 1)
+    ds = int(getattr(parallelism, "data_parallel_shard_degree", 1) or 1)
+    pp = int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1)
+
+    if not (tp > 1 or ds > 1):
+        return  # No parallelism → no synthetic comm needed
+
+    # ── Compute model parameter bytes ────────────────────────────────
+    total_params = 0
+    per_module_bytes: dict[str, int] = {}
+    for part in model_parts:
+        for name, param in part.named_parameters():
+            if param.requires_grad:
+                nbytes = param.numel() * param.element_size()
+                total_params += nbytes
+                prefix = ".".join(name.split(".")[:2])
+                per_module_bytes[prefix] = per_module_bytes.get(prefix, 0) + nbytes
+
+    logger.info(
+        "Injecting synthetic comm events: tp=%d ds=%d total_params=%d",
+        tp, ds, total_params,
+    )
+
+    # Convert to per-DP-shard size
+    shard_bytes = total_params // ds if ds > 1 else total_params
+    dtype_str = "torch.float32"  # Assume fp32 for CPU simulation
+
+    # ── FSDP2 all_gather events ───────────────────────────────────────
+    counter = [len(graph.nodes)]
+    def _next_id() -> str:
+        counter[0] += 1
+        return f"comm_syn_{counter[0]:07d}"
+
+    if ds > 1:
+        # One all_gather per transformer layer (approximate)
+        num_layers = max(
+            len(per_module_bytes),
+            getattr(model_parts[0], "n_layers", 0) or
+            len(getattr(model_parts[0], "layers", [])),
+            1,
+        )
+        per_layer_bytes = shard_bytes // max(num_layers, 1)
+
+        # Forward: all_gather before each layer
+        for i in range(num_layers):
+            node = OpNode(
+                node_id=_next_id(),
+                op_name="all_gather",
+                op_type="comm_collective",
+                phase="forward",
+                inputs=[TensorMeta(shape=(per_layer_bytes,), dtype=dtype_str, device="cpu")],
+                outputs=[TensorMeta(shape=(per_layer_bytes * ds,), dtype=dtype_str, device="cpu")],
+                comm_op="all_gather",
+                comm_group_size=ds,
+                attrs={"synthetic": True},
+            )
+            graph.add_node(node)
+            result.comm_events.append({
+                "event_id": node.node_id,
+                "op": "all_gather",
+                "group_size": ds,
+                "phase": "forward",
+                "tensor_meta": {"shape": [per_layer_bytes], "dtype": dtype_str, "device": "cpu"},
+                "source_node_ids": [],
+                "synthetic": True,
+            })
+
+        # Backward: reduce_scatter after each layer
+        for i in range(num_layers):
+            node = OpNode(
+                node_id=_next_id(),
+                op_name="reduce_scatter",
+                op_type="comm_collective",
+                phase="backward",
+                inputs=[TensorMeta(shape=(per_layer_bytes * ds,), dtype=dtype_str, device="cpu")],
+                outputs=[TensorMeta(shape=(per_layer_bytes,), dtype=dtype_str, device="cpu")],
+                comm_op="reduce_scatter",
+                comm_group_size=ds,
+                attrs={"synthetic": True},
+            )
+            graph.add_node(node)
+            result.comm_events.append({
+                "event_id": node.node_id,
+                "op": "reduce_scatter",
+                "group_size": ds,
+                "phase": "backward",
+                "tensor_meta": {"shape": [per_layer_bytes * ds], "dtype": dtype_str, "device": "cpu"},
+                "source_node_ids": [],
+                "synthetic": True,
+            })
+
+    # ── TP all_reduce events ──────────────────────────────────────────
+    if tp > 1:
+        seq_len = trainer.config.training.seq_len
+        batch_size = trainer.config.training.local_batch_size
+        # Activation shape after RowwiseParallel: (batch, seq, hidden)
+        hidden = _guess_hidden_dim(model_parts[0])
+        act_bytes = batch_size * seq_len * hidden * 4  # fp32
+
+        for _ in range(max(1, len(per_module_bytes) // 2)):
+            # Forward: all_reduce on RowwiseParallel output
+            node = OpNode(
+                node_id=_next_id(),
+                op_name="all_reduce",
+                op_type="comm_collective",
+                phase="forward",
+                inputs=[TensorMeta(shape=(act_bytes,), dtype=dtype_str, device="cpu")],
+                outputs=[TensorMeta(shape=(act_bytes,), dtype=dtype_str, device="cpu")],
+                comm_op="all_reduce",
+                comm_group_size=tp,
+                attrs={"synthetic": True},
+            )
+            graph.add_node(node)
+            result.comm_events.append({
+                "event_id": node.node_id,
+                "op": "all_reduce",
+                "group_size": tp,
+                "phase": "forward",
+                "tensor_meta": {"shape": [batch_size, seq_len, hidden], "dtype": dtype_str, "device": "cpu"},
+                "source_node_ids": [],
+                "synthetic": True,
+            })
+
+            # Backward: all_reduce on gradient
+            node = OpNode(
+                node_id=_next_id(),
+                op_name="all_reduce",
+                op_type="comm_collective",
+                phase="backward",
+                inputs=[TensorMeta(shape=(act_bytes,), dtype=dtype_str, device="cpu")],
+                outputs=[TensorMeta(shape=(act_bytes,), dtype=dtype_str, device="cpu")],
+                comm_op="all_reduce",
+                comm_group_size=tp,
+                attrs={"synthetic": True},
+            )
+            graph.add_node(node)
+            result.comm_events.append({
+                "event_id": node.node_id,
+                "op": "all_reduce",
+                "group_size": tp,
+                "phase": "backward",
+                "tensor_meta": {"shape": [batch_size, seq_len, hidden], "dtype": dtype_str, "device": "cpu"},
+                "source_node_ids": [],
+                "synthetic": True,
+            })
+
+
+def _guess_hidden_dim(model: Any) -> int:
+    """Guess the hidden dimension from a model's first Linear layer."""
+    import torch.nn as nn
+    for mod in model.modules():
+        if isinstance(mod, nn.Linear):
+            return mod.in_features
+    return 512  # fallback
+
+
+def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
+    """Run one simulated training step using an already-built Trainer instance."""
     rank = int(os.environ.get("RANK", "0"))
     capture = RuntimeCapture(rank=rank)
     data_iterator = trainer.batch_generator(trainer.dataloader)
@@ -248,6 +421,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         trainer.model_parts,
         optimizer_name=getattr(trainer.config.optimizer, "name", None),
     )
+
+    # Inject synthetic comm events for fake_backend (no real distributed comm)
+    try:
+        _inject_synthetic_comm_events(result, trainer, sim_opts)
+    except Exception as exc:
+        logger.warning("Failed to inject synthetic comm events: %s", exc)
 
     # ── CostModel ──────────────────────────────────────────────────────
     cost_model_enabled = getattr(sim_opts, "cost_model", False)
