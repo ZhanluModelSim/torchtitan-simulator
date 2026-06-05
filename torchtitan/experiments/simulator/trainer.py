@@ -23,9 +23,14 @@ class SimulationConfig:
     capture_joint_fx: bool = False
     semantic_schedule: bool = False
     cost_model: bool = False
-    """When ``True``, run :class:`MockCostModel` over the compute graph and
-    attach :class:`PerfResult` to every :class:`OpNode`.  Performance
-    estimates appear in the chrome trace, HTML timeline, and text summary."""
+    """When ``True``, run a :class:`CostModel` over the compute graph.
+
+    The model class is determined by ``cost_model_class`` (defaults to
+    :class:`MockCostModel`)."""
+    cost_model_class: str = ""
+    """Fully-qualified Python class path for a custom :class:`CostModel`.
+    Example: ``\"my_package.my_module.MyCostModel\"``.
+    If empty and ``cost_model=True``, :class:`MockCostModel` is used."""
 
 
 def _cpu_noop_parallelize(model, **__):

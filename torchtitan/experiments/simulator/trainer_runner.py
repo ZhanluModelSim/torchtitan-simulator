@@ -15,7 +15,7 @@ from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools.logging import logger
 
-from .cost_model import MockCostModel, apply_cost_model
+from .cost_model import CostModel, MockCostModel, apply_cost_model
 from .export import (
     export_chrome_trace,
     export_dot,
@@ -29,6 +29,31 @@ from .memory_estimator import attach_model_state_memory
 from .pp_schedule_extractor import PPScheduleExtractor
 from .runtime_capture import RuntimeCapture
 from .schedule_generator import generate_interleaved_1f1b_schedule
+
+
+def _import_cost_model(class_path: str) -> CostModel:
+    """Dynamically import a CostModel subclass from a fully-qualified path.
+
+    Args:
+        class_path: e.g. ``\"my_package.my_module.MyCostModel\"``.
+
+    Returns:
+        An instance of the specified CostModel subclass.
+    """
+    module_path, _, cls_name = class_path.rpartition(".")
+    if not module_path:
+        raise ValueError(
+            f"cost_model_class must be a fully-qualified path (e.g. "
+            f"\"my_package.my_module.MyCostModel\"), got \"{class_path}\""
+        )
+    import importlib
+    module = importlib.import_module(module_path)
+    cls = getattr(module, cls_name)
+    if not issubclass(cls, CostModel):
+        raise TypeError(
+            f"{class_path} must be a subclass of CostModel"
+        )
+    return cls()
 
 
 def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> None:
@@ -185,7 +210,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     # ── CostModel ──────────────────────────────────────────────────────
     cost_model_enabled = getattr(sim_opts, "cost_model", False)
     if cost_model_enabled:
-        cost_model = MockCostModel()
+        cost_model_cls = getattr(sim_opts, "cost_model_class", "") or ""
+        if cost_model_cls:
+            # Dynamic import of third-party CostModel (no trainer_runner.py edits needed)
+            cost_model = _import_cost_model(cost_model_cls)
+        else:
+            cost_model = MockCostModel()
         cost_summary = apply_cost_model(result, cost_model)
         result.metadata["cost_model"] = cost_summary
         logger.info(

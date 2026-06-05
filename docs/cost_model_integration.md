@@ -2,6 +2,8 @@
 
 本文档说明如何将第三方 CostModel（计算 + 通信）接入 TorchTitan Simulator，实现端到端训练时长预测。
 
+**无需修改 `trainer_runner.py`** — 只需配置 `cost_model_class` 即可。
+
 ## 架构概览
 
 ```
@@ -85,7 +87,7 @@ class PerfResult:
 
 ### Step 1: 实现 CostModel 子类
 
-继承 `CostModel`，实现 `estimate_node()`。建议将计算和通信分开建模：
+在你的项目中创建一个 Python 文件，继承 `CostModel` 并实现 `estimate_node()`：
 
 ```python
 # my_cost_model.py
@@ -191,75 +193,46 @@ class MyCostModel(CostModel):
         return numel * dtype_sizes.get(dtype, 2)
 ```
 
-### Step 2: 接入 Pipeline
+### Step 2: 配置 `cost_model_class`
 
-在 `trainer_runner.py` 的 `run_trainer_simulation()` 中，CostModel 在 `build_result()` 之后、export 之前调用：
-
-```python
-# 位置: trainer_runner.py, run_trainer_simulation()
-if sim_opts.cost_model:
-    cost_model = MockCostModel()  # ← 替换为你的 MyCostModel()
-    cost_summary = apply_cost_model(result, cost_model)
-    result.metadata["cost_model"] = cost_summary
-```
-
-**方案 A: 直接替换**（推荐用于固定硬件）
-
-修改 `torchtitan/experiments/simulator/trainer_runner.py` 第 174 行附近：
-
-```python
-from my_cost_model import MyCostModel   # ← 添加你的 import
-
-if sim_opts.cost_model:
-    cost_model = MyCostModel(           # ← 替换 MockCostModel
-        compute_tflops=312.0,
-        nvlink_gb_per_s=600.0,
-    )
-    cost_summary = apply_cost_model(result, cost_model)
-    result.metadata["cost_model"] = cost_summary
-```
-
-**方案 B: 通过 Extension Hook**（推荐用于多硬件对比）
-
-在 `torchtitan/experiments/simulator/extension_hooks.py` 的 `postprocess_extension_result` 中：
-
-```python
-def postprocess_extension_result(result, trainer, sim_opts):
-    """外部扩展可以在自己的代码库中实现此函数。"""
-    from my_cost_model import MyCostModel
-    from torchtitan.experiments.simulator.cost_model import apply_cost_model
-
-    if sim_opts.cost_model:
-        cost_model = MyCostModel()
-        cost_summary = apply_cost_model(result, cost_model)
-        result.metadata["cost_model"] = cost_summary
-    return result
-```
-
-### Step 3: 启用
-
-在 `config_registry.py` 中设置 `simulation.cost_model=True`：
+在 `config_registry.py` 中设置 `simulation.cost_model_class` 为你的类的完整路径：
 
 ```python
 simulation=SimulationConfig(
     output_dir="./simulator_output",
     output_formats=["json", "dot", "chrome_trace", "html", "text"],
-    cost_model=True,         # ← 启用 CostModel
+    cost_model=True,
+    cost_model_class="my_package.my_cost_model.MyCostModel",  # ← 你的类路径
     semantic_schedule=True,
 ),
 ```
 
-或 CLI override：
+或通过 CLI override（无需改 config_registry）：
 
 ```bash
 MODULE=simulator.deepseek_v4 CONFIG=deepseek_v4_sim_smoketest \
   NGPU=1 python3 -m torchtitan.train \
   --module simulator.deepseek_v4 --config deepseek_v4_sim_smoketest \
   --training.steps 1 --comm.mode=fake_backend \
-  --simulation.cost_model True
+  --simulation.cost_model True \
+  --simulation.cost_model_class my_package.my_cost_model.MyCostModel
 ```
 
-### Step 4: 查看结果
+`trainer_runner.py` 会自动通过 `importlib` 动态加载你的类，实例化后调用 `estimate_graph()`。
+
+> **无需修改 `trainer_runner.py` 或 simulator 的任何源码。**
+
+### Step 3: 确保你的类在 Python path 中
+
+确保包含 `MyCostModel` 的 Python 包在 `PYTHONPATH` 中：
+
+```bash
+export PYTHONPATH="/path/to/your/project:$PYTHONPATH"
+```
+
+或者在项目的 `setup.py` / `pyproject.toml` 中声明依赖。
+
+### Step 4: 运行并查看结果
 
 | 输出文件 | 包含的 CostModel 数据 |
 |---------|----------------------|
