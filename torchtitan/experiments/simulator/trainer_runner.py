@@ -31,7 +31,19 @@ from .runtime_capture import RuntimeCapture
 from .schedule_generator import generate_interleaved_1f1b_schedule
 
 
-def _import_cost_model(class_path: str, kwargs: dict[str, Any] | None = None) -> CostModel:
+def _get_cost_model_kwargs(sim_opts: Any) -> dict[str, Any]:
+    """Normalise ``cost_model_kwargs`` from config or CLI.
+
+    Accepts both a plain Python dict (from ``config_registry``) and a JSON
+    string (from ``--simulation.cost_model_kwargs '...'`` on the CLI).
+    """
+    raw = getattr(sim_opts, "cost_model_kwargs", {}) or {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        import json
+        return json.loads(raw)
+    return {}
     """Dynamically import a CostModel from a fully-qualified path.
 
     Supports two patterns:
@@ -238,7 +250,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     cost_model_enabled = getattr(sim_opts, "cost_model", False)
     if cost_model_enabled:
         cost_model_cls = getattr(sim_opts, "cost_model_class", "") or ""
-        cost_model_kwargs = getattr(sim_opts, "cost_model_kwargs", {}) or {}
+        cost_model_kwargs = _get_cost_model_kwargs(sim_opts)
         if cost_model_cls:
             # Dynamic import of third-party CostModel (no trainer_runner.py edits needed)
             cost_model = _import_cost_model(cost_model_cls, cost_model_kwargs)

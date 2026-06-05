@@ -42,10 +42,17 @@ class SimulationConfig:
 
     If empty and ``cost_model=True``, :class:`MockCostModel` is used.
     """
-    cost_model_kwargs: dict[str, Any] = field(default_factory=dict)
-    """Keyword arguments forwarded to the ``cost_model_class`` constructor.
-    Only used when ``cost_model_class`` points to a class (not a factory).
-    Example: ``{\"compute_tflops\": 312.0, \"nvlink_gb_per_s\": 600.0}``"""
+    cost_model_kwargs: str = ""
+    """Keyword arguments forwarded to the ``cost_model_class`` constructor,
+    as a JSON string.  When set via ``config_registry``, use a Python dict
+    assigned directly; :meth:`~_get_cost_model_kwargs` normalises both forms.
+
+    CLI example::
+      --simulation.cost_model_kwargs '{"compute_tflops":312.0,"nvlink_gb_per_s":600.0}'
+
+    config_registry example::
+      cost_model_kwargs={"compute_tflops": 312.0, "nvlink_gb_per_s": 600.0}
+    """
 
 
 def _cpu_noop_parallelize(model, **__):
