@@ -193,36 +193,51 @@ class MyCostModel(CostModel):
         return numel * dtype_sizes.get(dtype, 2)
 ```
 
-### Step 2: 配置 `cost_model_class`
+### Step 2: 配置 `cost_model_class`（两种方式）
 
-在 `config_registry.py` 中设置 `simulation.cost_model_class` 为你的类的完整路径：
+**方式 A: 类路径 + kwargs**（推荐）
 
 ```python
 simulation=SimulationConfig(
-    output_dir="./simulator_output",
-    output_formats=["json", "dot", "chrome_trace", "html", "text"],
     cost_model=True,
-    cost_model_class="my_package.my_cost_model.MyCostModel",  # ← 你的类路径
-    semantic_schedule=True,
-),
+    cost_model_class="my_package.my_cost_model.MyCostModel",
+    cost_model_kwargs={
+        "compute_tflops": 312.0,
+        "nvlink_gb_per_s": 600.0,
+        "hbm_gb_per_s": 2000.0,
+    },
+)
 ```
 
-或通过 CLI override（无需改 config_registry）：
+`trainer_runner.py` 会自动执行 `MyCostModel(compute_tflops=312.0, ...)`。
+
+**方式 B: 工厂函数**（适合复杂初始化）
+
+```python
+# my_package/my_cost_model.py
+def create_my_cost_model():
+    compute_model = ComputeCostModel.load_calibration("a100.json")
+    comm_model = CommCostModel(topology="fat_tree")
+    return HybridCostModel(compute=compute_model, comm=comm_model)
+```
+
+```python
+simulation=SimulationConfig(
+    cost_model=True,
+    cost_model_class="my_package.my_cost_model.create_my_cost_model",
+    # cost_model_kwargs 对工厂函数不生效
+)
+```
+
+或通过 CLI override：
 
 ```bash
-MODULE=simulator.deepseek_v4 CONFIG=deepseek_v4_sim_smoketest \
-  NGPU=1 python3 -m torchtitan.train \
-  --module simulator.deepseek_v4 --config deepseek_v4_sim_smoketest \
-  --training.steps 1 --comm.mode=fake_backend \
-  --simulation.cost_model True \
-  --simulation.cost_model_class my_package.my_cost_model.MyCostModel
+--simulation.cost_model True \
+--simulation.cost_model_class my_package.my_cost_model.MyCostModel \
+--simulation.cost_model_kwargs '{"compute_tflops": 312.0, "nvlink_gb_per_s": 600.0}'
 ```
 
-`trainer_runner.py` 会自动通过 `importlib` 动态加载你的类，实例化后调用 `estimate_graph()`。
-
 > **无需修改 `trainer_runner.py` 或 simulator 的任何源码。**
-
-### Step 3: 确保你的类在 Python path 中
 
 确保包含 `MyCostModel` 的 Python 包在 `PYTHONPATH` 中：
 

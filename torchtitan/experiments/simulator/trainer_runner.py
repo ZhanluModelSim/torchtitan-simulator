@@ -31,29 +31,56 @@ from .runtime_capture import RuntimeCapture
 from .schedule_generator import generate_interleaved_1f1b_schedule
 
 
-def _import_cost_model(class_path: str) -> CostModel:
-    """Dynamically import a CostModel subclass from a fully-qualified path.
+def _import_cost_model(class_path: str, kwargs: dict[str, Any] | None = None) -> CostModel:
+    """Dynamically import a CostModel from a fully-qualified path.
+
+    Supports two patterns:
+
+    1. **Class** — ``\"my_pkg.MyCostModel\"`` → instantiated as
+       ``MyCostModel(**kwargs)``.  Must be a :class:`CostModel` subclass.
+
+    2. **Factory** — ``\"my_pkg.create_cost_model\"`` → called as
+       ``create_cost_model()`` (no args).  Must return a :class:`CostModel`.
 
     Args:
-        class_path: e.g. ``\"my_package.my_module.MyCostModel\"``.
+        class_path: e.g. ``\"my_package.my_module.MyCostModel\"`` or
+            ``\"my_package.my_module.create_cost_model\"``.
+        kwargs: Forwarded to the constructor (class pattern only).
 
     Returns:
-        An instance of the specified CostModel subclass.
+        An instance of :class:`CostModel`.
     """
-    module_path, _, cls_name = class_path.rpartition(".")
+    if kwargs is None:
+        kwargs = {}
+    module_path, _, name = class_path.rpartition(".")
     if not module_path:
         raise ValueError(
-            f"cost_model_class must be a fully-qualified path (e.g. "
-            f"\"my_package.my_module.MyCostModel\"), got \"{class_path}\""
+            f"cost_model_class must be a fully-qualified path, "
+            f"got \"{class_path}\""
         )
     import importlib
+
     module = importlib.import_module(module_path)
-    cls = getattr(module, cls_name)
-    if not issubclass(cls, CostModel):
-        raise TypeError(
-            f"{class_path} must be a subclass of CostModel"
-        )
-    return cls()
+    obj = getattr(module, name)
+
+    if isinstance(obj, type) and issubclass(obj, CostModel):
+        # Class pattern: instantiate with kwargs
+        return obj(**kwargs)
+
+    if callable(obj):
+        # Factory pattern: call with no args
+        result = obj()
+        if not isinstance(result, CostModel):
+            raise TypeError(
+                f"Factory \"{class_path}\" must return a CostModel instance, "
+                f"got {type(result)}"
+            )
+        return result
+
+    raise TypeError(
+        f"\"{class_path}\" must be a CostModel subclass or a callable "
+        f"returning a CostModel, got {type(obj)}"
+    )
 
 
 def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> None:
@@ -211,9 +238,10 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     cost_model_enabled = getattr(sim_opts, "cost_model", False)
     if cost_model_enabled:
         cost_model_cls = getattr(sim_opts, "cost_model_class", "") or ""
+        cost_model_kwargs = getattr(sim_opts, "cost_model_kwargs", {}) or {}
         if cost_model_cls:
             # Dynamic import of third-party CostModel (no trainer_runner.py edits needed)
-            cost_model = _import_cost_model(cost_model_cls)
+            cost_model = _import_cost_model(cost_model_cls, cost_model_kwargs)
         else:
             cost_model = MockCostModel()
         cost_summary = apply_cost_model(result, cost_model)

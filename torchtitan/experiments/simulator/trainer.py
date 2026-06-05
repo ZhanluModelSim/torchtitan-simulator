@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from torchtitan.trainer import Trainer
 
@@ -28,9 +29,23 @@ class SimulationConfig:
     The model class is determined by ``cost_model_class`` (defaults to
     :class:`MockCostModel`)."""
     cost_model_class: str = ""
-    """Fully-qualified Python class path for a custom :class:`CostModel`.
-    Example: ``\"my_package.my_module.MyCostModel\"``.
-    If empty and ``cost_model=True``, :class:`MockCostModel` is used."""
+    """Fully-qualified Python path for a custom :class:`CostModel` class or
+    factory function.  The path must resolve to either:
+
+    * a :class:`CostModel` subclass (instantiated with
+      ``cost_model_kwargs``), or
+    * a **factory function** that takes no arguments and returns a
+      :class:`CostModel` instance (useful for complex setup).
+
+    Example class path: ``\"my_package.MyCostModel\"``
+    Example factory path: ``\"my_package.create_cost_model\"``
+
+    If empty and ``cost_model=True``, :class:`MockCostModel` is used.
+    """
+    cost_model_kwargs: dict[str, Any] = field(default_factory=dict)
+    """Keyword arguments forwarded to the ``cost_model_class`` constructor.
+    Only used when ``cost_model_class`` points to a class (not a factory).
+    Example: ``{\"compute_tflops\": 312.0, \"nvlink_gb_per_s\": 600.0}``"""
 
 
 def _cpu_noop_parallelize(model, **__):
