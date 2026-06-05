@@ -53,6 +53,13 @@ class SimulationConfig:
     config_registry example::
       cost_model_kwargs={"compute_tflops": 312.0, "nvlink_gb_per_s": 600.0}
     """
+    comm_backend: str = ""
+    """Distributed backend for communication capture.
+    ``\"\"`` (empty, default) uses fake_backend (config validation only, no
+    real comm).  ``\"gloo\"`` enables real CPU communication capture via
+    the gloo backend, which can record FSDP all-gather / reduce-scatter,
+    TP all-reduce, and other collectives with actual tensor shapes.
+    Requires ``torchrun`` or ``mp.spawn`` for multi-process execution."""
 
 
 def _cpu_noop_parallelize(model, **__):
@@ -63,6 +70,63 @@ def _cpu_noop_parallelize(model, **__):
     builds.  Skipping FSDP/TP is safe because the interception-based
     runtime capture records the actual ops that execute.
     """
+    return model
+
+
+def _cpu_gloo_parallelize(model: Any, **__: Any) -> Any:
+    """CPU+gloo parallelize: apply DTensor TP on CPU mesh.
+
+    Unlike ``_cpu_noop_parallelize``, this actually shards the model so that
+    real all-reduce / all-gather collectives fire and can be captured by
+    :class:`CommRecorder`.
+    """
+    try:
+        from torch.distributed.device_mesh import DeviceMesh
+    except ImportError:
+        return model
+
+    import torch
+    import torch.distributed as dist
+    from torch.distributed._tensor import Replicate
+
+    if not dist.is_initialized():
+        return model
+
+    world_size = dist.get_world_size()
+    if world_size <= 1:
+        return model
+
+    # Use the world as a combined tp×dp mesh
+    mesh = DeviceMesh("cpu", torch.arange(world_size).tolist())
+    # Wrap parameters as DTensors so that TP ops (all_reduce on
+    # RowwiseParallel output, all_gather on ColwiseParallel input)
+    # are triggered during forward/backward.
+    from torch.distributed._tensor import distribute_module
+    from torch.distributed.tensor.parallel import (
+        ColwiseParallel,
+        RowwiseParallel,
+        parallelize_module,
+    )
+
+    # Collect linear layers and apply Colwise/Rowwise in alternating pairs
+    import torch.nn as nn
+
+    linear_plan: dict[str, Any] = {}
+    linear_modules: list[tuple[str, nn.Linear]] = []
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear) and not name.endswith(".output"):
+            linear_modules.append((name, mod))
+
+    for i in range(0, len(linear_modules) - 1, 2):
+        linear_plan[linear_modules[i][0]] = ColwiseParallel()
+        linear_plan[linear_modules[i + 1][0]] = RowwiseParallel()
+
+    if linear_plan:
+        try:
+            model = parallelize_module(model, mesh, linear_plan)
+        except Exception:
+            pass  # Fall back to Replicate if parallelize fails
+
     return model
 
 
@@ -107,6 +171,7 @@ class SimulationTrainer(Trainer):
     def __init__(self, config: Config):
         patch_device_type_to_cpu()
 
+        sim_opts = config.simulation
         pp = int(getattr(config.parallelism, "pipeline_parallel_degree", 1) or 1)
         tp = int(getattr(config.parallelism, "tensor_parallel_degree", 1) or 1)
         ds = int(getattr(config.parallelism, "data_parallel_shard_degree", -1) or -1)

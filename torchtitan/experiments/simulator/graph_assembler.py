@@ -154,17 +154,30 @@ class GraphAssembler:
             op_name = ev.get("op", "collective_unknown")
             phase = phase_override or ev.get("phase", "unknown")
 
-            # Build output TensorMeta from event shape info if available
+            # Build input/output TensorMeta from event shape info
+            input_metas: list[TensorMeta] = []
             output_metas: list[TensorMeta] = []
-            for shape_entry in ev.get("tensor_shapes", []):
-                if shape_entry is not None:
-                    output_metas.append(
-                        TensorMeta(
-                            shape=tuple(shape_entry.get("shape", [])),
-                            dtype=shape_entry.get("dtype", "unknown"),
-                            device=shape_entry.get("device", "cpu"),
-                        )
-                    )
+
+            # Prefer tensor_shapes (list), fall back to tensor_meta (dict)
+            shape_entries = ev.get("tensor_shapes") or []
+            if not shape_entries:
+                tm = ev.get("tensor_meta")
+                if tm:
+                    shape_entries = [tm]
+
+            for entry in shape_entries:
+                if entry is None:
+                    continue
+                meta = TensorMeta(
+                    shape=tuple(entry.get("shape", [])),
+                    dtype=entry.get("dtype", "unknown"),
+                    device=entry.get("device", "cpu"),
+                    is_dtensor=entry.get("is_dtensor", False),
+                    placements=entry.get("placements"),
+                )
+                # For collectives, the tensor flows both in and out
+                input_metas.append(meta)
+                output_metas.append(meta)
 
             op_type = ev.get("op_type", "comm_collective")
             node = OpNode(
@@ -172,9 +185,10 @@ class GraphAssembler:
                 op_name=op_name,
                 op_type=op_type,
                 phase=phase,
-                inputs=[],
+                inputs=input_metas,
                 outputs=output_metas,
                 comm_op=op_name,
+                comm_group_size=ev.get("group_size"),
                 pp_stage=ev.get("pp_stage"),
                 microbatch_idx=ev.get("microbatch"),
                 attrs={
