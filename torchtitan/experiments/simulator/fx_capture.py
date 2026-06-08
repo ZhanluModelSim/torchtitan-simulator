@@ -44,84 +44,7 @@ from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
 from .nodes import ComputeGraph, DataEdge, OpNode, TensorMeta
-
-# ---------------------------------------------------------------------------
-# Op classification helpers (same logic as dispatch_interceptor, but operating
-# on FX node targets rather than live function objects)
-# ---------------------------------------------------------------------------
-
-_COMM_MARKERS = (
-    "_c10d_functional",
-    "c10d_functional",
-    "all_reduce",
-    "all_gather",
-    "reduce_scatter",
-    "all_to_all",
-    "broadcast",
-    "wait_tensor",
-    "barrier",
-)
-
-_P2P_MARKERS = ("_send", "_recv")
-
-_DATA_MOVE_MARKERS = ("_to_copy", "copy_")
-
-_MEMORY_MARKERS = (
-    "aten.empty",
-    "aten.zeros",
-    "aten.ones",
-    "aten.full",
-    "aten.arange",
-)
-
-_TRIVIAL_TARGETS = frozenset(
-    [
-        "aten.detach.default",
-        "aten.detach_.default",
-        "aten.alias.default",
-        "aten.t.default",
-        "aten.as_strided.default",
-        "aten._unsafe_view.default",
-        "aten.view.default",
-        "aten.lift_fresh_copy.default",
-        "aten.lift.default",
-    ]
-)
-
-_COMM_OP_MAP: list[tuple[str, str]] = [
-    ("reduce_scatter", "reduce_scatter"),
-    ("all_gather", "all_gather"),
-    ("all_reduce", "all_reduce"),
-    ("all_to_all", "all_to_all"),
-    ("broadcast", "broadcast"),
-    ("wait_tensor", "wait"),
-    ("barrier", "barrier"),
-    ("_send", "send"),
-    ("_recv", "recv"),
-]
-
-
-def _classify_fx_node(target: str) -> tuple[str, str | None]:
-    """Return ``(op_type, comm_op_or_None)``."""
-    if any(m in target for m in _P2P_MARKERS):
-        for substr, canonical in _COMM_OP_MAP:
-            if substr in target:
-                return "comm_p2p", canonical
-        return "comm_p2p", "p2p_unknown"
-
-    if any(m in target for m in _COMM_MARKERS):
-        for substr, canonical in _COMM_OP_MAP:
-            if substr in target:
-                return "comm_collective", canonical
-        return "comm_collective", "collective_unknown"
-
-    if any(m in target for m in _DATA_MOVE_MARKERS):
-        return "data_move", None
-
-    if any(target.startswith(m) or m in target for m in _MEMORY_MARKERS):
-        return "memory", None
-
-    return "compute", None
+from .op_classification import classify_op, TRIVIAL_TARGETS
 
 
 def _tensor_meta_from_val(val: Any) -> TensorMeta | None:
@@ -196,14 +119,14 @@ def fx_graph_to_compute_graph(
             continue
 
         target = str(fx_node.target)
-        if target in _TRIVIAL_TARGETS:
+        if target in TRIVIAL_TARGETS:
             continue
 
         counter[0] += 1
         node_id = f"fx_{counter[0]:07d}"
         fx_name_to_node_id[fx_node.name] = node_id
 
-        op_type, comm_op = _classify_fx_node(target)
+        op_type, comm_op = classify_op(target)
         input_metas = _collect_input_metas(fx_node)
         output_metas = _collect_output_metas(fx_node)
 

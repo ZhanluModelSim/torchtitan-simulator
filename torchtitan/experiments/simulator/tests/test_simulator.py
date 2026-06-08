@@ -1487,5 +1487,354 @@ class TestSimulatorIntegration(unittest.TestCase):
                 dist.destroy_process_group()
 
 
+class TestOpClassification(unittest.TestCase):
+    def test_compute_ops(self):
+        from torchtitan.experiments.simulator.op_classification import classify_op
+
+        for target in ("aten.mm.default", "aten.addmm.default", "aten.silu.default"):
+            op_type, comm_op = classify_op(target)
+            self.assertEqual(op_type, "compute")
+            self.assertIsNone(comm_op)
+
+    def test_comm_collective_ops(self):
+        from torchtitan.experiments.simulator.op_classification import classify_op
+
+        cases = [
+            ("_c10d_functional.reduce_scatter", "reduce_scatter"),
+            ("_c10d_functional.all_gather", "all_gather"),
+            ("_c10d_functional.all_reduce", "all_reduce"),
+            ("c10d_functional.all_to_all_single", "all_to_all"),
+            ("_c10d_functional.broadcast", "broadcast"),
+            ("_c10d_functional.wait_tensor", "wait"),
+            ("aten.barrier.default", "barrier"),
+        ]
+        for target, expected_comm in cases:
+            op_type, comm_op = classify_op(target)
+            self.assertEqual(op_type, "comm_collective")
+            self.assertEqual(comm_op, expected_comm)
+
+    def test_p2p_ops(self):
+        from torchtitan.experiments.simulator.op_classification import classify_op
+
+        cases = [
+            ("_c10d_functional._send", "send"),
+            ("_c10d_functional._recv", "recv"),
+        ]
+        for target, expected_comm in cases:
+            op_type, comm_op = classify_op(target)
+            self.assertEqual(op_type, "comm_p2p")
+            self.assertEqual(comm_op, expected_comm)
+
+    def test_data_move_ops(self):
+        from torchtitan.experiments.simulator.op_classification import classify_op
+
+        for target in ("_to_copy", "aten.copy_.default", ".to.device"):
+            op_type, comm_op = classify_op(target)
+            self.assertEqual(op_type, "data_move")
+            self.assertIsNone(comm_op)
+
+    def test_memory_ops(self):
+        from torchtitan.experiments.simulator.op_classification import classify_op
+
+        for target in (
+            "aten.empty.memory_format",
+            "aten.zeros",
+            "aten.ones",
+            "aten.rand.default",
+        ):
+            op_type, comm_op = classify_op(target)
+            self.assertEqual(op_type, "memory")
+            self.assertIsNone(comm_op)
+
+    def test_trivial_targets(self):
+        from torchtitan.experiments.simulator.op_classification import is_trivial
+
+        for target in (
+            "aten.detach.default",
+            "aten.view.default",
+            "aten.alias.default",
+        ):
+            self.assertTrue(is_trivial(target))
+        self.assertFalse(is_trivial("aten.mm.default"))
+
+    def test_consistency_with_fx_and_dispatch(self):
+        from torchtitan.experiments.simulator.op_classification import classify_op
+
+        targets = [
+            "aten.mm.default",
+            "_c10d_functional.all_reduce",
+            "_c10d_functional._send",
+            "_to_copy",
+            "aten.empty.memory_format",
+        ]
+        for target in targets:
+            op_type, comm_op = classify_op(target)
+            self.assertIsInstance(op_type, str)
+            self.assertTrue(
+                op_type
+                in ("compute", "comm_collective", "comm_p2p", "data_move", "memory")
+            )
+
+
+class TestUnifiedTrace(unittest.TestCase):
+    def test_trace_small_model_fake_mode(self):
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        model = _small_linear()
+        inputs = _example_inputs()
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, model, inputs, use_fake_mode=True):
+            output = model(*inputs)
+        result = recorder.build_result()
+        assert len(result.compute_graph.nodes) > 0
+        compute_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.op_type == "compute"
+        ]
+        assert len(compute_nodes) > 0
+        for n in compute_nodes:
+            assert n.phase == "forward"
+
+    def test_trace_small_model_eager_mode(self):
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        model = _small_linear()
+        inputs = _example_inputs()
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, use_fake_mode=False):
+            output = model(*inputs)
+        result = recorder.build_result()
+        assert len(result.compute_graph.nodes) > 0
+
+    def test_trace_backward_phase_detection(self):
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        model = _small_linear()
+        inputs = _example_inputs()
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, model, inputs, use_fake_mode=True):
+            output = model(*inputs)
+            loss = output.sum()
+            recorder.current_phase = "backward"
+            loss.backward()
+        result = recorder.build_result()
+        fwd_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.phase == "forward"
+        ]
+        bwd_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.phase == "backward"
+        ]
+        assert len(fwd_nodes) > 0
+        assert len(bwd_nodes) > 0
+
+    def test_trace_data_flow_edges(self):
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        model = nn.Linear(8, 4)
+        inputs = (torch.randn(2, 8),)
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, model, inputs, use_fake_mode=True):
+            output = model(*inputs)
+        assert len(recorder.edges) > 0
+        edge_types = {et for _, _, et in recorder.edges}
+        assert "data" in edge_types
+
+    def test_device_normalization_meta_to_cpu(self):
+        from torchtitan.experiments.simulator.unified_trace import _normalize_device
+
+        assert _normalize_device("meta") == "cpu"
+        assert _normalize_device("cpu") == "cpu"
+        assert _normalize_device("cuda:0") == "cuda:0"
+
+    def test_trace_meta_device_model(self):
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        with torch.device("meta"):
+            model = nn.Linear(16, 4)
+        # Inputs must also be meta for FakeTensorMode to accept them;
+        # the _fakeify_inputs helper in FX capture does this already.
+        # Here we create meta inputs directly.
+        inputs = (torch.randn(2, 16, device="meta"),)
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, model, inputs, use_fake_mode=True):
+            output = model(*inputs)
+        result = recorder.build_result()
+        assert len(result.compute_graph.nodes) > 0
+        for n in result.compute_graph.nodes.values():
+            for tm in n.inputs + n.outputs:
+                if tm.device == "meta":
+                    raise AssertionError(
+                        "TensorMeta.device should be normalized to 'cpu', got 'meta'"
+                    )
+
+    def test_trace_matches_dispatch_path_classification(self):
+        from torchtitan.experiments.simulator.op_classification import classify_op
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        model = nn.Linear(8, 4)
+        inputs = (torch.randn(2, 8),)
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, model, inputs, use_fake_mode=True):
+            output = model(*inputs)
+        for n in recorder.nodes:
+            expected_type, expected_comm = classify_op(n.op_name)
+            self.assertEqual(n.op_type, expected_type)
+            self.assertEqual(n.comm_op, expected_comm)
+
+
+class TestMetaDevicePatch(unittest.TestCase):
+    def test_meta_model_zero_memory(self):
+        with torch.device("meta"):
+            model = nn.Linear(16, 4)
+        # Meta tensors have shape/dtype but no data allocation.
+        # element_size() still returns dtype byte size (not 0), so
+        # memory is measured as numel * 0_data_bytes = effectively 0.
+        # The key invariant is: device.type == "meta" (no storage).
+        for p in model.parameters():
+            assert p.device.type == "meta"
+            assert p.is_meta
+
+    def test_meta_model_trace_produces_correct_graph(self):
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        with torch.device("meta"):
+            model = nn.Linear(8, 4)
+        inputs = (torch.randn(2, 8, device="meta"),)
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, model, inputs, use_fake_mode=True):
+            output = model(*inputs)
+        result = recorder.build_result()
+        assert len(result.compute_graph.nodes) > 0
+        for n in result.compute_graph.nodes.values():
+            for tm in n.inputs + n.outputs:
+                assert (
+                    tm.device == "cpu"
+                ), f"TensorMeta.device should be 'cpu', got '{tm.device}'"
+
+    def test_meta_device_module_stubs(self):
+        from torchtitan.experiments.simulator.meta_env import _make_meta_device_module
+
+        mod = _make_meta_device_module()
+        assert mod.device_count() == 0
+        assert mod.memory_allocated() == 0
+        assert mod.current_device() == 0
+        assert mod.get_device_name() == "Meta_Simulator"
+        mod.synchronize()
+        mod.empty_cache()
+
+    def test_meta_patch_sets_device_type(self):
+        import torchtitan.tools.utils as tt_utils
+
+        original_dt = getattr(tt_utils, "device_type", None)
+        original_dm = getattr(tt_utils, "device_module", None)
+
+        from torchtitan.experiments.simulator.meta_env import patch_device_type_to_meta
+
+        patch_device_type_to_meta()
+        assert tt_utils.device_type == "meta"
+        assert tt_utils.device_module.device_count() == 0
+
+        if original_dt is not None:
+            tt_utils.device_type = original_dt
+        if original_dm is not None:
+            tt_utils.device_module = original_dm
+
+
+class TestSimulatorUnified(unittest.TestCase):
+    def test_simulate_unified_cpu_mode(self):
+        from torchtitan.experiments.simulator.simulator import Simulator
+
+        sim = Simulator(rank=0, verbose=False)
+        model = _small_linear()
+        inputs = _example_inputs()
+        result = sim.simulate_unified(model, inputs, device_mode="cpu")
+        assert len(result.compute_graph.nodes) > 0
+        fwd_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.phase == "forward"
+        ]
+        bwd_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.phase == "backward"
+        ]
+        assert len(fwd_nodes) > 0
+        assert len(bwd_nodes) > 0
+        assert result.metadata["mode"] == "unified_trace"
+        assert result.metadata["device_mode"] == "cpu"
+
+    def test_simulate_unified_meta_mode(self):
+        from torchtitan.experiments.simulator.simulator import Simulator
+
+        sim = Simulator(rank=0, verbose=False)
+        with torch.device("meta"):
+            model = _small_linear()
+        inputs = (torch.randn(2, 16, device="meta"),)
+        result = sim.simulate_unified(model, inputs, device_mode="meta")
+        assert len(result.compute_graph.nodes) > 0
+        fwd_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.phase == "forward"
+        ]
+        bwd_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.phase == "backward"
+        ]
+        assert len(fwd_nodes) > 0
+        assert len(bwd_nodes) > 0
+        assert result.metadata["mode"] == "unified_trace"
+        assert result.metadata["device_mode"] == "meta"
+
+    def test_simulate_unified_meta_device_normalization(self):
+        from torchtitan.experiments.simulator.simulator import Simulator
+
+        sim = Simulator(rank=0, verbose=False)
+        with torch.device("meta"):
+            model = nn.Linear(8, 4)
+        inputs = (torch.randn(2, 8, device="meta"),)
+        result = sim.simulate_unified(model, inputs, device_mode="meta")
+        for n in result.compute_graph.nodes.values():
+            for tm in n.inputs + n.outputs:
+                assert tm.device == "cpu", f"Expected 'cpu', got '{tm.device}'"
+
+    def test_simulate_unified_produces_same_op_types_as_runtime(self):
+        from torchtitan.experiments.simulator.simulator import Simulator
+
+        sim = Simulator(rank=0, verbose=False)
+        model = nn.Linear(8, 4)
+        inputs = (torch.randn(2, 8),)
+
+        unified_result = sim.simulate_unified(model, inputs, device_mode="cpu")
+        runtime_result = sim.simulate_runtime([model], inputs)
+
+        unified_compute = {
+            n.op_name
+            for n in unified_result.compute_graph.nodes.values()
+            if n.op_type == "compute"
+        }
+        runtime_compute = {
+            n.op_name
+            for n in runtime_result.compute_graph.nodes.values()
+            if n.op_type == "compute"
+        }
+        assert len(unified_compute) > 0
+        assert len(runtime_compute) > 0
+
+
 if __name__ == "__main__":
     unittest.main()

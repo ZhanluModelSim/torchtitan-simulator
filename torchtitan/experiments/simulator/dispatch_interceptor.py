@@ -30,92 +30,7 @@ import torch.utils._pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from .nodes import OpNode, TensorMeta
-
-# ---------------------------------------------------------------------------
-# Op categorisation
-# ---------------------------------------------------------------------------
-
-# Prefixes / substrings that identify collective communication ops
-_COMM_COLLECTIVE_MARKERS = (
-    "_c10d_functional",
-    "c10d_functional",
-    "all_reduce",
-    "all_gather",
-    "reduce_scatter",
-    "all_to_all",
-    "broadcast_",
-    "wait_tensor",
-    "barrier",
-)
-
-# Substrings that identify point-to-point comm ops
-_COMM_P2P_MARKERS = ("_send", "_recv", ".send", ".recv")
-
-# Substrings that identify data-movement ops (device copy, dtype convert)
-_DATA_MOVE_MARKERS = ("_to_copy", "copy_", ".to.")
-
-# Allocation ops
-_MEMORY_MARKERS = (
-    "aten.empty",
-    "aten.zeros",
-    "aten.ones",
-    "aten.full",
-    "aten.arange",
-    "aten.rand",
-)
-
-# Ops that are too trivial/low-signal to record individually
-_SKIP_SUFFIXES = (
-    "aten.detach.default",
-    "aten.detach_.default",
-    "aten.alias.default",
-    "aten.t.default",
-    "aten.as_strided.default",
-    "aten._unsafe_view.default",
-    "aten.view.default",
-    "aten.lift_fresh_copy.default",
-    "aten.lift.default",
-)
-
-# Map from substring → canonical comm_op name
-_COMM_OP_MAP: list[tuple[str, str]] = [
-    ("reduce_scatter", "reduce_scatter"),
-    ("all_gather", "all_gather"),
-    ("all_reduce", "all_reduce"),
-    ("all_to_all", "all_to_all"),
-    ("broadcast", "broadcast"),
-    ("wait_tensor", "wait"),
-    ("barrier", "barrier"),
-    ("_send", "send"),
-    ("_recv", "recv"),
-]
-
-
-def _categorize_op(func_name: str) -> tuple[str, str | None]:
-    """Return ``(op_type, comm_op)`` for a given function name string."""
-    if any(m in func_name for m in _COMM_P2P_MARKERS):
-        for substr, canonical in _COMM_OP_MAP:
-            if substr in func_name:
-                return "comm_p2p", canonical
-        return "comm_p2p", "p2p_unknown"
-
-    if any(m in func_name for m in _COMM_COLLECTIVE_MARKERS):
-        for substr, canonical in _COMM_OP_MAP:
-            if substr in func_name:
-                return "comm_collective", canonical
-        return "comm_collective", "collective_unknown"
-
-    if any(m in func_name for m in _DATA_MOVE_MARKERS):
-        return "data_move", None
-
-    if any(func_name.startswith(m) or m in func_name for m in _MEMORY_MARKERS):
-        return "memory", None
-
-    return "compute", None
-
-
-def _is_trivial(func_name: str) -> bool:
-    return any(func_name.endswith(skip) for skip in _SKIP_SUFFIXES)
+from .op_classification import classify_op, TRIVIAL_TARGETS
 
 
 def _collect_tensor_metas(args: Any, kwargs: Any) -> list[TensorMeta]:
@@ -186,7 +101,7 @@ class OpRecorder:
         attrs: dict[str, Any] | None = None,
     ) -> OpNode:
         func_name = str(func)
-        op_type, comm_op = _categorize_op(func_name)
+        op_type, comm_op = classify_op(func_name)
 
         node = OpNode(
             node_id=self._next_id(),
@@ -259,7 +174,7 @@ class OpCaptureMode(TorchDispatchMode):
         # Execute first so output shapes are available
         result = func(*args, **kwargs)
 
-        if _is_trivial(func_name):
+        if func_name in TRIVIAL_TARGETS:
             return result
 
         input_metas = _collect_tensor_metas(args, kwargs)

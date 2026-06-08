@@ -48,9 +48,11 @@ from .export import (
     export_text_summary,
 )
 from .fx_capture import capture_forward_fx, capture_joint_fx
+from .meta_env import patch_device_type_to_meta
 from .nodes import SimulationResult, TrainingSchedule
 from .pp_schedule_extractor import PPScheduleExtractor
 from .runtime_capture import RuntimeCapture
+from .unified_trace import TraceRecorder, unified_trace
 
 
 class Simulator:
@@ -278,6 +280,98 @@ class Simulator:
             schedule=schedule,
             metadata={"mode": "pp_schedule_only", **(metadata or {})},
         )
+
+    # ------------------------------------------------------------------
+    # Mode 4: Unified dispatch trace (FakeTensorMode + TorchDispatchMode)
+    # ------------------------------------------------------------------
+
+    def simulate_unified(
+        self,
+        model: nn.Module,
+        example_inputs: tuple[Any, ...],
+        loss_fn: Any | None = None,
+        example_labels: torch.Tensor | None = None,
+        device_mode: str = "meta",
+        metadata: dict[str, Any] | None = None,
+    ) -> SimulationResult:
+        """
+        Trace *model* using the unified dispatch capture mode.
+
+        Combines ``FakeTensorMode`` with ``TorchDispatchMode`` to capture
+        every dispatched operation **without allocating any real memory**.
+        This is the preferred mode for ``fake_backend`` simulation because
+        it works on meta/FakeTensor inputs and produces a single coherent
+        compute graph in one pass.
+
+        When ``device_mode=\"meta\"``, the device environment is patched to
+        meta so that model parameters are shape-only (0 bytes).  When
+        ``device_mode=\"cpu\"``, the existing CPU patching is used and
+        ``FakeTensorMode`` is still active inside the unified trace context
+        (but real tensors are allocated for the model).
+
+        Args:
+            model: The model to trace.  Must be on meta (if
+                ``device_mode=\"meta\"``) or CPU (if ``device_mode=\"cpu\"``).
+            example_inputs: Positional input tensors.  Must match the model's
+                device (meta or CPU).
+            loss_fn: Optional loss function; defaults to ``output.sum()``.
+            example_labels: Labels for ``loss_fn``.
+            device_mode: ``\"meta\"`` or ``\"cpu\"``.  Controls which device
+                patching to apply.
+            metadata: Extra metadata.
+
+        Returns:
+            :class:`SimulationResult` with the unified compute graph.
+        """
+        self._log(f"Starting unified trace (device_mode={device_mode}) …")
+
+        if device_mode == "meta":
+            patch_device_type_to_meta()
+        else:
+            patch_device_type_to_cpu()
+
+        recorder = TraceRecorder(rank=self.rank)
+
+        use_fake = device_mode == "meta"
+
+        with unified_trace(
+            recorder,
+            model,
+            example_inputs,
+            use_fake_mode=use_fake,
+            phase="forward",
+        ):
+            self._log("  running forward pass …")
+            output = model(*example_inputs)
+
+            if loss_fn is not None and example_labels is not None:
+                loss = loss_fn(output, example_labels)
+            elif isinstance(output, torch.Tensor):
+                loss = output.sum()
+            else:
+                import torch.utils._pytree as pytree
+
+                flat, _ = pytree.tree_flatten(output)
+                loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
+
+            self._log("  running backward pass …")
+            recorder.current_phase = "backward"
+            loss.backward()
+
+        result = recorder.build_result(
+            metadata={
+                "mode": "unified_trace",
+                "device_mode": device_mode,
+                "rank": self.rank,
+                **(metadata or {}),
+            },
+        )
+
+        self._log(
+            f"  captured {len(result.compute_graph.nodes)} ops, "
+            f"{len(result.compute_graph.edges)} edges"
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Convenience: run all modes and export
