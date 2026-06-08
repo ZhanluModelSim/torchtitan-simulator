@@ -12,8 +12,8 @@ captured by the TorchTitan simulator.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
-from dataclasses import asdict, dataclass, field
 from typing import Any
 
 
@@ -230,6 +230,8 @@ class ScheduleEvent:
     microbatch_idx: int | None = None
     # Monotonically increasing logical clock; comparable within a single rank
     logical_clock: int = 0
+    # Links to fine-grained OpNodes in the compute graph (populated by link_schedule_to_graph)
+    op_node_ids: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -241,6 +243,7 @@ class ScheduleEvent:
             "pp_rank": self.pp_rank,
             "microbatch_idx": self.microbatch_idx,
             "logical_clock": self.logical_clock,
+            "op_node_ids": self.op_node_ids,
             "metadata": self.metadata,
         }
 

@@ -8,7 +8,11 @@ from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedCELoss
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.config import ActivationCheckpointConfig, ParallelismConfig, TrainingConfig
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    ParallelismConfig,
+    TrainingConfig,
+)
 from torchtitan.models.llama3.config_registry import model_registry
 
 from ..synthetic_dataloader import SyntheticTokenDataLoader

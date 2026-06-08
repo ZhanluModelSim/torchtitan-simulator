@@ -12,24 +12,21 @@ complete ordering of forward passes, backward passes, send operations, and
 receive operations across all ranks and microbatches — without actually
 executing any computation.
 
-For schedules that expose ``_compute_clock_cycles()`` or a ``_actions``
-attribute (``_PipelineScheduleRuntime``), we read the pre-computed action
-table directly.  For schedules that do not expose their internal action
-table, we reconstruct the schedule by calling the internal
-``_step_microbatches`` API under a dry-run mode.
+Primary strategy: read ``pipeline_order`` / ``pipeline_order_with_comms``
+from the schedule object (populated during ``__init__``).  Falls back to
+heuristic reconstruction for very old PyTorch versions that lack these
+attributes.
 
 Supported built-in schedules
 -----------------------------
-- ``Schedule1F1B`` (single-stage 1F1B)
-- ``ScheduleGPipe`` (single-stage GPipe)
-- ``ScheduleInterleaved1F1B`` (multi-stage interleaved)
-- ``ScheduleLoopedBFS`` (multi-stage BFS)
-- ``_PipelineScheduleRuntime`` (CSV-driven)
-- ``ScheduleDualPipeV`` and ``ScheduleZBVZeroBubble``
+All schedules registered in ``torch.distributed.pipelining.schedules``:
+Schedule1F1B, ScheduleGPipe, ScheduleInterleaved1F1B, ScheduleLoopedBFS,
+ScheduleInterleavedZeroBubble, ScheduleZBVZeroBubble, ScheduleDualPipeV,
+and ``_PipelineScheduleRuntime`` (CSV-driven).
 
 Usage::
 
-    extractor = PPScheduleExtractor(schedule, pp_rank=0, world_size=4)
+    extractor = PPScheduleExtractor(schedule, pp_rank=-1, world_size=4)
     training_schedule = extractor.extract()
     training_schedule.to_dict()  # -> JSON-serializable dict
 """
@@ -37,9 +34,12 @@ Usage::
 from __future__ import annotations
 
 import itertools
+import logging
 from typing import Any
 
 from .nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -58,7 +58,7 @@ _ACTION_SEND_FWD = "SEND_F"
 _ACTION_RECV_FWD = "RECV_F"
 _ACTION_SEND_BWD = "SEND_B"
 _ACTION_RECV_BWD = "RECV_B"
-_ACTION_SEND_ACT = "SEND_ACT"   # activation send (DP-style)
+_ACTION_SEND_ACT = "SEND_ACT"  # activation send (DP-style)
 _ACTION_RECV_ACT = "RECV_ACT"
 
 
@@ -117,22 +117,49 @@ class PPScheduleExtractor:
     # ------------------------------------------------------------------
 
     def extract(self) -> TrainingSchedule:
-        """Return a :class:`TrainingSchedule` describing the full pipeline schedule."""
+        """Return a :class:`TrainingSchedule` describing the full pipeline schedule.
+
+        Primary path: read ``pipeline_order_with_comms`` (multi-stage) or
+        ``pipeline_order`` (single-stage) from the schedule object, then
+        convert to TrainingSchedule via the shared conversion function.
+        Falls back to heuristic reconstruction if neither attribute exists.
+        """
+        from .schedule_extract import _convert_pipeline_order_to_training_schedule
+
+        # Primary: read pipeline_order from the schedule (populated at __init__)
+        pipeline_order = None
+        if hasattr(self.schedule, "pipeline_order_with_comms"):
+            pipeline_order = self.schedule.pipeline_order_with_comms
+        elif hasattr(self.schedule, "pipeline_order"):
+            pipeline_order = self.schedule.pipeline_order
+
+        if pipeline_order is not None:
+            pp_group_size = getattr(self.schedule, "pp_group_size", self.world_size)
+            return _convert_pipeline_order_to_training_schedule(
+                pipeline_order,
+                schedule=self.schedule,
+                pp_degree=pp_group_size,
+                tp_degree=1,
+                dp_degree=1,
+                n_microbatches=self.n_microbatches,
+                schedule_name=type(self.schedule).__name__,
+                virtual_stages_per_rank=1,
+            )
+
+        # Fallback: heuristic reconstruction (for very old PyTorch versions)
+        logger.warning(
+            "No pipeline_order found on schedule %s; using heuristic 1F1B",
+            type(self.schedule).__name__,
+        )
         metadata = {
             "schedule_type": type(self.schedule).__name__,
             "n_microbatches": self.n_microbatches,
             "pp_rank": self.pp_rank,
             "world_size": self.world_size,
+            "extraction_method": "heuristic_fallback",
         }
         ts = TrainingSchedule(metadata=metadata)
-
-        action_table = self._extract_action_table()
-        if action_table:
-            self._build_schedule_from_table(ts, action_table)
-        else:
-            # Fallback: reconstruct from schedule type heuristics
-            self._build_schedule_heuristic(ts)
-
+        self._build_schedule_heuristic(ts)
         self._add_send_recv_deps(ts)
         return ts
 
@@ -168,9 +195,7 @@ class PPScheduleExtractor:
         #  in a predictable pattern)
         return None
 
-    def _parse_runtime_actions(
-        self, actions: Any
-    ) -> dict[int, list[tuple[str, int]]]:
+    def _parse_runtime_actions(self, actions: Any) -> dict[int, list[tuple[str, int]]]:
         """
         Parse the actions dict from ``_PipelineScheduleRuntime._actions``.
 
@@ -189,10 +214,10 @@ class PPScheduleExtractor:
                     rank = item.get("rank", 0)
                     action = item.get("type", item.get("action", "F"))
                     mb = item.get("microbatch", item.get("mb", 0))
-                    table.setdefault(rank, []).append(
-                        (str(action).upper(), int(mb))
-                    )
-                elif hasattr(item, "computation_type") and hasattr(item, "microbatch_index"):
+                    table.setdefault(rank, []).append((str(action).upper(), int(mb)))
+                elif hasattr(item, "computation_type") and hasattr(
+                    item, "microbatch_index"
+                ):
                     # Action object with stage_index, computation_type, microbatch_index
                     rank = int(getattr(item, "stage_index", 0))
                     action_type, mb = self._unpack_action(item)
@@ -210,12 +235,13 @@ class PPScheduleExtractor:
                 for act in rank_actions:
                     if isinstance(act, dict):
                         parsed.append(
-                            (str(act.get("type", "F")).upper(), int(act.get("microbatch", 0)))
+                            (
+                                str(act.get("type", "F")).upper(),
+                                int(act.get("microbatch", 0)),
+                            )
                         )
                     elif hasattr(act, "type") and hasattr(act, "microbatch"):
-                        parsed.append(
-                            (str(act.type).upper(), int(act.microbatch))
-                        )
+                        parsed.append((str(act.type).upper(), int(act.microbatch)))
                     else:
                         action_type, mb = self._unpack_action(act)
                         parsed.append((action_type, mb))
@@ -294,11 +320,7 @@ class PPScheduleExtractor:
     ) -> None:
         counter = [0]
 
-        ranks = (
-            list(action_table.keys())
-            if self.pp_rank == -1
-            else [self.pp_rank]
-        )
+        ranks = list(action_table.keys()) if self.pp_rank == -1 else [self.pp_rank]
 
         for rank in ranks:
             actions = action_table.get(rank, [])

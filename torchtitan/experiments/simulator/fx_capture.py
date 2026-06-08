@@ -302,7 +302,11 @@ def capture_forward_fx(
     with FakeTensorMode(allow_non_fake_inputs=True) as fake_mode:
         fake_inputs = _fakeify_inputs(example_inputs, fake_mode)
         fake_kwargs = {
-            k: (fake_mode.from_tensor(v, static_shapes=True) if isinstance(v, torch.Tensor) else v)
+            k: (
+                fake_mode.from_tensor(v, static_shapes=True)
+                if isinstance(v, torch.Tensor)
+                else v
+            )
             for k, v in example_kwargs.items()
         }
 
@@ -365,7 +369,9 @@ def capture_joint_fx(
     buffers = {k: v.detach() for k, v in model.named_buffers()}
     trainable_names = [name for name, p in model.named_parameters() if p.requires_grad]
     if not trainable_names:
-        raise RuntimeError("joint fwd/bwd FX capture requires at least one trainable parameter")
+        raise RuntimeError(
+            "joint fwd/bwd FX capture requires at least one trainable parameter"
+        )
 
     def _loss_with_params(*param_values_and_inputs):
         n_params = len(trainable_names)

@@ -18,10 +18,40 @@ The module provides:
 
 from __future__ import annotations
 
-import math
+from collections import deque
 from typing import Any
 
 from .nodes import ComputeGraph, OpNode, PerfResult, SimulationResult
+
+# ---------------------------------------------------------------------------
+# Overlap strategies
+# ---------------------------------------------------------------------------
+
+
+class OverlapStrategy:
+    """Base class for compute/comm overlap estimation strategies."""
+
+    def overlap_factor(self, compute_us: float, comm_us: float) -> float:
+        """Return effective total time given compute and comm durations."""
+        raise NotImplementedError
+
+
+class NoOverlap(OverlapStrategy):
+    """No overlap: total = compute + comm."""
+
+    def overlap_factor(self, compute_us: float, comm_us: float) -> float:
+        return compute_us + comm_us
+
+
+class FixedOverlap(OverlapStrategy):
+    """Fixed-ratio overlap: total = compute + max(0, comm - compute * factor)."""
+
+    def __init__(self, factor: float = 0.5) -> None:
+        self.factor = factor
+
+    def overlap_factor(self, compute_us: float, comm_us: float) -> float:
+        return compute_us + max(0.0, comm_us - compute_us * self.factor)
+
 
 # ---------------------------------------------------------------------------
 # Mock hardware parameters
@@ -35,7 +65,7 @@ _DEFAULT_MOCK_COMM_GB_PER_S = 50.0  # inter-node / NVLink bandwidth (GB/s)
 _DEFAULT_MOCK_COMM_LATENCY_US = 5.0  # fixed per-collective latency (µs)
 
 
-def _estimate_flops(node: OpNode) -> int:
+def _estimate_flops(node: OpNode, default_seq_len: int = 4096) -> int:
     """Heuristic FLOPs estimate from op name and input/output shapes.
 
     Uses lightweight rules for the most common ATen ops.  Returns 0 for ops
@@ -52,16 +82,24 @@ def _estimate_flops(node: OpNode) -> int:
 
     # --- matmul-like ---
     if any(kw in op for kw in ("mm", "matmul", "bmm", "baddbmm", "addmm", "linear")):
-        # Roughly 2 * M * K * N for each matmul
+        left_idx = 1 if "addmm" in op else 0
+        right_idx = 2 if "addmm" in op else 1
+        if (
+            len(in_shapes) > max(left_idx, right_idx)
+            and len(in_shapes[left_idx]) >= 2
+            and len(in_shapes[right_idx]) >= 2
+        ):
+            batch_dims = (
+                _numel(in_shapes[left_idx][:-2]) if len(in_shapes[left_idx]) > 2 else 1
+            )
+            M = in_shapes[left_idx][-2]
+            K = in_shapes[left_idx][-1]
+            N = in_shapes[right_idx][-1]
+            return 2 * batch_dims * M * K * N
         total = 0
-        for inp in node.inputs:
-            s = inp.shape
-            if len(s) >= 2:
-                total += 2 * _numel(s[:-2]) * s[-2] * s[-1]
-        for out in node.outputs:
-            s = out.shape
-            if len(s) >= 2:
-                total += _numel(s)
+        for out in out_shapes:
+            if len(out) >= 2:
+                total += 2 * _numel(out)
         return total
 
     # --- scaled_dot_product_attention ---
@@ -98,16 +136,19 @@ def _estimate_flops(node: OpNode) -> int:
         flops_per_elem = 4
     elif "sqrt" in op or "rsqrt" in op:
         flops_per_elem = 3
-    elif "div" in op or "mul" in op or "add" in op or "sub" in op:
+    elif op.startswith("aten.add") or op == "add":
+        flops_per_elem = 1
+    elif op.startswith("aten.mul") or op == "mul":
+        flops_per_elem = 1
+    elif op.startswith("aten.div") or op == "div":
+        flops_per_elem = 1
+    elif op.startswith("aten.sub") or op == "sub":
         flops_per_elem = 1
     elif "norm" in op or "rms_norm" in op or "layer_norm" in op:
         flops_per_elem = 5
     elif "softmax" in op:
         flops_per_elem = 5
-    elif "silu" in op or "gelu" in op:
-        flops_per_elem = 5
     else:
-        # Generic compute op: assume ~2 FLOPs per output element
         flops_per_elem = 2
 
     total = 0
@@ -116,7 +157,7 @@ def _estimate_flops(node: OpNode) -> int:
     return total
 
 
-def _estimate_bytes(node: OpNode) -> tuple[int, int]:
+def _estimate_bytes(node: OpNode, default_seq_len: int = 4096) -> tuple[int, int]:
     """Estimate bytes read / written from tensor shapes.
 
     Returns:
@@ -124,37 +165,52 @@ def _estimate_bytes(node: OpNode) -> tuple[int, int]:
     """
     bytes_read = 0
     for inp in node.inputs:
-        bytes_read += _tensor_bytes(inp.shape, inp.dtype)
+        bytes_read += _tensor_bytes(inp.shape, inp.dtype, default_seq_len)
     bytes_written = 0
     for out in node.outputs:
-        bytes_written += _tensor_bytes(out.shape, out.dtype)
+        bytes_written += _tensor_bytes(out.shape, out.dtype, default_seq_len)
     return bytes_read, bytes_written
 
 
-def _estimate_comm_bytes(node: OpNode) -> int:
+def _estimate_comm_bytes(node: OpNode, default_seq_len: int = 4096) -> int:
     """Estimate bytes communicated by a collective or P2P op."""
+    if node.comm_op == "reduce_scatter":
+        total = 0
+        for inp in node.inputs:
+            total += _tensor_bytes(inp.shape, inp.dtype, default_seq_len)
+        return total
+    if node.comm_op == "all_gather":
+        total = 0
+        for out in node.outputs:
+            total += _tensor_bytes(out.shape, out.dtype, default_seq_len)
+        return total
     total = 0
     for out in node.outputs:
-        total += _tensor_bytes(out.shape, out.dtype)
+        total += _tensor_bytes(out.shape, out.dtype, default_seq_len)
     if total == 0:
         for inp in node.inputs:
-            total += _tensor_bytes(inp.shape, inp.dtype)
+            total += _tensor_bytes(inp.shape, inp.dtype, default_seq_len)
     return total
 
 
-def _numel(shape: tuple[int, ...]) -> int:
-    """Product of shape dimensions, handling dynamic dims (None or -1)."""
+def _numel(shape: tuple[int, ...], default_seq_len: int = 4096) -> int:
+    """Product of shape dimensions, handling dynamic dims (None or -1).
+
+    Dynamic dimensions (commonly sequence length in LLM training) are
+    replaced by *default_seq_len* rather than a hardcoded constant.
+    """
     prod = 1
     for d in shape:
         if d is None or d < 0:
-            # Dynamic dimension: use a reasonable default
-            prod *= 1024
+            prod *= default_seq_len
         else:
             prod *= d
     return prod
 
 
-def _tensor_bytes(shape: tuple[int, ...], dtype: str) -> int:
+def _tensor_bytes(
+    shape: tuple[int, ...], dtype: str, default_seq_len: int = 4096
+) -> int:
     """Bytes for a tensor of given shape and dtype string."""
     dtype_bytes = {
         "torch.float32": 4,
@@ -174,7 +230,7 @@ def _tensor_bytes(shape: tuple[int, ...], dtype: str) -> int:
         "torch.uint8": 1,
         "torch.bool": 1,
     }
-    return _numel(shape) * dtype_bytes.get(dtype, 2)
+    return _numel(shape, default_seq_len) * dtype_bytes.get(dtype, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +324,12 @@ class MockCostModel(CostModel):
         noise_std: Standard deviation of Gaussian noise added to each
             estimate as a fraction (default 0.05 = 5%).
         seed: Random seed for reproducible noise (default 42).
+        default_seq_len: Fallback value for dynamic (None / -1) dimensions
+            in tensor shapes, typically the training sequence length
+            (default 4096).
+        overlap_strategy: Optional :class:`OverlapStrategy` for
+            compute/comm overlap estimation.  If ``None``, no overlap
+            is applied (total = compute + comm).
     """
 
     def __init__(
@@ -279,6 +341,8 @@ class MockCostModel(CostModel):
         arithmetic_intensity_threshold: float = 10.0,
         noise_std: float = 0.05,
         seed: int = 42,
+        default_seq_len: int = 4096,
+        overlap_strategy: OverlapStrategy | None = None,
     ) -> None:
         self.tflops = tflops
         self.gb_per_s = gb_per_s
@@ -286,13 +350,19 @@ class MockCostModel(CostModel):
         self.comm_latency_us = comm_latency_us
         self.arithmetic_intensity_threshold = arithmetic_intensity_threshold
         self.noise_std = noise_std
+        self.default_seq_len = default_seq_len
+        self.overlap_strategy: OverlapStrategy | None = overlap_strategy
         self._rng = __import__("random").Random(seed)
 
     def estimate_node(self, node: OpNode) -> PerfResult:
         """Estimate performance for a single node using mock parameters."""
-        flops = _estimate_flops(node)
-        bytes_read, bytes_written = _estimate_bytes(node)
-        comm_bytes = _estimate_comm_bytes(node) if node.op_type.startswith("comm_") else 0
+        flops = _estimate_flops(node, self.default_seq_len)
+        bytes_read, bytes_written = _estimate_bytes(node, self.default_seq_len)
+        comm_bytes = (
+            _estimate_comm_bytes(node, self.default_seq_len)
+            if node.op_type.startswith("comm_")
+            else 0
+        )
 
         compute_time_us = 0.0
         comm_time_us = 0.0
@@ -310,11 +380,13 @@ class MockCostModel(CostModel):
                     compute_time_us = max(compute_time_us, mem_bound_time_us)
 
         elif node.op_type in ("comm_collective", "comm_p2p") and comm_bytes > 0:
-            comm_time_us = self.comm_latency_us + comm_bytes / (self.comm_gb_per_s * 1e3)
+            comm_time_us = self.comm_latency_us + comm_bytes / (
+                self.comm_gb_per_s * 1e3
+            )
             # Scale by group size heuristic (all_reduce has log(P) factor)
             if node.comm_op == "all_reduce" and node.comm_group_size:
                 gs = max(node.comm_group_size, 1)
-                comm_time_us *= (1 + math.log2(gs) * 0.5)
+                comm_time_us *= 2 * (gs - 1) / gs
 
         elif node.op_type in ("data_move", "memory"):
             # Data movement: bandwidth-bound
@@ -329,7 +401,12 @@ class MockCostModel(CostModel):
             noise2 = self._rng.gauss(0, self.noise_std)
             comm_time_us *= max(0.01, 1.0 + noise2)
 
-        total_time_us = compute_time_us + comm_time_us
+        if self.overlap_strategy and compute_time_us > 0 and comm_time_us > 0:
+            total_time_us = self.overlap_strategy.overlap_factor(
+                compute_time_us, comm_time_us
+            )
+        else:
+            total_time_us = compute_time_us + comm_time_us
 
         return PerfResult(
             compute_time_us=round(compute_time_us, 3),
@@ -359,9 +436,9 @@ class MockCostModel(CostModel):
 def _critical_path_time_us(graph: ComputeGraph) -> float:
     """Topological longest-path algorithm on the compute graph.
 
-    Uses ``perf_result.total_time_us`` as the node weight.  Comm and compute
-    are assumed to overlap partially — comm edges only add the comm portion
-    of the destination node when both nodes have compute time.
+    Uses ``perf_result.total_time_us`` as the node weight.  Returns the
+    maximum finish time across all nodes, which is the critical-path
+    duration.
 
     Returns:
         Longest path duration in microseconds, or 0.0 if graph is unannotated.
@@ -375,38 +452,153 @@ def _critical_path_time_us(graph: ComputeGraph) -> float:
             in_degree[edge.dst_node_id] = in_degree.get(edge.dst_node_id, 0) + 1
 
     # Topological sort
-    queue = [nid for nid, deg in in_degree.items() if deg == 0]
+    queue: deque[str] = deque(nid for nid, deg in in_degree.items() if deg == 0)
     topo: list[str] = []
     while queue:
-        u = queue.pop(0)
+        u = queue.popleft()
         topo.append(u)
         for v in adj.get(u, []):
             in_degree[v] -= 1
             if in_degree[v] == 0:
                 queue.append(v)
 
-    # DP longest path
+    # DP longest path — dist[u] = earliest finish time of node u
     dist: dict[str, float] = {}
     max_time = 0.0
     for u in topo:
         node = graph.nodes.get(u)
-        if node is None or node.perf_result is None:
-            dur = 0.0
-        else:
+        dur = 0.0
+        if node and node.perf_result:
             dur = node.perf_result.total_time_us
-        prev = dist.get(u, 0.0)
-        dist[u] = prev + dur
+        # max finish time of predecessors
+        pred_finish = 0.0
+        for edge in graph.edges:
+            if edge.dst_node_id == u and edge.src_node_id in dist:
+                pred_finish = max(pred_finish, dist[edge.src_node_id])
+        dist[u] = pred_finish + dur
         if dist[u] > max_time:
             max_time = dist[u]
-        for v in adj.get(u, []):
-            # Partial overlap: only add comm portion when crossing a comm edge
-            v_node = graph.nodes.get(v)
-            edge_cost = dur
-            if v_node and v_node.perf_result and v_node.perf_result.comm_time_us > 0:
-                # Communication can overlap with upstream compute;
-                # only add the portion that isn't overlapped.
-                edge_cost = max(0.0, dur - v_node.perf_result.comm_time_us * 0.5)
-            dist[v] = max(dist.get(v, 0.0), dist[u] + edge_cost)
+
+    return round(max_time, 3)
+
+
+# ---------------------------------------------------------------------------
+# Schedule-graph linking
+# ---------------------------------------------------------------------------
+
+
+def link_schedule_to_graph(result: SimulationResult) -> None:
+    """Populate ScheduleEvent.op_node_ids by matching (phase, pp_stage, microbatch_idx).
+
+    For each ScheduleEvent, find all OpNodes in result.compute_graph that share
+    the same phase, pp_stage (if set on both), and microbatch_idx (if set on both).
+    This bridges the coarse schedule and fine-grained compute graph, enabling
+    multi-rank step time prediction.
+    """
+    if result.schedule is None:
+        return
+
+    graph = result.compute_graph
+
+    # Build lookup: (phase, pp_stage, microbatch_idx) → list of node_ids
+    node_lookup: dict[tuple[str, int | None, int | None], list[str]] = {}
+    for nid, node in graph.nodes.items():
+        key = (node.phase, node.pp_stage, node.microbatch_idx)
+        node_lookup.setdefault(key, []).append(nid)
+
+    for event in result.schedule.events:
+        key = (
+            event.event_type.split("_", 1)[-1]
+            if "_" in event.event_type
+            else event.event_type,
+            event.pp_stage,
+            event.microbatch_idx,
+        )
+        # Map coarse event_type to phase
+        phase_map = {
+            "pp_forward": "forward",
+            "pp_backward": "backward",
+            "fsdp2_all_gather": "forward",
+            "fsdp2_reduce_scatter": "backward",
+            "dp_gradient_sync": "backward",
+            "optimizer_step": "optimizer",
+        }
+        phase = phase_map.get(event.event_type, "unknown")
+        lookup_key = (phase, event.pp_stage, event.microbatch_idx)
+        matches = node_lookup.get(lookup_key, [])
+        event.op_node_ids = matches
+
+
+# ---------------------------------------------------------------------------
+# Multi-rank step time prediction
+# ---------------------------------------------------------------------------
+
+
+def predict_multi_rank_step_time_us(
+    result: SimulationResult,
+    cost_model: CostModel | None = None,
+) -> float:
+    """Predict step time using multi-rank schedule dependency graph.
+
+    Falls back to single-rank critical-path if the schedule has no events
+    or the cost model has no annotations.
+
+    The algorithm:
+    1. Link schedule events to compute graph nodes via (phase, pp_stage, mb_idx).
+    2. For each schedule event, compute its duration from linked OpNode perf_results.
+       - If no linked nodes, fall back to cost_model.estimate_node().
+    3. Run longest-path on the schedule deps graph (events as nodes, deps as edges).
+    4. Return the maximum finish time across all ranks.
+
+    Args:
+        result: SimulationResult with populated schedule and compute_graph.
+        cost_model: Optional CostModel for fallback duration estimation.
+
+    Returns:
+        Predicted step time in microseconds.
+    """
+    if result.schedule is None or len(result.schedule.events) == 0:
+        if cost_model is None:
+            cost_model = MockCostModel()
+        cost_model.estimate_graph(result.compute_graph)
+        return cost_model.predict_step_time_us(result.compute_graph)
+
+    # Step 1: link schedule to graph
+    link_schedule_to_graph(result)
+
+    # Step 2: compute event durations
+    event_durations: dict[str, float] = {}
+    for event in result.schedule.events:
+        if event.op_node_ids:
+            total = 0.0
+            for nid in event.op_node_ids:
+                node = result.compute_graph.nodes.get(nid)
+                if node and node.perf_result:
+                    total += node.perf_result.total_time_us
+            event_durations[event.event_id] = total
+        else:
+            event_durations[event.event_id] = 0.0
+
+    # Step 3: longest-path on schedule deps
+    # Build adjacency from deps
+    dep_adj: dict[str, list[str]] = {}
+    for dep in result.schedule.deps:
+        dep_adj.setdefault(dep.from_event_id, []).append(dep.to_event_id)
+
+    # Topological longest-path
+    event_finish: dict[str, float] = {}
+    max_time = 0.0
+
+    # Process events in order (schedule.events is already logically sorted)
+    for event in result.schedule.events:
+        dur = event_durations.get(event.event_id, 0.0)
+        pred_finish = 0.0
+        for dep in result.schedule.deps:
+            if dep.to_event_id == event.event_id and dep.from_event_id in event_finish:
+                pred_finish = max(pred_finish, event_finish[dep.from_event_id])
+        event_finish[event.event_id] = pred_finish + dur
+        if event_finish[event.event_id] > max_time:
+            max_time = event_finish[event.event_id]
 
     return round(max_time, 3)
 
@@ -443,7 +635,11 @@ def apply_cost_model(
     for node in result.compute_graph.nodes.values():
         phase = node.phase or "unknown"
         if phase not in per_phase:
-            per_phase[phase] = {"compute_time_us": 0.0, "comm_time_us": 0.0, "total_time_us": 0.0}
+            per_phase[phase] = {
+                "compute_time_us": 0.0,
+                "comm_time_us": 0.0,
+                "total_time_us": 0.0,
+            }
         if node.perf_result:
             per_phase[phase]["compute_time_us"] += node.perf_result.compute_time_us
             per_phase[phase]["comm_time_us"] += node.perf_result.comm_time_us
@@ -457,5 +653,7 @@ def apply_cost_model(
         "step_time_us": step_time_us,
         "total_compute_time_us": total_compute,
         "total_comm_time_us": total_comm,
-        "per_phase": {k: {kk: round(vv, 3) for kk, vv in v.items()} for k, v in per_phase.items()},
+        "per_phase": {
+            k: {kk: round(vv, 3) for kk, vv in v.items()} for k, v in per_phase.items()
+        },
     }

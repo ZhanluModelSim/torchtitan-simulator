@@ -13,7 +13,6 @@ from typing import Any
 from .nodes import ComputeGraph, MemoryEvent, TensorMeta
 
 
-
 _DTYPE_SIZES: dict[str, int] = {
     "torch.bool": 1,
     "torch.uint8": 1,
@@ -76,10 +75,16 @@ def _event_counter(prefix: str):
 AGGREGATE_MEMORY_KEYS = {"total_event_bytes", "by_category", "by_phase", "by_device"}
 
 
-def memory_metadata_without_aggregates(metadata: dict[str, Any] | None) -> dict[str, Any]:
+def memory_metadata_without_aggregates(
+    metadata: dict[str, Any] | None
+) -> dict[str, Any]:
     if not metadata:
         return {}
-    return {key: value for key, value in metadata.items() if key not in AGGREGATE_MEMORY_KEYS}
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key not in AGGREGATE_MEMORY_KEYS
+    }
 
 
 def finalize_memory_summary(
@@ -142,7 +147,9 @@ def attach_model_state_memory(
     return model_memory_summary
 
 
-def estimate_graph_memory(graph: ComputeGraph) -> tuple[list[MemoryEvent], dict[str, Any]]:
+def estimate_graph_memory(
+    graph: ComputeGraph,
+) -> tuple[list[MemoryEvent], dict[str, Any]]:
     """
     Estimate activation/output memory from graph node outputs and data edges.
 
@@ -153,7 +160,9 @@ def estimate_graph_memory(graph: ComputeGraph) -> tuple[list[MemoryEvent], dict[
     """
     node_ids = list(graph.nodes.keys())
     node_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
-    last_consumer: dict[str, int] = {node_id: node_index[node_id] for node_id in node_ids}
+    last_consumer: dict[str, int] = {
+        node_id: node_index[node_id] for node_id in node_ids
+    }
     for edge in graph.edges:
         if edge.src_node_id in node_index and edge.dst_node_id in node_index:
             last_consumer[edge.src_node_id] = max(

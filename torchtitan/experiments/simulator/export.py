@@ -33,12 +33,12 @@ from .nodes import ComputeGraph, OpNode, SimulationResult, TrainingSchedule
 # ---------------------------------------------------------------------------
 
 _DOT_COLORS: dict[str, str] = {
-    "compute": "#AED6F1",          # light blue
+    "compute": "#AED6F1",  # light blue
     "comm_collective": "#F9E79F",  # yellow
-    "comm_p2p": "#FAD7A0",         # orange
-    "data_move": "#A9DFBF",        # light green
-    "memory": "#D7BDE2",           # light purple
-    "unknown": "#D5D8DC",          # grey
+    "comm_p2p": "#FAD7A0",  # orange
+    "data_move": "#A9DFBF",  # light green
+    "memory": "#D7BDE2",  # light purple
+    "unknown": "#D5D8DC",  # grey
 }
 
 
@@ -103,7 +103,7 @@ def _graph_to_dot(
         src = edge.src_node_id.replace("-", "_")
         dst = edge.dst_node_id.replace("-", "_")
         style = "dashed" if edge.edge_type in ("comm_dep", "sequential") else "solid"
-        lines.append(f'  {src} -> {dst} [style={style}];')
+        lines.append(f"  {src} -> {dst} [style={style}];")
 
     lines.append("}")
     return "\n".join(lines)
@@ -314,31 +314,41 @@ def _add_schedule_trace_events(
             dur = ev.get("perf_total_time_us", 1.0)
             if dur <= 0:
                 dur = 1.0
-            events.append({
-                "ph": "X",
-                "pid": pid,
-                "tid": tid,
-                "ts": ts / 1000.0,
-                "dur": dur / 1000.0,
-                "name": ev.get("event_type", "event"),
-                "cat": strategy,
-                "args": {
-                    "pp_stage": ev.get("pp_stage"),
-                    "mb": ev.get("microbatch_idx"),
-                    "rank": ev.get("rank"),
-                },
-            })
+            events.append(
+                {
+                    "ph": "X",
+                    "pid": pid,
+                    "tid": tid,
+                    "ts": ts / 1000.0,
+                    "dur": dur / 1000.0,
+                    "name": ev.get("event_type", "event"),
+                    "cat": strategy,
+                    "args": {
+                        "pp_stage": ev.get("pp_stage"),
+                        "mb": ev.get("microbatch_idx"),
+                        "rank": ev.get("rank"),
+                    },
+                }
+            )
 
     # Metadata events for each strategy
-    strategy_names = {"pp": "PP Schedule", "fsdp": "FSDP", "tp": "TP", "dp": "DP", "optim": "Optimizer"}
+    strategy_names = {
+        "pp": "PP Schedule",
+        "fsdp": "FSDP",
+        "tp": "TP",
+        "dp": "DP",
+        "optim": "Optimizer",
+    }
     for strategy, pid in pid_map.items():
-        events.append({
-            "ph": "M",
-            "pid": pid,
-            "tid": 0,
-            "name": "process_name",
-            "args": {"name": strategy_names.get(strategy, strategy)},
-        })
+        events.append(
+            {
+                "ph": "M",
+                "pid": pid,
+                "tid": 0,
+                "name": "process_name",
+                "args": {"name": strategy_names.get(strategy, strategy)},
+            }
+        )
 
 
 def _schedule_event_lane_for_trace(ev: dict[str, Any], strategy: str) -> str:
@@ -388,9 +398,11 @@ def _add_aggregated_phase_events(
 
     for phase in phase_order:
         # Find all groups for this phase
-        phase_groups = [(k, sum(times), min(group_indices[k]))
-                        for k, times in groups.items()
-                        if k[0] == phase]
+        phase_groups = [
+            (k, sum(times), min(group_indices[k]))
+            for k, times in groups.items()
+            if k[0] == phase
+        ]
         if not phase_groups:
             continue
 
@@ -401,33 +413,37 @@ def _add_aggregated_phase_events(
             if pp_stage or mb:
                 name += f" (s{pp_stage} mb{mb})"
 
-            events.append({
-                "ph": "X",
-                "pid": pid,
-                "tid": tid,
-                "ts": cumulative_ts_us / 1000.0,
-                "dur": total_us / 1000.0,
-                "name": name,
-                "cat": "aggregated",
-                "args": {
-                    "phase": phase,
-                    "pp_stage": pp_stage,
-                    "microbatch": mb,
-                    "op_count": len(groups[key]),
-                    "total_us": round(total_us, 3),
-                },
-            })
+            events.append(
+                {
+                    "ph": "X",
+                    "pid": pid,
+                    "tid": tid,
+                    "ts": cumulative_ts_us / 1000.0,
+                    "dur": total_us / 1000.0,
+                    "name": name,
+                    "cat": "aggregated",
+                    "args": {
+                        "phase": phase,
+                        "pp_stage": pp_stage,
+                        "microbatch": mb,
+                        "op_count": len(groups[key]),
+                        "total_us": round(total_us, 3),
+                    },
+                }
+            )
             cumulative_ts_us += total_us
             tid += 1
 
     # Metadata
-    events.append({
-        "ph": "M",
-        "pid": pid,
-        "tid": 0,
-        "name": "process_name",
-        "args": {"name": "Aggregated Phases"},
-    })
+    events.append(
+        {
+            "ph": "M",
+            "pid": pid,
+            "tid": 0,
+            "name": "process_name",
+            "args": {"name": "Aggregated Phases"},
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +479,9 @@ def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> N
         if node.perf_result is None:
             continue
         phase = node.phase or "unknown"
-        phase_totals[phase] = phase_totals.get(phase, 0.0) + node.perf_result.total_time_us
+        phase_totals[phase] = (
+            phase_totals.get(phase, 0.0) + node.perf_result.total_time_us
+        )
     grand_total = sum(phase_totals.values())
 
     # Count schedule events per mapped phase
@@ -493,8 +511,12 @@ def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> N
 
             ev_copy = dict(ev)
             ev_copy["perf_total_time_us"] = round(per_event, 3)
-            ev_copy["perf_cumulative_start_us"] = round(cumulative_per_phase.get(phase, 0.0), 3)
-            cumulative_per_phase[phase] = cumulative_per_phase.get(phase, 0.0) + per_event
+            ev_copy["perf_cumulative_start_us"] = round(
+                cumulative_per_phase.get(phase, 0.0), 3
+            )
+            cumulative_per_phase[phase] = (
+                cumulative_per_phase.get(phase, 0.0) + per_event
+            )
             enriched_events.append(ev_copy)
 
         schedule["events"] = enriched_events
@@ -593,7 +615,10 @@ def _schedule_events_for_html(result: SimulationResult) -> list[dict[str, Any]]:
                 "name": ev.get("op", "comm"),
             }
         )
-    return sorted(events, key=lambda e: (int(e.get("logical_clock", 0)), str(e.get("event_id", ""))))
+    return sorted(
+        events,
+        key=lambda e: (int(e.get("logical_clock", 0)), str(e.get("event_id", ""))),
+    )
 
 
 def _schedule_deps_for_html(result: SimulationResult) -> list[dict[str, Any]]:
@@ -643,7 +668,11 @@ def _render_operator_dag_canvas(
     phase: str,
     max_nodes: int = 220,
 ) -> str:
-    nodes = [n for n in result.compute_graph.nodes.values() if (n.phase or "unknown") == phase]
+    nodes = [
+        n
+        for n in result.compute_graph.nodes.values()
+        if (n.phase or "unknown") == phase
+    ]
     if not nodes:
         return f'<p class="muted">No {escape(phase)} operators captured.</p>'
     truncated = len(nodes) > max_nodes
@@ -1676,9 +1705,15 @@ def export_text_summary(result: SimulationResult) -> str:
     cost_summary = result.metadata.get("cost_model", {}) or {}
     if cost_summary:
         section("Performance Estimate (CostModel)")
-        lines.append(f"  Predicted step time : {_format_time_us(cost_summary.get('step_time_us', 0))}")
-        lines.append(f"  Total compute time : {_format_time_us(cost_summary.get('total_compute_time_us', 0))}")
-        lines.append(f"  Total comm time    : {_format_time_us(cost_summary.get('total_comm_time_us', 0))}")
+        lines.append(
+            f"  Predicted step time : {_format_time_us(cost_summary.get('step_time_us', 0))}"
+        )
+        lines.append(
+            f"  Total compute time : {_format_time_us(cost_summary.get('total_compute_time_us', 0))}"
+        )
+        lines.append(
+            f"  Total comm time    : {_format_time_us(cost_summary.get('total_comm_time_us', 0))}"
+        )
         per_phase = cost_summary.get("per_phase", {}) or {}
         if per_phase:
             lines.append("")
@@ -1687,14 +1722,17 @@ def export_text_summary(result: SimulationResult) -> str:
                 comp = _format_time_us(times.get("compute_time_us", 0))
                 comm = _format_time_us(times.get("comm_time_us", 0))
                 total = _format_time_us(times.get("total_time_us", 0))
-                lines.append(f"    {phase:<14}: compute={comp}  comm={comm}  total={total}")
+                lines.append(
+                    f"    {phase:<14}: compute={comp}  comm={comm}  total={total}"
+                )
 
         # Annotated node count
         annotated = sum(
-            1 for n in result.compute_graph.nodes.values()
-            if n.perf_result is not None
+            1 for n in result.compute_graph.nodes.values() if n.perf_result is not None
         )
-        lines.append(f"  Nodes with perf data: {annotated} / {len(result.compute_graph.nodes)}")
+        lines.append(
+            f"  Nodes with perf data: {annotated} / {len(result.compute_graph.nodes)}"
+        )
 
     section("Metadata")
     for k, v in result.metadata.items():

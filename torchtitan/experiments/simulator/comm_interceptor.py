@@ -98,7 +98,7 @@ class CommRecorder:
         recorder = get_current_recorder()
         if recorder is not None:
             seen = set()
-            for t in ([tensor] if isinstance(tensor, torch.Tensor) else []):
+            for t in [tensor] if isinstance(tensor, torch.Tensor) else []:
                 producer = recorder.get_producer(t)
                 if producer is not None and producer not in seen:
                     source_node_ids.append(producer)
@@ -172,7 +172,9 @@ class CommRecorder:
 # ---------------------------------------------------------------------------
 
 
-def _try_patch_functional_collectives(recorder: CommRecorder) -> list[tuple[Any, str, Any]]:
+def _try_patch_functional_collectives(
+    recorder: CommRecorder,
+) -> list[tuple[Any, str, Any]]:
     """
     Patch the functional-collectives module used by FSDP and DTensor.
     Returns a list of (module, attr_name, original_fn) for later restoration.
@@ -266,7 +268,9 @@ def capture_comms(
         recorder.record_collective("all_gather", tensor, group, async_op=async_op)
         return orig_all_gather(tensor_list, tensor, group=group, async_op=async_op)
 
-    def _all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):
+    def _all_gather_into_tensor(
+        output_tensor, input_tensor, group=None, async_op=False
+    ):
         ev = recorder.record_collective(
             "all_gather_into_tensor",
             input_tensor,
@@ -283,7 +287,9 @@ def capture_comms(
             active.set_producer(output_tensor, ev["event_id"])
         return out
 
-    def _reduce_scatter(output, input_list, op=dist.ReduceOp.SUM, group=None, async_op=False):
+    def _reduce_scatter(
+        output, input_list, op=dist.ReduceOp.SUM, group=None, async_op=False
+    ):
         tensor = input_list[0] if input_list else None
         ev = recorder.record_collective(
             "reduce_scatter",
@@ -301,7 +307,9 @@ def capture_comms(
             active.set_producer(output, ev["event_id"])
         return out
 
-    def _reduce_scatter_tensor(output, input_tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):
+    def _reduce_scatter_tensor(
+        output, input_tensor, op=dist.ReduceOp.SUM, group=None, async_op=False
+    ):
         ev = recorder.record_collective(
             "reduce_scatter_tensor",
             input_tensor,
@@ -373,11 +381,15 @@ def capture_comms(
         return orig_isend(tensor, dst, group=group, tag=tag)
 
     def _irecv(tensor, src=None, group=None, tag=0):
-        recorder.record_p2p("irecv", tensor, src if src is not None else -1, group, tag=tag)
+        recorder.record_p2p(
+            "irecv", tensor, src if src is not None else -1, group, tag=tag
+        )
         return orig_irecv(tensor, src=src, group=group, tag=tag)
 
     def _broadcast(tensor, src=0, group=None, async_op=False):
-        recorder.record_collective("broadcast", tensor, group, src=src, async_op=async_op)
+        recorder.record_collective(
+            "broadcast", tensor, group, src=src, async_op=async_op
+        )
         return orig_broadcast(tensor, src=src, group=group, async_op=async_op)
 
     def _barrier(group=None, async_op=False, device_ids=None):

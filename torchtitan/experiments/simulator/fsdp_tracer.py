@@ -77,9 +77,7 @@ class FSDPEventRecorder:
 # ---------------------------------------------------------------------------
 
 
-def _fwd_pre_hook(
-    recorder: FSDPEventRecorder, module_name: str
-):
+def _fwd_pre_hook(recorder: FSDPEventRecorder, module_name: str):
     """Fires before module.forward() — corresponds to FSDP allgather."""
 
     def hook(module: nn.Module, input: Any) -> None:
@@ -92,9 +90,7 @@ def _fwd_pre_hook(
     return hook
 
 
-def _fwd_post_hook(
-    recorder: FSDPEventRecorder, module_name: str
-):
+def _fwd_post_hook(recorder: FSDPEventRecorder, module_name: str):
     """Fires after module.forward() — may correspond to FSDP reshard."""
 
     def hook(module: nn.Module, input: Any, output: Any) -> None:
@@ -107,9 +103,7 @@ def _fwd_post_hook(
     return hook
 
 
-def _bwd_pre_hook(
-    recorder: FSDPEventRecorder, module_name: str
-):
+def _bwd_pre_hook(recorder: FSDPEventRecorder, module_name: str):
     """Fires before module backward — corresponds to FSDP allgather for bwd."""
 
     def hook(module: nn.Module, grad_output: Any) -> None:
@@ -122,9 +116,7 @@ def _bwd_pre_hook(
     return hook
 
 
-def _bwd_post_hook(
-    recorder: FSDPEventRecorder, module_name: str
-):
+def _bwd_post_hook(recorder: FSDPEventRecorder, module_name: str):
     """Fires after module backward — corresponds to FSDP reduce-scatter."""
 
     def hook(
@@ -179,9 +171,7 @@ def capture_fsdp_events(
             handles.append(
                 module.register_forward_pre_hook(_fwd_pre_hook(recorder, name))
             )
-            handles.append(
-                module.register_forward_hook(_fwd_post_hook(recorder, name))
-            )
+            handles.append(module.register_forward_hook(_fwd_post_hook(recorder, name)))
             handles.append(
                 module.register_full_backward_pre_hook(_bwd_pre_hook(recorder, name))
             )

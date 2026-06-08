@@ -23,20 +23,14 @@ from __future__ import annotations
 import contextlib
 from typing import Any
 
-import torch
 import torch.nn as nn
 
-from .comm_interceptor import CommRecorder, capture_comms
-from .dispatch_interceptor import OpRecorder, capture_ops
-from .fsdp_tracer import FSDPEventRecorder, capture_fsdp_events
+from .comm_interceptor import capture_comms, CommRecorder
+from .dispatch_interceptor import capture_ops, OpRecorder
+from .fsdp_tracer import capture_fsdp_events, FSDPEventRecorder
 from .graph_assembler import GraphAssembler
 from .memory_estimator import build_runtime_memory
-from .nodes import (
-    ScheduleDep,
-    ScheduleEvent,
-    SimulationResult,
-    TrainingSchedule,
-)
+from .nodes import ScheduleDep, ScheduleEvent, SimulationResult, TrainingSchedule
 
 
 class RuntimeCapture:
@@ -176,11 +170,12 @@ class RuntimeCapture:
             stage.forward = _make_fwd_wrapper(idx, orig_fwd)
             saved.append((stage, "forward", orig_fwd))
 
-            bwd_attr = "_backward_one_chunk"
-            if hasattr(stage, bwd_attr):
-                orig_bwd = getattr(stage, bwd_attr)
-                setattr(stage, bwd_attr, _make_bwd_wrapper(idx, orig_bwd))
-                saved.append((stage, bwd_attr, orig_bwd))
+            for bwd_attr in ("backward_one_chunk", "_backward_one_chunk"):
+                if hasattr(stage, bwd_attr):
+                    orig_bwd = getattr(stage, bwd_attr)
+                    setattr(stage, bwd_attr, _make_bwd_wrapper(idx, orig_bwd))
+                    saved.append((stage, bwd_attr, orig_bwd))
+                    break
 
         if hasattr(pp_schedule, "step"):
             orig_step = pp_schedule.step
@@ -209,7 +204,9 @@ class RuntimeCapture:
                         "logical_clock": len(self._pp_events),
                     }
                 )
-                self._pp_deps.append({"from": start_id, "to": end_id, "type": "control"})
+                self._pp_deps.append(
+                    {"from": start_id, "to": end_id, "type": "control"}
+                )
                 return result
 
             pp_schedule.step = wrapped_step

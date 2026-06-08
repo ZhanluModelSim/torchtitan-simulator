@@ -97,7 +97,9 @@ class GraphAssembler:
 
         if edges is not None:
             for src, dst, edge_type in edges:
-                graph.add_edge(DataEdge(src_node_id=src, dst_node_id=dst, edge_type=edge_type))
+                graph.add_edge(
+                    DataEdge(src_node_id=src, dst_node_id=dst, edge_type=edge_type)
+                )
         else:
             # Backward-compatible fallback: sequential edges
             GroupKey = tuple  # (phase, pp_stage, microbatch_idx)

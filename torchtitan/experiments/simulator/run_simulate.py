@@ -179,7 +179,9 @@ def _run_simulation(
 
     elif mode == "schedule":
         if pp_schedule is None:
-            print("[run_simulate] No PP schedule found; nothing to export for 'schedule' mode.")
+            print(
+                "[run_simulate] No PP schedule found; nothing to export for 'schedule' mode."
+            )
             return
         result = sim.simulate_pp_schedule(pp_schedule)
         _export_result(result, output_dir, output_formats, sim)
@@ -195,7 +197,9 @@ def _run_simulation(
         )
 
 
-def _export_result(result: Any, output_dir: str, output_formats: list[str], sim: Any) -> None:
+def _export_result(
+    result: Any, output_dir: str, output_formats: list[str], sim: Any
+) -> None:
     from torchtitan.experiments.simulator.export import (
         export_chrome_trace,
         export_dot,
@@ -242,6 +246,7 @@ def _build_model_cpu(
         (model_parts, pp_schedule_or_None, pp_stages_or_None, vocab_size)
     """
     import torch.distributed as dist
+
     from torchtitan.distributed import ParallelDims
 
     # Resolve model name
@@ -263,10 +268,15 @@ def _build_model_cpu(
 
     # Build DeviceMesh on CPU
     from torchtitan.distributed import utils as dist_utils
+
     world_mesh = parallel_dims.build_mesh(device_type="cpu")
 
     # Build model
-    from torchtitan.models import model_name_to_cls, model_name_to_tokenizer, models_config
+    from torchtitan.models import (
+        model_name_to_cls,
+        model_name_to_tokenizer,
+        models_config,
+    )
 
     model_cls = model_name_to_cls[model_name]
     model_config = models_config[model_name][config.model.flavor]
@@ -281,6 +291,7 @@ def _build_model_cpu(
     pp_degree = parallel_dims.pp
     if pp_degree > 1:
         from torchtitan.distributed.pipeline_parallel import pipeline_llm
+
         pp_mesh = world_mesh["pp"] if "pp" in world_mesh.mesh_dim_names else None
         model_parts, pp_schedule, pp_stages = pipeline_llm(
             model,
@@ -293,6 +304,7 @@ def _build_model_cpu(
     else:
         # Apply FSDP / TP if configured
         from torchtitan.distributed.fsdp import parallelize_llm
+
         parallelize_llm(model, world_mesh, parallel_dims, config)
         model_parts = [model]
         pp_schedule = None

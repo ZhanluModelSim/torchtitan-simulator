@@ -38,7 +38,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from .comm_interceptor import CommRecorder, capture_comms
+from .comm_interceptor import capture_comms, CommRecorder
 from .cpu_env import cpu_distributed_context, patch_device_type_to_cpu
 from .export import (
     export_chrome_trace,
@@ -208,10 +208,9 @@ class Simulator:
                     loss = output.sum()
                 else:
                     import torch.utils._pytree as pytree
+
                     flat, _ = pytree.tree_flatten(output)
-                    loss = sum(
-                        t.sum() for t in flat if isinstance(t, torch.Tensor)
-                    )
+                    loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
 
                 self._log("  running backward pass …")
                 capture.set_phase("backward")
@@ -273,6 +272,7 @@ class Simulator:
         )
 
         from .nodes import ComputeGraph
+
         return SimulationResult(
             compute_graph=ComputeGraph(metadata={}),
             schedule=schedule,

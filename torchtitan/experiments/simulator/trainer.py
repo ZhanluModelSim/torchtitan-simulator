@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
-import torch.distributed as dist
 
 from torchtitan.trainer import Trainer
 
@@ -76,9 +75,6 @@ def _cpu_noop_parallelize(model, **__):
     return model
 
 
-
-
-
 def _cpu_gloo_parallelize_llama(model: Any, **__: Any) -> Any:
     """CPU+gloo Llama3 parallelize: apply FSDP1 on CPU.
 
@@ -88,11 +84,15 @@ def _cpu_gloo_parallelize_llama(model: Any, **__: Any) -> Any:
     with correct tensor shapes.
     """
     import torch.distributed as dist
+
     if not dist.is_initialized() or dist.get_world_size() <= 1:
         return model
     try:
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        from torch.distributed.fsdp import ShardingStrategy
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+        )
+
         return FSDP(
             model,
             sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
@@ -176,10 +176,6 @@ class SimulationTrainer(Trainer):
         self.parallel_dims.tp = 1
         self.parallel_dims.dp_shard = 1
         self.parallel_dims.dp_replicate = 1
-
-    def train(self):
-        patch_device_type_to_cpu()
-        run_trainer_simulation(self, self.config.simulation)
 
     def train(self):
         patch_device_type_to_cpu()

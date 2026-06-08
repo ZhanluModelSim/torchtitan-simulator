@@ -10,12 +10,13 @@ import os
 from typing import Any
 
 import torch
+import torch.nn as nn
 
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools.logging import logger
 
-from .cost_model import CostModel, MockCostModel, apply_cost_model
+from .cost_model import apply_cost_model, CostModel, MockCostModel
 from .export import (
     export_chrome_trace,
     export_dot,
@@ -25,11 +26,10 @@ from .export import (
 )
 from .extension_hooks import collect_extension_metadata, postprocess_extension_result
 from .fx_capture import capture_forward_fx, capture_joint_fx
-from .memory_estimator import attach_model_state_memory
-from .nodes import OpNode, TensorMeta
-from .pp_schedule_extractor import PPScheduleExtractor
+from .memory_estimator import attach_model_state_memory, dtype_size
+from .nodes import DataEdge, OpNode, TensorMeta
 from .runtime_capture import RuntimeCapture
-from .schedule_generator import generate_interleaved_1f1b_schedule
+from .schedule_extract import extract_schedule_from_pytorch
 
 
 def _get_cost_model_kwargs(sim_opts: Any) -> dict[str, Any]:
@@ -43,11 +43,14 @@ def _get_cost_model_kwargs(sim_opts: Any) -> dict[str, Any]:
         return raw
     if isinstance(raw, str) and raw.strip():
         import json
+
         return json.loads(raw)
     return {}
 
 
-def _import_cost_model(class_path: str, kwargs: dict[str, Any] | None = None) -> CostModel:
+def _import_cost_model(
+    class_path: str, kwargs: dict[str, Any] | None = None
+) -> CostModel:
     """Dynamically import a CostModel from a fully-qualified path.
 
     Supports two patterns:
@@ -71,8 +74,7 @@ def _import_cost_model(class_path: str, kwargs: dict[str, Any] | None = None) ->
     module_path, _, name = class_path.rpartition(".")
     if not module_path:
         raise ValueError(
-            f"cost_model_class must be a fully-qualified path, "
-            f"got \"{class_path}\""
+            f"cost_model_class must be a fully-qualified path, " f'got "{class_path}"'
         )
     import importlib
 
@@ -88,13 +90,13 @@ def _import_cost_model(class_path: str, kwargs: dict[str, Any] | None = None) ->
         result = obj()
         if not isinstance(result, CostModel):
             raise TypeError(
-                f"Factory \"{class_path}\" must return a CostModel instance, "
+                f'Factory "{class_path}" must return a CostModel instance, '
                 f"got {type(result)}"
             )
         return result
 
     raise TypeError(
-        f"\"{class_path}\" must be a CostModel subclass or a callable "
+        f'"{class_path}" must be a CostModel subclass or a callable '
         f"returning a CostModel, got {type(obj)}"
     )
 
@@ -118,9 +120,10 @@ def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> N
 def _inject_semantic_schedule(result: Any, config: Any) -> None:
     """Append a semantic PP / TP / DP / FSDP2 schedule to *result*.
 
-    Reads parallelism settings from *config* so the HTML visualisation
-    shows the full multi-rank topology even when the simulator runs on a
-    single CPU process.
+    Reads parallelism settings from *config* and constructs a real PyTorch
+    schedule object with mock stages to extract the exact action table.
+    The HTML visualisation then shows the full multi-rank topology matching
+    upstream PyTorch behaviour.
     """
     from .nodes import TrainingSchedule
 
@@ -131,25 +134,25 @@ def _inject_semantic_schedule(result: Any, config: Any) -> None:
     pp_degree = int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1)
     tp_degree = int(getattr(parallelism, "tensor_parallel_degree", 1) or 1)
     dp_shard = int(getattr(parallelism, "data_parallel_shard_degree", 1) or 1)
-    # dp_shard == -1 means "use remaining ranks"
     if dp_shard < 0:
         dp_shard = 1
     dp_repl = int(getattr(parallelism, "data_parallel_replicate_degree", 1) or 1)
+    dp_degree = dp_shard * dp_repl
+
+    schedule_name = str(
+        getattr(parallelism, "pipeline_parallel_schedule", "1F1B") or "1F1B"
+    )
     num_mb = int(getattr(parallelism, "pipeline_parallel_microbatch_size", 8) or 8)
+    virtual = 2 if "Interleaved" in schedule_name else 1
+    num_stages = pp_degree * virtual
 
-    schedule = getattr(parallelism, "pipeline_parallel_schedule", "1F1B") or "1F1B"
-    virtual = 2 if "Interleaved" in str(schedule) else 1
-
-    training = getattr(config, "training", None)
-    num_steps = int(getattr(training, "steps", 1) or 1) if training else 1
-
-    semantic = generate_interleaved_1f1b_schedule(
+    semantic = extract_schedule_from_pytorch(
         pp_degree=pp_degree,
         tp_degree=tp_degree,
-        dp_shard_degree=dp_shard,
-        dp_replicate_degree=dp_repl,
-        num_microbatches=num_mb,
-        num_steps=num_steps,
+        dp_degree=dp_degree,
+        num_stages=num_stages,
+        n_microbatches=num_mb,
+        schedule_name=schedule_name,
         virtual_stages_per_rank=virtual,
     )
 
@@ -178,6 +181,7 @@ def _inject_synthetic_comm_events(
     """
     if getattr(sim_opts, "comm_backend", "") == "gloo":
         import torch.distributed as dist
+
         if dist.is_initialized() and dist.get_backend() == dist.Backend.GLOO:
             return  # Real comm already captured via gloo; skip synthetic injection
 
@@ -193,149 +197,243 @@ def _inject_synthetic_comm_events(
     if not (tp > 1 or ds > 1):
         return  # No parallelism → no synthetic comm needed
 
-    # ── Compute model parameter bytes ────────────────────────────────
-    total_params = 0
-    per_module_bytes: dict[str, int] = {}
+    # ── Compute model parameter numel ─────────────────────────────────
+    total_param_numel = 0
+    per_module_numel: dict[str, int] = {}
     for part in model_parts:
         for name, param in part.named_parameters():
             if param.requires_grad:
-                nbytes = param.numel() * param.element_size()
-                total_params += nbytes
+                nel = param.numel()
+                total_param_numel += nel
                 prefix = ".".join(name.split(".")[:2])
-                per_module_bytes[prefix] = per_module_bytes.get(prefix, 0) + nbytes
+                per_module_numel[prefix] = per_module_numel.get(prefix, 0) + nel
 
-    logger.info(
-        "Injecting synthetic comm events: tp=%d ds=%d total_params=%d",
-        tp, ds, total_params,
+    # ── Determine dtype from config ───────────────────────────────────
+    from torchtitan.config import TORCH_DTYPE_MAP
+
+    mp_param = getattr(trainer.config.training, "mixed_precision_param", "bfloat16")
+    torch_dtype = TORCH_DTYPE_MAP.get(mp_param, torch.bfloat16)
+    dtype_str = str(torch_dtype)
+    dtype_byte_size = (
+        torch_dtype.itemsize
+        if hasattr(torch_dtype, "itemsize")
+        else dtype_size(dtype_str)
     )
 
-    # Convert to per-DP-shard size
-    shard_bytes = total_params // ds if ds > 1 else total_params
-    dtype_str = "torch.float32"  # Assume fp32 for CPU simulation
+    logger.info(
+        "Injecting synthetic comm events: tp=%d ds=%d dtype=%s total_param_numel=%d",
+        tp,
+        ds,
+        dtype_str,
+        total_param_numel,
+    )
+
+    shard_numel = total_param_numel // ds if ds > 1 else total_param_numel
 
     # ── FSDP2 all_gather events ───────────────────────────────────────
     counter = [len(graph.nodes)]
+
     def _next_id() -> str:
         counter[0] += 1
         return f"comm_syn_{counter[0]:07d}"
 
-    if ds > 1:
-        # One all_gather per transformer layer (approximate)
-        num_layers = max(
-            len(per_module_bytes),
-            getattr(model_parts[0], "n_layers", 0) or
-            len(getattr(model_parts[0], "layers", [])),
-            1,
-        )
-        per_layer_bytes = shard_bytes // max(num_layers, 1)
+    def _find_last_compute_node_id(phase: str) -> str | None:
+        for nid in reversed(list(graph.nodes.keys())):
+            n = graph.nodes[nid]
+            if n.phase == phase and n.op_type == "compute":
+                return nid
+        return None
 
-        # Forward: all_gather before each layer
+    if ds > 1:
+        num_layers = _infer_num_layers(model_parts)
+        per_layer_numel = shard_numel // max(num_layers, 1)
+        full_layer_numel = per_layer_numel * ds
+
+        fwd_anchor = _find_last_compute_node_id("forward")
+        bwd_anchor = _find_last_compute_node_id("backward")
+
         for i in range(num_layers):
             node = OpNode(
                 node_id=_next_id(),
                 op_name="all_gather",
                 op_type="comm_collective",
                 phase="forward",
-                inputs=[TensorMeta(shape=(per_layer_bytes,), dtype=dtype_str, device="cpu")],
-                outputs=[TensorMeta(shape=(per_layer_bytes * ds,), dtype=dtype_str, device="cpu")],
+                inputs=[
+                    TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
+                ],
+                outputs=[
+                    TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
+                ],
                 comm_op="all_gather",
                 comm_group_size=ds,
                 attrs={"synthetic": True},
             )
             graph.add_node(node)
-            result.comm_events.append({
-                "event_id": node.node_id,
-                "op": "all_gather",
-                "group_size": ds,
-                "phase": "forward",
-                "tensor_meta": {"shape": [per_layer_bytes], "dtype": dtype_str, "device": "cpu"},
-                "source_node_ids": [],
-                "synthetic": True,
-            })
+            if fwd_anchor:
+                graph.add_edge(DataEdge(fwd_anchor, node.node_id, "sequential"))
+            result.comm_events.append(
+                {
+                    "event_id": node.node_id,
+                    "op": "all_gather",
+                    "group_size": ds,
+                    "phase": "forward",
+                    "tensor_meta": {
+                        "shape": [per_layer_numel],
+                        "dtype": dtype_str,
+                        "device": "cpu",
+                    },
+                    "source_node_ids": [fwd_anchor] if fwd_anchor else [],
+                    "synthetic": True,
+                }
+            )
 
-        # Backward: reduce_scatter after each layer
         for i in range(num_layers):
             node = OpNode(
                 node_id=_next_id(),
                 op_name="reduce_scatter",
                 op_type="comm_collective",
                 phase="backward",
-                inputs=[TensorMeta(shape=(per_layer_bytes * ds,), dtype=dtype_str, device="cpu")],
-                outputs=[TensorMeta(shape=(per_layer_bytes,), dtype=dtype_str, device="cpu")],
+                inputs=[
+                    TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
+                ],
+                outputs=[
+                    TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
+                ],
                 comm_op="reduce_scatter",
                 comm_group_size=ds,
                 attrs={"synthetic": True},
             )
             graph.add_node(node)
-            result.comm_events.append({
-                "event_id": node.node_id,
-                "op": "reduce_scatter",
-                "group_size": ds,
-                "phase": "backward",
-                "tensor_meta": {"shape": [per_layer_bytes * ds], "dtype": dtype_str, "device": "cpu"},
-                "source_node_ids": [],
-                "synthetic": True,
-            })
+            if bwd_anchor:
+                graph.add_edge(DataEdge(bwd_anchor, node.node_id, "sequential"))
+            result.comm_events.append(
+                {
+                    "event_id": node.node_id,
+                    "op": "reduce_scatter",
+                    "group_size": ds,
+                    "phase": "backward",
+                    "tensor_meta": {
+                        "shape": [full_layer_numel],
+                        "dtype": dtype_str,
+                        "device": "cpu",
+                    },
+                    "source_node_ids": [bwd_anchor] if bwd_anchor else [],
+                    "synthetic": True,
+                }
+            )
 
     # ── TP all_reduce events ──────────────────────────────────────────
     if tp > 1:
         seq_len = trainer.config.training.seq_len
         batch_size = trainer.config.training.local_batch_size
-        # Activation shape after RowwiseParallel: (batch, seq, hidden)
         hidden = _guess_hidden_dim(model_parts[0])
-        act_bytes = batch_size * seq_len * hidden * 4  # fp32
+        act_numel = batch_size * seq_len * hidden
+        num_layers = _infer_num_layers(model_parts)
+        tp_allreduce_count = num_layers * 2
 
-        for _ in range(max(1, len(per_module_bytes) // 2)):
-            # Forward: all_reduce on RowwiseParallel output
+        fwd_anchor = _find_last_compute_node_id("forward")
+        bwd_anchor = _find_last_compute_node_id("backward")
+
+        for _ in range(tp_allreduce_count):
             node = OpNode(
                 node_id=_next_id(),
                 op_name="all_reduce",
                 op_type="comm_collective",
                 phase="forward",
-                inputs=[TensorMeta(shape=(act_bytes,), dtype=dtype_str, device="cpu")],
-                outputs=[TensorMeta(shape=(act_bytes,), dtype=dtype_str, device="cpu")],
+                inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
+                outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
                 comm_op="all_reduce",
                 comm_group_size=tp,
                 attrs={"synthetic": True},
             )
             graph.add_node(node)
-            result.comm_events.append({
-                "event_id": node.node_id,
-                "op": "all_reduce",
-                "group_size": tp,
-                "phase": "forward",
-                "tensor_meta": {"shape": [batch_size, seq_len, hidden], "dtype": dtype_str, "device": "cpu"},
-                "source_node_ids": [],
-                "synthetic": True,
-            })
+            if fwd_anchor:
+                graph.add_edge(DataEdge(fwd_anchor, node.node_id, "sequential"))
+            result.comm_events.append(
+                {
+                    "event_id": node.node_id,
+                    "op": "all_reduce",
+                    "group_size": tp,
+                    "phase": "forward",
+                    "tensor_meta": {
+                        "shape": [batch_size, seq_len, hidden],
+                        "dtype": dtype_str,
+                        "device": "cpu",
+                    },
+                    "source_node_ids": [fwd_anchor] if fwd_anchor else [],
+                    "synthetic": True,
+                }
+            )
 
-            # Backward: all_reduce on gradient
             node = OpNode(
                 node_id=_next_id(),
                 op_name="all_reduce",
                 op_type="comm_collective",
                 phase="backward",
-                inputs=[TensorMeta(shape=(act_bytes,), dtype=dtype_str, device="cpu")],
-                outputs=[TensorMeta(shape=(act_bytes,), dtype=dtype_str, device="cpu")],
+                inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
+                outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
                 comm_op="all_reduce",
                 comm_group_size=tp,
                 attrs={"synthetic": True},
             )
             graph.add_node(node)
-            result.comm_events.append({
-                "event_id": node.node_id,
-                "op": "all_reduce",
-                "group_size": tp,
-                "phase": "backward",
-                "tensor_meta": {"shape": [batch_size, seq_len, hidden], "dtype": dtype_str, "device": "cpu"},
-                "source_node_ids": [],
-                "synthetic": True,
-            })
+            if bwd_anchor:
+                graph.add_edge(DataEdge(bwd_anchor, node.node_id, "sequential"))
+            result.comm_events.append(
+                {
+                    "event_id": node.node_id,
+                    "op": "all_reduce",
+                    "group_size": tp,
+                    "phase": "backward",
+                    "tensor_meta": {
+                        "shape": [batch_size, seq_len, hidden],
+                        "dtype": dtype_str,
+                        "device": "cpu",
+                    },
+                    "source_node_ids": [bwd_anchor] if bwd_anchor else [],
+                    "synthetic": True,
+                }
+            )
+
+
+def _infer_num_layers(model_parts: list[Any]) -> int:
+    """Derive the number of transformer layers from model config or structure.
+
+    Tries in order:
+    1. model.config.n_layers (all TorchTitan models define this)
+    2. len(model.layers) attribute
+    3. Fallback: unique parameter-prefix count (approximate)
+    """
+    for part in model_parts:
+        config = getattr(part, "config", None)
+        if config is not None:
+            n = getattr(config, "n_layers", None)
+            if n is not None:
+                return n
+        n = getattr(part, "n_layers", None)
+        if n is not None:
+            return n
+        layers_attr = getattr(part, "layers", None)
+        if layers_attr is not None and isinstance(
+            layers_attr, (list, tuple, nn.Sequential, nn.ModuleList)
+        ):
+            return len(layers_attr)
+    # Fallback: count unique 2-prefix groups from parameter names
+    per_module_numel: dict[str, int] = {}
+    for part in model_parts:
+        for name, param in part.named_parameters():
+            if param.requires_grad:
+                prefix = ".".join(name.split(".")[:2])
+                per_module_numel[prefix] = (
+                    per_module_numel.get(prefix, 0) + param.numel()
+                )
+    return max(len(per_module_numel), 1)
 
 
 def _guess_hidden_dim(model: Any) -> int:
     """Guess the hidden dimension from a model's first Linear layer."""
     import torch.nn as nn
+
     for mod in model.modules():
         if isinstance(mod, nn.Linear):
             return mod.in_features
@@ -462,6 +560,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     except Exception as exc:
         result.metadata["fx_forward_graph_error"] = str(exc)
     if sim_opts.capture_joint_fx:
+
         def _trainer_loss_adapter(pred: Any, labels: torch.Tensor) -> torch.Tensor:
             try:
                 valid_tokens = (labels != IGNORE_INDEX).sum().to(dtype=torch.float32)

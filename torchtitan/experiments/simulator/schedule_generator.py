@@ -18,11 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .nodes import (
-    ScheduleDep,
-    ScheduleEvent,
-    TrainingSchedule,
-)
+from .nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
 
 
 def _unique_id(prefix: str, counter: list[int]) -> str:
@@ -126,12 +122,10 @@ def generate_interleaved_1f1b_schedule(
         rank_clock[rank] = rank_clock.get(rank, 0) + 1
 
         if rank in prev_per_rank:
-            schedule.add_dep(
-                ScheduleDep(prev_per_rank[rank], eid, "control")
-            )
+            schedule.add_dep(ScheduleDep(prev_per_rank[rank], eid, "control"))
         prev_per_rank[rank] = eid
 
-        for dep_id, dep_type in (deps or []):
+        for dep_id, dep_type in deps or []:
             schedule.add_dep(ScheduleDep(dep_id, eid, dep_type))
         return eid
 
@@ -161,31 +155,55 @@ def generate_interleaved_1f1b_schedule(
 
         # FSDP2 all-gather (one event per DP group, pinned to rank 0 of group)
         ag_eid = _add(
-            rank, "fsdp2_all_gather", "fsdp2",
-            pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+            rank,
+            "fsdp2_all_gather",
+            "fsdp2",
+            pp_rank=pp_rank,
+            pp_stage=stage,
+            mb=mb,
+            step=step,
             deps=deps,
         )
         # TP all-reduce activation
         tp_eid = _add(
-            rank, "tp_all_reduce", "tp",
-            pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+            rank,
+            "tp_all_reduce",
+            "tp",
+            pp_rank=pp_rank,
+            pp_stage=stage,
+            mb=mb,
+            step=step,
             deps=[(ag_eid, "control")],
         )
         # PP forward compute
         fwd_eid = _add(
-            rank, "pp_forward", "pp",
-            pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+            rank,
+            "pp_forward",
+            "pp",
+            pp_rank=pp_rank,
+            pp_stage=stage,
+            mb=mb,
+            step=step,
             deps=[(tp_eid, "control")],
         )
         return fwd_eid
 
     def _send_activation(
-        step: int, pp_rank: int, stage: int, mb: int, fwd_dep: str,
+        step: int,
+        pp_rank: int,
+        stage: int,
+        mb: int,
+        fwd_dep: str,
     ) -> str:
         rank = pp_rank * tp_degree * dp_degree
         return _add(
-            rank, "pp_send_activation", "pp",
-            pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+            rank,
+            "pp_send_activation",
+            "pp",
+            pp_rank=pp_rank,
+            pp_stage=stage,
+            mb=mb,
+            step=step,
             deps=[(fwd_dep, "pp_comm")],
         )
 
@@ -206,24 +224,43 @@ def generate_interleaved_1f1b_schedule(
             deps.append((pp_recv_grad_dep, "pp_comm"))
 
         bwd_eid = _add(
-            rank, "pp_backward", "pp",
-            pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+            rank,
+            "pp_backward",
+            "pp",
+            pp_rank=pp_rank,
+            pp_stage=stage,
+            mb=mb,
+            step=step,
             deps=deps,
         )
         rs_eid = _add(
-            rank, "fsdp2_reduce_scatter", "fsdp2",
-            pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+            rank,
+            "fsdp2_reduce_scatter",
+            "fsdp2",
+            pp_rank=pp_rank,
+            pp_stage=stage,
+            mb=mb,
+            step=step,
             deps=[(bwd_eid, "fsdp_comm")],
         )
         return rs_eid
 
     def _send_gradient(
-        step: int, pp_rank: int, stage: int, mb: int, rs_dep: str,
+        step: int,
+        pp_rank: int,
+        stage: int,
+        mb: int,
+        rs_dep: str,
     ) -> str:
         rank = pp_rank * tp_degree * dp_degree
         return _add(
-            rank, "pp_send_gradient", "pp",
-            pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+            rank,
+            "pp_send_gradient",
+            "pp",
+            pp_rank=pp_rank,
+            pp_stage=stage,
+            mb=mb,
+            step=step,
             deps=[(rs_dep, "pp_comm")],
         )
 
@@ -233,10 +270,12 @@ def generate_interleaved_1f1b_schedule(
 
     for step in range(num_steps):
         # Per-(stage, mb) tracking: (fwd_eid, bwd_trigger)
-        fwd_done: dict[tuple[int, int], str] = {}   # (stage, mb) → fwd_event_id
-        fwd_sent: dict[tuple[int, int], str] = {}    # (stage, mb) → send_event_id
-        bwd_done: dict[tuple[int, int], str] = {}    # (stage, mb) → rs_event_id
-        bwd_grad_sent: dict[tuple[int, int], str] = {}  # (stage, mb) → send_grad_event_id
+        fwd_done: dict[tuple[int, int], str] = {}  # (stage, mb) → fwd_event_id
+        fwd_sent: dict[tuple[int, int], str] = {}  # (stage, mb) → send_event_id
+        bwd_done: dict[tuple[int, int], str] = {}  # (stage, mb) → rs_event_id
+        bwd_grad_sent: dict[
+            tuple[int, int], str
+        ] = {}  # (stage, mb) → send_grad_event_id
 
         # --- Warmup: pipeline fill ---
         # Each pipeline "clock" step introduces a new microbatch and shifts
@@ -258,7 +297,10 @@ def generate_interleaved_1f1b_schedule(
                     pp_recv_dep = fwd_sent.get((stage - 1, mb))
 
                 fwd_eid = _forward_pass(
-                    step, pp_rank, stage, mb,
+                    step,
+                    pp_rank,
+                    stage,
+                    mb,
                     pp_recv_dep=pp_recv_dep,
                 )
                 send_eid = _send_activation(step, pp_rank, stage, mb, fwd_eid)
@@ -268,11 +310,19 @@ def generate_interleaved_1f1b_schedule(
                 # Once a microbatch reaches the last stage, trigger backward
                 if stage == total_stages - 1:
                     loss_eid = _add(
-                        pp_rank * tp_degree * dp_degree, "loss_compute", "compute",
-                        pp_rank=pp_rank, pp_stage=stage, mb=mb, step=step,
+                        pp_rank * tp_degree * dp_degree,
+                        "loss_compute",
+                        "compute",
+                        pp_rank=pp_rank,
+                        pp_stage=stage,
+                        mb=mb,
+                        step=step,
                     )
                     rs_eid = _backward_pass(
-                        step, pp_rank, stage, mb,
+                        step,
+                        pp_rank,
+                        stage,
+                        mb,
                         bwd_trigger_dep=loss_eid,
                     )
                     bwd_done[(stage, mb)] = rs_eid
@@ -284,7 +334,10 @@ def generate_interleaved_1f1b_schedule(
                         bwd_pp_rank = stage_to_pp_rank[bs]
                         pp_recv_grad = bwd_grad_sent.get((bs + 1, mb))
                         rs_eid = _backward_pass(
-                            step, bwd_pp_rank, bs, mb,
+                            step,
+                            bwd_pp_rank,
+                            bs,
+                            mb,
                             pp_recv_grad_dep=pp_recv_grad,
                         )
                         bwd_done[(bs, mb)] = rs_eid
@@ -297,12 +350,20 @@ def generate_interleaved_1f1b_schedule(
             stage = (pp_rank * virtual_stages_per_rank) % total_stages
 
             dp_sync = _add(
-                rank, "dp_gradient_sync", "dp",
-                pp_rank=pp_rank, pp_stage=stage, step=step,
+                rank,
+                "dp_gradient_sync",
+                "dp",
+                pp_rank=pp_rank,
+                pp_stage=stage,
+                step=step,
             )
             _add(
-                rank, "optimizer_step", "optimizer",
-                pp_rank=pp_rank, pp_stage=stage, step=step,
+                rank,
+                "optimizer_step",
+                "optimizer",
+                pp_rank=pp_rank,
+                pp_stage=stage,
+                step=step,
                 deps=[(dp_sync, "control")],
             )
 
@@ -311,8 +372,11 @@ def generate_interleaved_1f1b_schedule(
     # We copy them to sibling ranks so the swimlane shows balanced work.
     # dp_gradient_sync and optimizer_step are already emitted per-rank.
     group_size = tp_degree * dp_degree
-    original_events = [e for e in schedule.events
-                       if e.metadata.get("strategy") in ("pp", "fsdp2", "tp", "compute")]
+    original_events = [
+        e
+        for e in schedule.events
+        if e.metadata.get("strategy") in ("pp", "fsdp2", "tp", "compute")
+    ]
     original_deps = list(schedule.deps)
 
     eid_remap: dict[str, dict[int, str]] = {}

@@ -30,7 +30,7 @@ Quick start::
     export_json(result, "output/result.json")
 """
 
-from .cost_model import CostModel, MockCostModel, apply_cost_model
+from .cost_model import apply_cost_model, CostModel, MockCostModel
 from .export import (
     export_chrome_trace,
     export_dot,
