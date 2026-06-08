@@ -30,6 +30,7 @@ from .memory_estimator import attach_model_state_memory, dtype_size
 from .nodes import DataEdge, OpNode, TensorMeta
 from .runtime_capture import RuntimeCapture
 from .schedule_extract import extract_schedule_from_pytorch
+from .unified_trace import TraceRecorder, unified_trace
 
 
 def _get_cost_model_kwargs(sim_opts: Any) -> dict[str, Any]:
@@ -443,7 +444,8 @@ def _guess_hidden_dim(model: Any) -> int:
 def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     """Run one simulated training step using an already-built Trainer instance."""
     rank = int(os.environ.get("RANK", "0"))
-    capture = RuntimeCapture(rank=rank)
+    comm_backend = getattr(sim_opts, "comm_backend", "") or ""
+
     data_iterator = trainer.batch_generator(trainer.dataloader)
     trainer.optimizers.zero_grad()
 
@@ -454,65 +456,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         local_valid_tokens += (labels != IGNORE_INDEX).sum()
         microbatches.append((input_dict, labels))
 
-    local_valid_tokens = local_valid_tokens.to(trainer.device)
-    if trainer.parallel_dims.dp_enabled:
-        batch_mesh = trainer.parallel_dims.get_mesh("batch")
-        global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
-    else:
-        global_valid_tokens = local_valid_tokens.float()
-
-    pp_stages = getattr(trainer, "_sim_stages", None) or trainer.model_parts
-    with capture.activate(
-        trainer.model_parts,
-        phase="forward",
-        pp_schedule=None,
-        pp_stages=pp_stages,
-    ):
-        # Monkey-patch Tensor.backward to detect backward pass phase
-        _original_backward = torch.Tensor.backward
-
-        def _backward_with_phase(self, *args: Any, **kwargs: Any) -> None:
-            capture.set_phase("backward")
-            try:
-                _original_backward(self, *args, **kwargs)
-            finally:
-                capture.set_phase("forward")
-
-        torch.Tensor.backward = _backward_with_phase  # type: ignore[assignment]
-        try:
-            for mb_idx, (input_dict, labels) in enumerate(microbatches):
-                capture.set_microbatch(mb_idx)
-                capture.set_phase("forward")
-                for k, v in input_dict.items():
-                    if isinstance(v, torch.Tensor):
-                        input_dict[k] = v.to(trainer.device)
-                labels = labels.to(trainer.device)
-                trainer.forward_backward_step(
-                    input_dict=input_dict,
-                    labels=labels,
-                    global_valid_tokens=global_valid_tokens,
-                )
-        finally:
-            torch.Tensor.backward = _original_backward  # type: ignore[assignment]
-
-        capture.set_phase("optimizer")
-        dist_utils.clip_grad_norm_(
-            [p for m in trainer.model_parts for p in m.parameters()],
-            trainer.config.training.max_norm,
-            foreach=True,
-            pp_mesh=trainer.parallel_dims.get_optional_mesh("pp"),
-            ep_enabled=trainer.parallel_dims.ep_enabled,
+    if comm_backend == "gloo":
+        result = _run_gloo_capture(
+            trainer, sim_opts, rank, microbatches, local_valid_tokens
         )
-        trainer.optimizers.step()
-        trainer.lr_schedulers.step()
-
-    result = capture.build_result(
-        metadata={
-            "mode": "simulation",
-            "rank": rank,
-            **collect_extension_metadata(trainer, capture),
-        }
-    )
+    else:
+        result = _run_unified_capture(trainer, sim_opts, rank, microbatches)
 
     attach_model_state_memory(
         result,
@@ -520,11 +469,11 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         optimizer_name=getattr(trainer.config.optimizer, "name", None),
     )
 
-    # Inject synthetic comm events for fake_backend (no real distributed comm)
-    try:
-        _inject_synthetic_comm_events(result, trainer, sim_opts)
-    except Exception as exc:
-        logger.warning("Failed to inject synthetic comm events: %s", exc)
+    if comm_backend != "gloo":
+        try:
+            _inject_synthetic_comm_events(result, trainer, sim_opts)
+        except Exception as exc:
+            logger.warning("Failed to inject synthetic comm events: %s", exc)
 
     # ── CostModel ──────────────────────────────────────────────────────
     cost_model_enabled = getattr(sim_opts, "cost_model", False)
@@ -532,7 +481,6 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         cost_model_cls = getattr(sim_opts, "cost_model_class", "") or ""
         cost_model_kwargs = _get_cost_model_kwargs(sim_opts)
         if cost_model_cls:
-            # Dynamic import of third-party CostModel (no trainer_runner.py edits needed)
             cost_model = _import_cost_model(cost_model_cls, cost_model_kwargs)
         else:
             cost_model = MockCostModel()
@@ -589,3 +537,110 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     ]
     _export_result(result, sim_opts.output_dir, output_formats)
     logger.info("Simulation outputs written to %s", sim_opts.output_dir)
+
+
+def _run_gloo_capture(
+    trainer: Any,
+    sim_opts: Any,
+    rank: int,
+    microbatches: list[tuple[dict[str, torch.Tensor], torch.Tensor]],
+    local_valid_tokens: torch.Tensor,
+) -> Any:
+    """Gloo backend: use RuntimeCapture with real CPU tensors."""
+    capture = RuntimeCapture(rank=rank)
+    local_valid_tokens = local_valid_tokens.to(trainer.device)
+    if trainer.parallel_dims.dp_enabled:
+        batch_mesh = trainer.parallel_dims.get_mesh("batch")
+        global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
+    else:
+        global_valid_tokens = local_valid_tokens.float()
+
+    pp_stages = getattr(trainer, "_sim_stages", None) or trainer.model_parts
+    with capture.activate(
+        trainer.model_parts,
+        phase="forward",
+        pp_schedule=None,
+        pp_stages=pp_stages,
+    ):
+        _original_backward = torch.Tensor.backward
+
+        def _backward_with_phase(self, *args: Any, **kwargs: Any) -> None:
+            capture.set_phase("backward")
+            try:
+                _original_backward(self, *args, **kwargs)
+            finally:
+                capture.set_phase("forward")
+
+        torch.Tensor.backward = _backward_with_phase
+        try:
+            for mb_idx, (input_dict, labels) in enumerate(microbatches):
+                capture.set_microbatch(mb_idx)
+                capture.set_phase("forward")
+                for k, v in input_dict.items():
+                    if isinstance(v, torch.Tensor):
+                        input_dict[k] = v.to(trainer.device)
+                labels = labels.to(trainer.device)
+                trainer.forward_backward_step(
+                    input_dict=input_dict,
+                    labels=labels,
+                    global_valid_tokens=global_valid_tokens,
+                )
+        finally:
+            torch.Tensor.backward = _original_backward
+
+        capture.set_phase("optimizer")
+        dist_utils.clip_grad_norm_(
+            [p for m in trainer.model_parts for p in m.parameters()],
+            trainer.config.training.max_norm,
+            foreach=True,
+            pp_mesh=trainer.parallel_dims.get_optional_mesh("pp"),
+            ep_enabled=trainer.parallel_dims.ep_enabled,
+        )
+        trainer.optimizers.step()
+        trainer.lr_schedulers.step()
+
+    return capture.build_result(
+        metadata={
+            "mode": "simulation",
+            "rank": rank,
+            **collect_extension_metadata(trainer, capture),
+        }
+    )
+
+
+def _run_unified_capture(
+    trainer: Any,
+    sim_opts: Any,
+    rank: int,
+    microbatches: list[tuple[dict[str, torch.Tensor], torch.Tensor]],
+) -> Any:
+    """Fake_backend: use UnifiedTraceMode with FakeTensorMode for zero-memory capture."""
+    recorder = TraceRecorder(rank=rank)
+    first_input_dict, first_labels = microbatches[0]
+    example_inputs = (first_input_dict["input"].to("meta"),)
+
+    model_part = trainer.model_parts[0]
+    use_fake = True
+
+    with unified_trace(recorder, model_part, example_inputs, use_fake_mode=use_fake):
+        output = model_part(*example_inputs)
+
+        if isinstance(output, torch.Tensor):
+            loss = output.sum()
+        else:
+            import torch.utils._pytree as pytree
+
+            flat, _ = pytree.tree_flatten(output)
+            loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
+
+        recorder.current_phase = "backward"
+        loss.backward()
+
+    result = recorder.build_result(
+        metadata={
+            "mode": "unified_trace",
+            "rank": rank,
+            "device_mode": "meta",
+        }
+    )
+    return result

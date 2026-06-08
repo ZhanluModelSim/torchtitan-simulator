@@ -14,6 +14,7 @@ import torch
 from torchtitan.trainer import Trainer
 
 from .cpu_env import patch_device_type_to_cpu
+from .meta_env import patch_device_type_to_meta
 from .trainer_runner import run_trainer_simulation
 
 
@@ -62,6 +63,12 @@ class SimulationConfig:
     the gloo backend, which can record FSDP all-gather / reduce-scatter,
     TP all-reduce, and other collectives with actual tensor shapes.
     Requires ``torchrun`` or ``mp.spawn`` for multi-process execution."""
+    device_mode: str = ""
+    """Device mode for model construction and trace capture.
+    ``\"\"`` (empty) auto-selects: ``\"meta\"`` for fake_backend, ``\"cpu\"``
+    for gloo.  ``\"meta\"`` creates shape-only parameters (0 bytes memory),
+    suitable for simulating arbitrarily large models.  ``\"cpu\"`` creates
+    real CPU tensors (required for gloo comm capture)."""
 
 
 def _cpu_noop_parallelize(model, **__):
@@ -146,9 +153,18 @@ class SimulationTrainer(Trainer):
         simulation: SimulationConfig = field(default_factory=SimulationConfig)
 
     def __init__(self, config: Config):
-        patch_device_type_to_cpu()
-
         sim_opts = config.simulation
+        comm_backend = getattr(sim_opts, "comm_backend", "") or ""
+        device_mode = getattr(sim_opts, "device_mode", "") or ""
+        if not device_mode:
+            device_mode = "meta" if comm_backend != "gloo" else "cpu"
+        sim_opts.device_mode = device_mode
+
+        if device_mode == "meta":
+            patch_device_type_to_meta()
+        else:
+            patch_device_type_to_cpu()
+
         pp = int(getattr(config.parallelism, "pipeline_parallel_degree", 1) or 1)
         tp = int(getattr(config.parallelism, "tensor_parallel_degree", 1) or 1)
         ds = int(getattr(config.parallelism, "data_parallel_shard_degree", -1) or -1)
@@ -158,8 +174,6 @@ class SimulationTrainer(Trainer):
         if pp * tp * ds * dr > 1:
             _set_fake_world_size(config)
 
-        # Select parallelize strategy based on comm_backend
-        comm_backend = getattr(sim_opts, "comm_backend", "") or ""
         if comm_backend == "gloo":
             model_name = getattr(config.model_spec, "name", "")
             if "deepseek" in model_name.lower():
@@ -178,5 +192,9 @@ class SimulationTrainer(Trainer):
         self.parallel_dims.dp_replicate = 1
 
     def train(self):
-        patch_device_type_to_cpu()
+        comm_backend = getattr(self.config.simulation, "comm_backend", "") or ""
+        if comm_backend == "gloo":
+            patch_device_type_to_cpu()
+        else:
+            patch_device_type_to_meta()
         run_trainer_simulation(self, self.config.simulation)
