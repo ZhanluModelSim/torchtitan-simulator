@@ -45,6 +45,8 @@ from .nodes import (
     ComputeGraph,
     DataEdge,
     OpNode,
+    ScheduleDep,
+    ScheduleEvent,
     SimulationResult,
     TensorMeta,
     TrainingSchedule,
@@ -121,6 +123,10 @@ class TraceRecorder:
         self.current_phase: str = "forward"
         self.current_pp_stage: int | None = None
         self.current_microbatch: int | None = None
+        self.comm_events: list[dict[str, Any]] = []
+        self.fsdp_events: list[dict[str, Any]] = []
+        self.pp_events: list[dict[str, Any]] = []
+        self._pp_deps: list[dict[str, Any]] = []
 
     def _next_id(self) -> str:
         with self._lock:
@@ -186,7 +192,10 @@ class TraceRecorder:
 
         Edges from ``self.edges`` are used directly if available;
         otherwise, sequential edges within each ``(phase, pp_stage,
-        microbatch_idx)`` group are inferred.
+        microbatch_idx)`` group are inferred.  Communication events
+        from ``self.comm_events`` are merged into the compute graph
+        as :class:`OpNode` entries with data-flow edges to their
+        source compute nodes.
         """
         graph = ComputeGraph(metadata=metadata or {})
         for n in self.nodes:
@@ -213,9 +222,93 @@ class TraceRecorder:
                     )
                 last_in_group[key] = n.node_id
 
+        # Merge comm events as OpNode entries
+        for ev in self.comm_events:
+            node_id = ev.get("event_id", f"comm_{len(graph.nodes)+1:07d}")
+            op_name = ev.get("op", "collective_unknown")
+            phase = ev.get("phase", "unknown")
+            input_metas: list[TensorMeta] = []
+            output_metas: list[TensorMeta] = []
+            shape_entries = ev.get("tensor_shapes") or []
+            if not shape_entries:
+                tm = ev.get("tensor_meta")
+                if tm:
+                    shape_entries = [tm]
+            for entry in shape_entries:
+                if entry is None:
+                    continue
+                meta = TensorMeta(
+                    shape=tuple(entry.get("shape", [])),
+                    dtype=entry.get("dtype", "unknown"),
+                    device=_normalize_device(entry.get("device", "cpu")),
+                    is_dtensor=entry.get("is_dtensor", False),
+                    placements=entry.get("placements"),
+                )
+                input_metas.append(meta)
+                output_metas.append(meta)
+            op_type = ev.get("op_type", "comm_collective")
+            comm_node = OpNode(
+                node_id=node_id,
+                op_name=op_name,
+                op_type=op_type,
+                phase=phase,
+                inputs=input_metas,
+                outputs=output_metas,
+                comm_op=op_name,
+                comm_group_size=ev.get("group_size"),
+                pp_stage=ev.get("pp_stage"),
+                microbatch_idx=ev.get("microbatch"),
+                attrs={
+                    "group": str(ev.get("group", "")),
+                    "tag": str(ev.get("tag", "")),
+                    "src_rank": ev.get("src_rank"),
+                    "dst_rank": ev.get("dst_rank"),
+                    "rank": ev.get("rank"),
+                },
+            )
+            graph.add_node(comm_node)
+            for src_id in ev.get("source_node_ids", []):
+                if src_id in graph.nodes:
+                    graph.add_edge(
+                        DataEdge(
+                            src_node_id=src_id,
+                            dst_node_id=node_id,
+                            edge_type="data",
+                        )
+                    )
+
+        # Build schedule from FSDP + PP events
+        schedule = TrainingSchedule(metadata={"rank": self.rank})
+        for ev in self.fsdp_events:
+            schedule.add_event(
+                ScheduleEvent(
+                    event_id=ev["event_id"],
+                    event_type=ev["event_type"],
+                    rank=self.rank,
+                    logical_clock=ev["logical_clock"],
+                    metadata=ev.get("metadata", {}),
+                )
+            )
+        for ev in self.pp_events:
+            schedule.add_event(
+                ScheduleEvent(
+                    event_id=ev["event_id"],
+                    event_type=ev["event_type"],
+                    rank=ev.get("rank", self.rank),
+                    pp_stage=ev.get("pp_stage"),
+                    microbatch_idx=ev.get("microbatch"),
+                    logical_clock=ev.get("logical_clock", 0),
+                )
+            )
+        for dep in self._pp_deps:
+            schedule.add_dep(ScheduleDep(dep["from"], dep["to"], dep["type"]))
+
         return SimulationResult(
             compute_graph=graph,
-            schedule=TrainingSchedule(metadata={"rank": self.rank}),
+            schedule=schedule,
+            comm_events=list(self.comm_events),
+            fsdp_events=list(self.fsdp_events),
+            pp_events=list(self.pp_events),
             metadata=metadata or {},
         )
 
@@ -291,9 +384,17 @@ def unified_trace(
     example_inputs: tuple[Any, ...] | None = None,
     use_fake_mode: bool = True,
     phase: str = "forward",
+    capture_comm: bool = False,
+    capture_fsdp: bool = True,
+    model_parts: list[torch.nn.Module] | None = None,
 ) -> Generator[TraceRecorder, None, None]:
     """Context manager that activates :class:`UnifiedTraceMode` and
     optionally a :class:`FakeTensorMode` for shape-only tracing.
+
+    When ``capture_comm=True``, also activates :class:`CommRecorder` to
+    intercept distributed communication operations.  When
+    ``capture_fsdp=True`` and ``model_parts`` is provided, attaches
+    FSDP lifecycle hooks to every :class:`FSDPModule` found.
 
     Args:
         recorder: Target recorder to write into.
@@ -302,6 +403,12 @@ def unified_trace(
         use_fake_mode: If ``True``, wrap in a ``FakeTensorMode`` so that
             all tensors are shape-only and no memory is allocated.
         phase: Initial phase annotation.
+        capture_comm: If ``True``, activate :class:`CommRecorder` to
+            intercept ``torch.distributed`` comm ops.  Required for
+            gloo backend mode; skipped for fake_backend since comm
+            ops won't exist.
+        capture_fsdp: If ``True``, attach FSDP lifecycle hooks.
+        model_parts: List of model modules for FSDP hook attachment.
 
     Yields:
         The same ``recorder`` instance for convenience.
@@ -309,11 +416,39 @@ def unified_trace(
     recorder.current_phase = phase
     _RECORDER_STACK.append(recorder)
 
+    comm_recorder = None
+    fsdp_recorder = None
+
     with contextlib.ExitStack() as stack:
         if use_fake_mode:
             fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
             stack.enter_context(fake_mode)
         stack.enter_context(UnifiedTraceMode(recorder))
+
+        if capture_comm:
+            from .comm_interceptor import capture_comms, CommRecorder
+
+            comm_recorder = CommRecorder(rank=recorder.rank)
+            comm_recorder.current_phase = phase
+            stack.enter_context(capture_comms(comm_recorder))
+
+        if capture_fsdp and model_parts:
+            from .fsdp_tracer import capture_fsdp_events, FSDPEventRecorder
+
+            fsdp_recorder = FSDPEventRecorder(rank=recorder.rank)
+            fsdp_recorder.current_phase = phase
+            for m in model_parts:
+                stack.enter_context(capture_fsdp_events(m, fsdp_recorder))
+
         yield recorder
+
+    # Transfer comm/FSDP events to the TraceRecorder after context exits
+    if capture_comm and comm_recorder is not None:
+        recorder.comm_events = list(comm_recorder.events)
+        # Update source_node_ids to reference TraceRecorder's node IDs
+        # (CommRecorder uses OpRecorder IDs via get_current_recorder,
+        # which already resolves to TraceRecorder since it's on the stack)
+    if capture_fsdp and fsdp_recorder is not None:
+        recorder.fsdp_events = list(fsdp_recorder.events)
 
     _RECORDER_STACK.pop()

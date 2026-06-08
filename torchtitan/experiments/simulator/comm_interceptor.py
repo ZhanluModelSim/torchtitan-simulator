@@ -27,8 +27,9 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from .dispatch_interceptor import get_current_recorder
 from .nodes import TensorMeta
+
+from .unified_trace import get_current_recorder
 
 # ---------------------------------------------------------------------------
 # CommRecorder
