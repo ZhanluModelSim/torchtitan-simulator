@@ -303,7 +303,16 @@ def _add_schedule_trace_events(
     if result.schedule is None:
         return
 
-    # Collect events by strategy
+    des_event_map: dict[str, dict[str, Any]] = {}
+    schedule_data: dict[str, Any] = {
+        "events": [ev.to_dict() for ev in result.schedule.events],
+    }
+    _inject_schedule_timing({"schedule": schedule_data}, result)
+    for ev_dict in schedule_data["events"]:
+        eid = ev_dict.get("event_id", "")
+        if "perf_cumulative_start_us" in ev_dict or "perf_total_time_us" in ev_dict:
+            des_event_map[eid] = ev_dict
+
     by_strategy: dict[str, list[dict[str, Any]]] = {}
     for ev in result.schedule.events:
         d = ev.to_dict()
@@ -334,8 +343,10 @@ def _add_schedule_trace_events(
                 tid_map[lane] = tid_counter[0]
                 tid_counter[0] += 1
             tid = pid * 100 + tid_map[lane]
-            ts = ev.get("perf_cumulative_start_us", ev.get("logical_clock", 0))
-            dur = ev.get("perf_total_time_us", 1.0)
+            eid = ev.get("event_id", "")
+            enriched = des_event_map.get(eid, ev)
+            ts = enriched.get("perf_cumulative_start_us", ev.get("logical_clock", 0))
+            dur = enriched.get("perf_total_time_us", ev.get("perf_total_time_us", 1.0))
             if dur <= 0:
                 dur = 1.0
             events.append(

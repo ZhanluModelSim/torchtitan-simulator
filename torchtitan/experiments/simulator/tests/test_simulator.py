@@ -625,6 +625,73 @@ class TestExport(unittest.TestCase):
             assert "drawMemoryTrace" in content
             assert "memory-events-body" in content
 
+    def test_chrome_trace_schedule_events_have_des_timing(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_multi_rank_des
+        from torchtitan.experiments.simulator.export import export_chrome_trace
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            PerfResult,
+            ScheduleDep,
+            ScheduleEvent,
+            SimulationResult,
+            TrainingSchedule,
+        )
+
+        graph = ComputeGraph()
+        graph.add_node(
+            OpNode(
+                "n_fwd",
+                "aten.mm.default",
+                "compute",
+                "forward",
+                pp_stage=0,
+                microbatch_idx=0,
+                perf_result=PerfResult(total_time_us=50.0),
+            )
+        )
+        graph.add_node(
+            OpNode(
+                "n_bwd",
+                "aten.mm.default",
+                "compute",
+                "backward",
+                pp_stage=0,
+                microbatch_idx=0,
+                perf_result=PerfResult(total_time_us=30.0),
+            )
+        )
+
+        schedule = TrainingSchedule()
+        ev_fwd = ScheduleEvent(
+            "e_fwd", "pp_forward", rank=0, pp_stage=0, microbatch_idx=0
+        )
+        ev_bwd = ScheduleEvent(
+            "e_bwd", "pp_backward", rank=0, pp_stage=0, microbatch_idx=0
+        )
+        schedule.add_event(ev_fwd)
+        schedule.add_event(ev_bwd)
+        schedule.add_dep(ScheduleDep("e_fwd", "e_bwd", "data"))
+
+        result = SimulationResult(compute_graph=graph, schedule=schedule)
+        simulate_multi_rank_des(result)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "trace.json")
+            export_chrome_trace(result, path)
+            with open(path) as f:
+                data = json.load(f)
+            schedule_events = [
+                e
+                for e in data["traceEvents"]
+                if e.get("cat") in ("pp", "fsdp", "tp", "dp", "optim")
+            ]
+            assert len(schedule_events) > 0, "Should have schedule events"
+            has_positive_ts = any(e.get("ts", 0) > 0 for e in schedule_events)
+            assert (
+                has_positive_ts
+            ), "Schedule events should have DES timing (positive ts) in trace.json"
+
 
 class TestTrainerRunnerExtensionHooks(unittest.TestCase):
     def test_collect_extension_metadata(self):
