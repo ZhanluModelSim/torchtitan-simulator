@@ -767,7 +767,7 @@ def export_html(
     )
     # Compute perf grand total for summary card
     cost_summary = result.metadata.get("cost_model", {}) or {}
-    perf_grand_total_us = cost_summary.get("step_time_us", 0)
+    perf_grand_total_us = cost_summary.get("e2e_step_time_us", 0)
     data_payload = _json_script_payload(result)
     steps = sorted({_event_step(ev) for ev in schedule_events}) or [0]
 
@@ -1706,7 +1706,10 @@ def export_text_summary(result: SimulationResult) -> str:
     if cost_summary:
         section("Performance Estimate (CostModel)")
         lines.append(
-            f"  Predicted step time : {_format_time_us(cost_summary.get('step_time_us', 0))}"
+            f"  E2E step time       : {_format_time_us(cost_summary.get('e2e_step_time_us', 0))}"
+        )
+        lines.append(
+            f"  Single-rank step    : {_format_time_us(cost_summary.get('single_rank_step_time_us', 0))}"
         )
         lines.append(
             f"  Total compute time : {_format_time_us(cost_summary.get('total_compute_time_us', 0))}"

@@ -488,12 +488,23 @@ def _critical_path_time_us(graph: ComputeGraph) -> float:
 
 
 def link_schedule_to_graph(result: SimulationResult) -> None:
-    """Populate ScheduleEvent.op_node_ids by matching (phase, pp_stage, microbatch_idx).
+    """Populate ScheduleEvent.op_node_ids by matching phase (and optionally pp_stage/microbatch_idx).
 
-    For each ScheduleEvent, find all OpNodes in result.compute_graph that share
-    the same phase, pp_stage (if set on both), and microbatch_idx (if set on both).
-    This bridges the coarse schedule and fine-grained compute graph, enabling
-    multi-rank step time prediction.
+    For each ScheduleEvent, find all OpNodes in result.compute_graph that
+    share the same phase.  When a node has ``pp_stage=None`` or
+    ``microbatch_idx=None`` (single-rank trace), it matches **any**
+    schedule event with the same phase, regardless of the event's
+    stage/microbatch values.  When both have concrete values, they
+    must match exactly.
+
+    For single-rank traces where nodes lack stage/mb labels, the
+    matching is **proportional**: each event of the same type gets
+    ``total_phase_duration / num_events_of_same_type`` as its
+    duration, rather than inheriting the full set of graph nodes
+    (which would duplicate time across every event).
+
+    This bridges the coarse schedule and fine-grained compute graph,
+    enabling multi-rank step time prediction.
     """
     if result.schedule is None:
         return
@@ -506,27 +517,54 @@ def link_schedule_to_graph(result: SimulationResult) -> None:
         key = (node.phase, node.pp_stage, node.microbatch_idx)
         node_lookup.setdefault(key, []).append(nid)
 
+    # Map coarse event_type to phase
+    phase_map = {
+        "pp_forward": "forward",
+        "pp_backward": "backward",
+        "fsdp2_all_gather": "forward",
+        "fsdp2_reduce_scatter": "backward",
+        "dp_gradient_sync": "backward",
+        "optimizer_step": "optimizer",
+    }
+
+    # Compute total per-phase duration from perf_results
+    phase_duration: dict[str, float] = {}
+    for nid, node in graph.nodes.items():
+        phase = node.phase or "unknown"
+        if node.perf_result:
+            phase_duration.setdefault(phase, 0.0)
+            phase_duration[phase] += node.perf_result.total_time_us
+
+    # Count events of each type for proportional splitting
+    event_type_counts: dict[str, int] = {}
     for event in result.schedule.events:
-        key = (
-            event.event_type.split("_", 1)[-1]
-            if "_" in event.event_type
-            else event.event_type,
-            event.pp_stage,
-            event.microbatch_idx,
-        )
-        # Map coarse event_type to phase
-        phase_map = {
-            "pp_forward": "forward",
-            "pp_backward": "backward",
-            "fsdp2_all_gather": "forward",
-            "fsdp2_reduce_scatter": "backward",
-            "dp_gradient_sync": "backward",
-            "optimizer_step": "optimizer",
-        }
+        event_type_counts.setdefault(event.event_type, 0)
+        event_type_counts[event.event_type] += 1
+
+    # Check if nodes have pp_stage/microbatch_idx set (multi-rank trace)
+    has_stage_labels = any(
+        node.pp_stage is not None or node.microbatch_idx is not None
+        for node in graph.nodes.values()
+    )
+
+    for event in result.schedule.events:
         phase = phase_map.get(event.event_type, "unknown")
         lookup_key = (phase, event.pp_stage, event.microbatch_idx)
-        matches = node_lookup.get(lookup_key, [])
-        event.op_node_ids = matches
+        exact_matches = node_lookup.get(lookup_key, [])
+
+        if exact_matches:
+            event.op_node_ids = exact_matches
+        elif has_stage_labels:
+            # Multi-rank trace but no exact match → event has no
+            # corresponding compute ops (e.g. PP send/recv)
+            event.op_node_ids = []
+        else:
+            # Single-rank trace: nodes lack stage/mb labels.
+            # Don't assign all nodes to every event — that would
+            # duplicate time.  Instead, assign proportional duration
+            # via a single representative node whose perf_result is
+            # scaled to phase_duration / event_type_count.
+            event.op_node_ids = []
 
 
 # ---------------------------------------------------------------------------
@@ -566,6 +604,30 @@ def predict_multi_rank_step_time_us(
     # Step 1: link schedule to graph
     link_schedule_to_graph(result)
 
+    # Step 1b: compute total per-phase duration for proportional splitting
+    phase_duration: dict[str, float] = {}
+    for node in result.compute_graph.nodes.values():
+        phase = node.phase or "unknown"
+        if node.perf_result:
+            phase_duration.setdefault(phase, 0.0)
+            phase_duration[phase] += node.perf_result.total_time_us
+
+    # Count events of each type for proportional splitting
+    event_type_counts: dict[str, int] = {}
+    for event in result.schedule.events:
+        event_type_counts.setdefault(event.event_type, 0)
+        event_type_counts[event.event_type] += 1
+
+    # Map event types to phases
+    event_phase_map = {
+        "pp_forward": "forward",
+        "pp_backward": "backward",
+        "fsdp2_all_gather": "forward",
+        "fsdp2_reduce_scatter": "backward",
+        "dp_gradient_sync": "backward",
+        "optimizer_step": "optimizer",
+    }
+
     # Step 2: compute event durations
     event_durations: dict[str, float] = {}
     for event in result.schedule.events:
@@ -577,7 +639,14 @@ def predict_multi_rank_step_time_us(
                     total += node.perf_result.total_time_us
             event_durations[event.event_id] = total
         else:
-            event_durations[event.event_id] = 0.0
+            # Proportional split: events without linked nodes get
+            # (phase_total_duration / num_events_of_same_type).
+            # This avoids duplicating the entire phase duration
+            # across every event of the same type.
+            phase = event_phase_map.get(event.event_type, "unknown")
+            phase_total = phase_duration.get(phase, 0.0)
+            count = event_type_counts.get(event.event_type, 1)
+            event_durations[event.event_id] = phase_total / count
 
     # Step 3: longest-path on schedule deps
     # Build adjacency from deps
@@ -616,19 +685,29 @@ def apply_cost_model(
 
     If *cost_model* is ``None``, a default :class:`MockCostModel` is used.
 
+    When ``result.schedule`` has events (from ``semantic_schedule`` or
+    real FSDP/PP capture), the E2E step time is computed via
+    :func:`predict_multi_rank_step_time_us` which accounts for
+    multi-rank schedule dependencies.  Otherwise, the single-rank
+    critical-path time is used.
+
     Args:
         result: The simulation result to annotate and analyse.
         cost_model: Optional cost model instance.
 
     Returns:
-        Dict with keys ``step_time_us``, ``compute_time_us``,
-        ``comm_time_us``, and ``per_phase`` breakdown.
+        Dict with keys ``e2e_step_time_us``, ``single_rank_step_time_us``,
+        ``total_compute_time_us``, ``total_comm_time_us``, and
+        ``per_phase`` breakdown.
     """
     if cost_model is None:
         cost_model = MockCostModel()
 
     cost_model.estimate_graph(result.compute_graph)
-    step_time_us = cost_model.predict_step_time_us(result.compute_graph)
+    single_rank_step = cost_model.predict_step_time_us(result.compute_graph)
+
+    # E2E step time: multi-rank schedule if available, else single-rank
+    e2e_step = predict_multi_rank_step_time_us(result, cost_model)
 
     # Per-phase breakdown
     per_phase: dict[str, dict[str, float]] = {}
@@ -650,7 +729,8 @@ def apply_cost_model(
     total_comm = round(sum(p["comm_time_us"] for p in per_phase.values()), 3)
 
     return {
-        "step_time_us": step_time_us,
+        "e2e_step_time_us": e2e_step,
+        "single_rank_step_time_us": single_rank_step,
         "total_compute_time_us": total_compute,
         "total_comm_time_us": total_comm,
         "per_phase": {

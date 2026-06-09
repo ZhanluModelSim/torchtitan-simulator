@@ -23,7 +23,7 @@ from .export import (
     export_json,
     export_text_summary,
 )
-from .extension_hooks import collect_extension_metadata, postprocess_extension_result
+from .extension_hooks import postprocess_extension_result
 from .fx_capture import capture_forward_fx, capture_joint_fx
 from .memory_estimator import attach_model_state_memory, dtype_size
 from .nodes import DataEdge, OpNode, TensorMeta
@@ -509,6 +509,10 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         except Exception as exc:
             logger.warning("Failed to inject synthetic comm events: %s", exc)
 
+    # ── Semantic schedule (must precede CostModel) ────────────────────
+    if sim_opts.semantic_schedule:
+        _inject_semantic_schedule(result, trainer.config)
+
     # ── CostModel ──────────────────────────────────────────────────────
     cost_model_enabled = getattr(sim_opts, "cost_model", False)
     if cost_model_enabled:
@@ -521,14 +525,13 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         cost_summary = apply_cost_model(result, cost_model)
         result.metadata["cost_model"] = cost_summary
         logger.info(
-            "CostModel: step_time=%.1f us, compute=%.1f us, comm=%.1f us",
-            cost_summary["step_time_us"],
+            "CostModel: e2e_step=%.1f us, single_rank_step=%.1f us, "
+            "compute=%.1f us, comm=%.1f us",
+            cost_summary["e2e_step_time_us"],
+            cost_summary["single_rank_step_time_us"],
             cost_summary["total_compute_time_us"],
             cost_summary["total_comm_time_us"],
         )
-
-    if sim_opts.semantic_schedule:
-        _inject_semantic_schedule(result, trainer.config)
 
     if not microbatches:
         raise RuntimeError("simulation requires at least one microbatch")
