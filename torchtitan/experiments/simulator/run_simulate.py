@@ -208,6 +208,9 @@ def _export_result(
         export_text_summary,
     )
 
+    rank = int(os.environ.get("RANK", "0"))
+    if rank != 0:
+        return
     os.makedirs(output_dir, exist_ok=True)
     if "json" in output_formats:
         p = os.path.join(output_dir, "simulation_result.json")

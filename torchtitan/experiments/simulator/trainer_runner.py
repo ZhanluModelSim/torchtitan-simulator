@@ -108,6 +108,9 @@ def _import_cost_model(
 
 
 def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> None:
+    rank = int(os.environ.get("RANK", "0"))
+    if rank != 0:
+        return
     os.makedirs(output_dir, exist_ok=True)
 
     if "json" in output_formats:

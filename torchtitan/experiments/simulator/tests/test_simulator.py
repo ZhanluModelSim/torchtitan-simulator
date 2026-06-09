@@ -770,6 +770,39 @@ class TestExport(unittest.TestCase):
             assert "Phase Markers" in thread_names.values()
 
 
+class TestExportResultGatedToRankZero(unittest.TestCase):
+    def test_export_result_gated_to_rank_zero(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            PerfResult,
+            SimulationResult,
+        )
+        from torchtitan.experiments.simulator.trainer_runner import _export_result
+
+        g = ComputeGraph()
+        g.add_node(
+            OpNode("n1", "op1", "compute", "forward", perf_result=PerfResult(total_time_us=1.0))
+        )
+        result = SimulationResult(compute_graph=g)
+
+        saved_rank = os.environ.get("RANK")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["RANK"] = "3"
+            _export_result(result, tmpdir, ["json"])
+            json_path = os.path.join(tmpdir, "simulation_result.json")
+            assert not os.path.exists(json_path), "Non-zero rank should not write files"
+
+            os.environ["RANK"] = "0"
+            _export_result(result, tmpdir, ["json"])
+            assert os.path.exists(json_path), "Rank 0 should write files"
+
+        if saved_rank is not None:
+            os.environ["RANK"] = saved_rank
+        else:
+            os.environ.pop("RANK", None)
+
+
 class TestTrainerRunnerExtensionHooks(unittest.TestCase):
     def test_collect_extension_metadata(self):
         from torchtitan.experiments.simulator.extension_hooks import (
