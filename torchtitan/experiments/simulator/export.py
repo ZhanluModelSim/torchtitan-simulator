@@ -521,8 +521,25 @@ def _add_aggregated_phase_events(
 
 def _json_script_payload(result: SimulationResult) -> str:
     data = result.to_dict()
-    # ── Inject schedule timing from OpNode perf_results ───────────────
     _inject_schedule_timing(data, result)
+    has_des = any(
+        n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
+    )
+    if has_des:
+        from .des_engine import compute_des_memory_timeline, compute_des_utilization
+
+        util = compute_des_utilization(result)
+        result.metadata.setdefault("des_engine", {}).update(util)
+        data["metadata"]["des_engine"] = result.metadata["des_engine"]
+        mem = compute_des_memory_timeline(result)
+        result.metadata["des_memory"] = {
+            "static_memory_bytes": mem["static_memory_bytes"],
+            "peak_dynamic_bytes": mem["peak_dynamic_bytes"],
+            "peak_total_bytes": mem["peak_total_bytes"],
+            "timeline": mem["timeline"],
+            "phase_peak": mem["phase_peak"],
+        }
+        data["metadata"]["des_memory"] = result.metadata["des_memory"]
     return escape(json.dumps(data, default=str), quote=False)
 
 
@@ -1210,8 +1227,11 @@ def export_html(
       const laneH = 28;
       const padTop = 40;
       const labelW = 170;
+      const desMemory = TRACE.metadata?.des_memory;
+      const desStats = TRACE.metadata?.des_engine;
+      const extraH = (desMemory ? laneH + 10 : 0) + (desStats ? 30 : 0);
       const width = Math.max(980, labelW + 80 + (maxTime + 10) * pixelsPerUnit);
-      const height = Math.max(160, padTop + lanes.length * laneH + 24);
+      const height = Math.max(160, padTop + lanes.length * laneH + 24 + extraH);
       const ctx = resizeCanvas(canvas, width, height);
       ctx.clearRect(0, 0, width, height);
       ctx.font = '12px ui-sans-serif, system-ui, sans-serif';
@@ -1230,7 +1250,7 @@ def export_html(
           ctx.fillRect(labelW, y - laneH / 2, width - labelW - 30, laneH);
         }}
         // Show rank + PP annotation
-        const rankNum = lane.replace('Rank ', '');
+        const rankNum = lane.replace(/^Rank /, '').split(' ')[0];
         const sample = laneMap.get(lane)?.[0];
         let annotation = lane;
         if (sample) {{
@@ -1251,6 +1271,28 @@ def export_html(
         ctx.lineTo(width - 30, y + laneH / 2);
         ctx.stroke();
       }});
+
+      // Phase boundary shading
+      const phaseRanges = {{}};
+      for (const ev of allEvents) {{
+        const phase = _scheduleEventToPhase(ev.event_type, eventStrategy(ev));
+        const tStart = ev.perf_cumulative_start_us || 0;
+        const tEnd = tStart + (ev.perf_total_time_us || 0);
+        if (!phaseRanges[phase]) phaseRanges[phase] = {{min: tStart, max: tEnd}};
+        else {{
+          phaseRanges[phase].min = Math.min(phaseRanges[phase].min, tStart);
+          phaseRanges[phase].max = Math.max(phaseRanges[phase].max, tEnd);
+        }}
+      }}
+      const phaseColors = {{forward: '#93c5fd', backward: '#fca5a5', optimizer: '#86efac'}};
+      for (const [phase, range] of Object.entries(phaseRanges)) {{
+        const x1 = labelW + range.min * pixelsPerUnit;
+        const x2 = labelW + range.max * pixelsPerUnit;
+        ctx.fillStyle = phaseColors[phase] || '#d5d8dc';
+        ctx.globalAlpha = 0.15;
+        ctx.fillRect(x1, padTop - 4, x2 - x1, lanes.length * laneH + 8);
+        ctx.globalAlpha = 1.0;
+      }}
 
       // Time axis
       const axisY = padTop + lanes.length * laneH + 8;
@@ -1307,13 +1349,81 @@ def export_html(
           }}
         }}
       }}
+
+      // Memory track
+      if (desMemory && desMemory.timeline && desMemory.timeline.length > 0) {{
+        const memLaneH = 20;
+        const memLaneIdx = lanes.length;
+        const memLaneY = padTop + memLaneIdx * laneH + 6;
+        const peakBytes = desMemory.peak_total_bytes || 1;
+        ctx.fillStyle = '#1e293b';
+        ctx.font = 'bold 10px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillText('Memory', 6, memLaneY);
+        ctx.strokeStyle = '#e2e8f0';
+        ctx.beginPath();
+        ctx.moveTo(labelW, memLaneY + laneH / 2);
+        ctx.lineTo(width - 30, memLaneY + laneH / 2);
+        ctx.stroke();
+        const barH = memLaneH - 4;
+        const staticRatio = (desMemory.static_memory_bytes || 0) / peakBytes;
+        ctx.fillStyle = '#64748b';
+        ctx.globalAlpha = 0.5;
+        const staticH = barH * staticRatio;
+        ctx.fillRect(labelW, memLaneY - staticH / 2 + barH / 2 - staticH / 2, width - labelW - 30, staticH);
+        ctx.globalAlpha = 1.0;
+        for (const sample of desMemory.timeline) {{
+          const x = labelW + sample.time_us * pixelsPerUnit;
+          const dynRatio = sample.dynamic_bytes / peakBytes;
+          ctx.fillStyle = '#60a5fa';
+          ctx.globalAlpha = 0.3;
+          ctx.fillRect(x, memLaneY - barH / 2, Math.max(2, 4 * pixelsPerUnit), barH * dynRatio);
+          ctx.globalAlpha = 1.0;
+        }}
+      }}
+
+      // DES stats bar
+      if (desStats) {{
+        const statsY = height - 20;
+        ctx.fillStyle = '#1e293b';
+        ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillText('DES:', 6, statsY);
+        ctx.fillStyle = '#4fc3f7';
+        ctx.fillText('Compute ' + (desStats.compute_busy_pct || 0).toFixed(1) + '%', 46, statsY);
+        ctx.fillStyle = '#f9e79f';
+        ctx.fillText('Comm ' + (desStats.comm_busy_pct || 0).toFixed(1) + '%', 140, statsY);
+        ctx.fillStyle = '#dc2626';
+        ctx.fillText('Overlap ' + (desStats.overlap_pct || 0).toFixed(1) + '%', 220, statsY);
+        ctx.fillStyle = '#e5e7eb';
+        const e2e = desStats.e2e_step_time_us || 0;
+        ctx.fillText('E2E ' + (e2e >= 1000 ? (e2e / 1000).toFixed(2) + 'ms' : e2e.toFixed(0) + 'µs'), 320, statsY);
+      }}
+    }}
+
+    function eventEngineType(eventType) {{
+      const et = String(eventType || '').toLowerCase();
+      if (et.startsWith('pp_send') || et.startsWith('pp_recv') ||
+          et.startsWith('fsdp2_all_gather') || et.startsWith('fsdp2_reduce_scatter') ||
+          et.startsWith('dp_gradient') || et.startsWith('tp_')) {{
+        return 'comm';
+      }}
+      return 'compute';
+    }}
+
+    function _scheduleEventToPhase(eventType, strategy) {{
+      const et = (eventType || '').toLowerCase();
+      const st = (strategy || '').toLowerCase();
+      if (et.includes('bwd') || et.includes('backward') || st.includes('backward')) return 'backward';
+      if (et.includes('fwd') || et.includes('forward') || st === 'pp' || st === 'compute') return 'forward';
+      if (et.includes('optim')) return 'optimizer';
+      if (et.includes('reduce') || et.includes('gradient')) return 'backward';
+      return 'forward';
     }}
 
     function chromeTraceLane(ev) {{
-      // One lane per physical card (rank).  All parallelism events on the
-      // same card — PP forward/backward, FSDP, TP, DP, optimizer — are
-      // inherently sequential and rendered in a single horizontal lane.
-      return 'Rank ' + (ev.rank ?? 0);
+      const eventType = String(ev.event_type || '');
+      const rank = ev.rank ?? 0;
+      const engine = eventEngineType(eventType);
+      return 'Rank ' + rank + ' ' + (engine === 'comm' ? 'Comm' : 'Compute');
     }}
 
     function drawDag(canvas) {{
