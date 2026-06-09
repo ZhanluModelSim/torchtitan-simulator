@@ -64,6 +64,7 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     _populate_des_metadata(result)
     data = result.to_dict()
+    _inject_schedule_timing(data, result)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
 
@@ -521,10 +522,13 @@ def _add_aggregated_phase_events(
 
 
 def _populate_des_metadata(result: SimulationResult) -> None:
-    has_des = any(
+    has_des_nodes = any(
         n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
     )
-    if not has_des:
+    has_des_events = result.schedule is not None and any(
+        ev.des_start_time_us is not None for ev in result.schedule.events
+    )
+    if not has_des_nodes and not has_des_events:
         return
     from .des_engine import compute_des_memory_timeline, compute_des_utilization
 
@@ -1254,7 +1258,7 @@ def export_html(
       const maxTime = hasTiming
         ? Math.max(1, ...allEvents.map(ev => (ev.perf_cumulative_start_us || 0) + (ev.perf_total_time_us || 0)))
         : Math.max(0, ...allEvents.map(ev => Number(ev.logical_clock || 0)));
-      const pixelsPerUnit = hasTiming ? Math.max(0.005, 58 * state.zoom / 50) : 58 * state.zoom;
+      const pixelsPerUnit = hasTiming ? Math.max(0.005, 58 * state.zoom / Math.max(1, maxTime / 100)) : 58 * state.zoom;
       const laneH = 28;
       const padTop = 40;
       const labelW = 170;

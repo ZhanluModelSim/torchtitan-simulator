@@ -327,7 +327,10 @@ def compute_des_utilization(result: SimulationResult) -> dict[str, Any]:
     graph = result.compute_graph
     nodes = list(graph.nodes.values())
 
-    has_des = any(n.des_start_time_us is not None for n in nodes)
+    has_des = any(n.des_start_time_us is not None for n in nodes) or (
+        result.schedule is not None
+        and any(ev.des_start_time_us is not None for ev in result.schedule.events)
+    )
 
     if not has_des:
         return {
@@ -363,10 +366,44 @@ def compute_des_utilization(result: SimulationResult) -> dict[str, Any]:
         if dur > perf_dur + 0.1:
             contention_count += 1
 
+    if not compute_intervals and not comm_intervals and result.schedule is not None:
+        for ev in result.schedule.events:
+            if ev.des_start_time_us is None or ev.des_finish_time_us is None:
+                continue
+            start = ev.des_start_time_us
+            finish = ev.des_finish_time_us
+            dur = finish - start
+            engine_type = _event_engine_type(ev.event_type)
+            if engine_type == "comm":
+                comm_intervals.append((start, finish))
+            else:
+                compute_intervals.append((start, finish))
+            perf_dur = (
+                sum(
+                    result.compute_graph.nodes.get(nid).perf_result.total_time_us
+                    for nid in ev.op_node_ids
+                    if nid in result.compute_graph.nodes
+                    and result.compute_graph.nodes[nid].perf_result is not None
+                )
+                if ev.op_node_ids
+                else 0.0
+            )
+            if dur > perf_dur + 0.1:
+                contention_count += 1
+
     e2e_step = max(
         (n.des_finish_time_us for n in nodes if n.des_finish_time_us is not None),
         default=0.0,
     )
+    if e2e_step == 0.0 and result.schedule is not None:
+        e2e_step = max(
+            (
+                ev.des_finish_time_us
+                for ev in result.schedule.events
+                if ev.des_finish_time_us is not None
+            ),
+            default=0.0,
+        )
     cp_step = _critical_path_time_us(graph)
 
     compute_busy = _merge_interval_total(compute_intervals)
@@ -432,11 +469,37 @@ def compute_des_memory_timeline(result: SimulationResult) -> dict[str, Any]:
     memory_events = result.memory_events
 
     index_to_des_time: list[float] = []
-    for node in nodes_list:
-        if node.des_start_time_us is not None:
-            index_to_des_time.append(node.des_start_time_us)
-        else:
-            index_to_des_time.append(0.0)
+    node_id_to_des_start: dict[str, float] = {}
+    node_id_to_des_finish: dict[str, float] = {}
+    if result.schedule is not None:
+        for ev in result.schedule.events:
+            if ev.des_start_time_us is None or ev.des_finish_time_us is None:
+                continue
+            for nid in ev.op_node_ids:
+                node_id_to_des_start[nid] = min(
+                    node_id_to_des_start.get(nid, float("inf")),
+                    ev.des_start_time_us,
+                )
+                node_id_to_des_finish[nid] = max(
+                    node_id_to_des_finish.get(nid, 0.0),
+                    ev.des_finish_time_us,
+                )
+    node_des_available = any(node.des_start_time_us is not None for node in nodes_list)
+    if node_des_available:
+        for node in nodes_list:
+            if node.des_start_time_us is not None:
+                index_to_des_time.append(node.des_start_time_us)
+            else:
+                if node.node_id in node_id_to_des_start:
+                    index_to_des_time.append(node_id_to_des_start[node.node_id])
+                else:
+                    index_to_des_time.append(0.0)
+    else:
+        for node in nodes_list:
+            if node.node_id in node_id_to_des_start:
+                index_to_des_time.append(node_id_to_des_start[node.node_id])
+            else:
+                index_to_des_time.append(0.0)
 
     static_events: list[MemoryEvent] = []
     dynamic_events: list[MemoryEvent] = []
@@ -454,6 +517,8 @@ def compute_des_memory_timeline(result: SimulationResult) -> dict[str, Any]:
         free_node = nodes_list[me.lifetime_end]
         if free_node.des_finish_time_us is not None:
             free_time = free_node.des_finish_time_us
+        elif free_node.node_id in node_id_to_des_finish:
+            free_time = node_id_to_des_finish[free_node.node_id]
         else:
             free_time = index_to_des_time[me.lifetime_end]
         dynamic_with_times.append(
