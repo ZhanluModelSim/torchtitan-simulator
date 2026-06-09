@@ -128,9 +128,9 @@ def _build_mock_stages_and_schedule(
 ) -> Any:
     """Construct a real PyTorch schedule object with mock stages."""
     from torch.distributed.pipelining.schedules import (
+        get_schedule_class,
         PipelineScheduleMulti,
         PipelineScheduleSingle,
-        get_schedule_class,
     )
 
     schedule_class = get_schedule_class(schedule_name)
@@ -255,9 +255,7 @@ def _action_to_event_type(action: Any) -> str:
     return _comp_type_to_event_type(comp_type)
 
 
-def _stage_to_pp_rank(
-    stage_index: int, schedule: Any, pp_degree: int
-) -> int:
+def _stage_to_pp_rank(stage_index: int, schedule: Any, pp_degree: int) -> int:
     if hasattr(schedule, "stage_index_to_group_rank"):
         mapping = schedule.stage_index_to_group_rank
         if mapping and stage_index in mapping:
@@ -311,7 +309,7 @@ def _convert_pipeline_order_to_training_schedule(
     # for cross-rank dependency matching.
     event_index: dict[tuple[str, int | None, int, int], ScheduleEvent] = {}
 
-    per_rank_prev: dict[int, str] = {}
+    per_rank_prev: dict[Any, str] = {}
 
     for pp_rank_key, action_list in pipeline_order.items():
         logical_clock = 0
@@ -324,12 +322,8 @@ def _convert_pipeline_order_to_training_schedule(
             stage_index = action.stage_index
             mb_index = action.microbatch_index
 
-            # pipeline_order keys are PP ranks; use the key directly as pp_rank.
-            # For PipelineScheduleSingle (1F1B, GPipe), each key is a PP rank
-            # and the actions list describes what that PP rank does.
             actual_pp_rank = pp_rank_key
 
-            # Base global rank for this PP rank
             base_global_rank = actual_pp_rank * tp_degree * dp_degree
 
             eid = _next_id(event_type)
@@ -349,10 +343,10 @@ def _convert_pipeline_order_to_training_schedule(
             )
             ts.add_event(ev)
 
-            # Sequential dependency within same PP rank
-            if pp_rank_key in per_rank_prev:
-                ts.add_dep(ScheduleDep(per_rank_prev[pp_rank_key], eid, "control"))
-            per_rank_prev[pp_rank_key] = eid
+            pp_prev_key = ("pp", pp_rank_key)
+            if pp_prev_key in per_rank_prev:
+                ts.add_dep(ScheduleDep(per_rank_prev[pp_prev_key], eid, "control"))
+            per_rank_prev[pp_prev_key] = eid
 
             # Index for cross-rank dependency matching
             key = (event_type, mb_index, stage_index, pp_rank_key)
@@ -374,8 +368,12 @@ def _convert_pipeline_order_to_training_schedule(
     send_recv_lookup: dict[tuple[str, int | None, int], tuple[int, ScheduleEvent]] = {}
     for key, ev in list(event_index.items()):
         etype, mb, stage, pp_r = key
-        if etype in ("pp_send_activation", "pp_recv_activation",
-                     "pp_send_gradient", "pp_recv_gradient"):
+        if etype in (
+            "pp_send_activation",
+            "pp_recv_activation",
+            "pp_send_gradient",
+            "pp_recv_gradient",
+        ):
             send_recv_lookup[(etype, mb, stage)] = (pp_r, ev)
 
     # SEND_F(stage=s) → RECV_F(stage=s+1) for same microbatch
@@ -386,9 +384,7 @@ def _convert_pipeline_order_to_training_schedule(
             if recv_key in send_recv_lookup:
                 recv_pp_r, recv_ev = send_recv_lookup[recv_key]
                 if recv_pp_r != pp_r:
-                    ts.add_dep(
-                        ScheduleDep(ev.event_id, recv_ev.event_id, "pp_comm")
-                    )
+                    ts.add_dep(ScheduleDep(ev.event_id, recv_ev.event_id, "pp_comm"))
 
     # SEND_B → RECV_B: backward gradient flows from later to earlier stage.
     # SEND_B(stage=s) sends gradient; RECV_B(stage=s-1) receives it.
@@ -399,9 +395,7 @@ def _convert_pipeline_order_to_training_schedule(
             if recv_key in send_recv_lookup:
                 recv_pp_r, recv_ev = send_recv_lookup[recv_key]
                 if recv_pp_r != pp_r:
-                    ts.add_dep(
-                        ScheduleDep(ev.event_id, recv_ev.event_id, "pp_comm")
-                    )
+                    ts.add_dep(ScheduleDep(ev.event_id, recv_ev.event_id, "pp_comm"))
 
     # ── Replicate PP-group events across TP and DP ranks ─────────────
     # PP events are generated per PP rank.  Replicate them to sibling
@@ -409,16 +403,13 @@ def _convert_pipeline_order_to_training_schedule(
 
     group_size = tp_degree * dp_degree
     if group_size > 1:
-        original_events = [
-            e
-            for e in ts.events
-            if e.metadata.get("strategy") == "pp"
-        ]
+        original_events = [e for e in ts.events if e.metadata.get("strategy") == "pp"]
         original_deps = list(ts.deps)
 
         eid_remap: dict[str, dict[int, str]] = {}
         for ev in original_events:
             base_rank = ev.rank
+            dp_tp_offset = base_rank % group_size
             pp_group_base = (base_rank // group_size) * group_size
             for r_offset in range(1, group_size):
                 r = pp_group_base + r_offset
@@ -437,7 +428,7 @@ def _convert_pipeline_order_to_training_schedule(
 
                 if ev.event_id not in eid_remap:
                     eid_remap[ev.event_id] = {}
-                eid_remap[ev.event_id][r] = new_eid
+                eid_remap[ev.event_id][r_offset] = new_eid
 
                 if r in per_rank_prev:
                     ts.add_dep(ScheduleDep(per_rank_prev[r], new_eid, "control"))
@@ -448,8 +439,8 @@ def _convert_pipeline_order_to_training_schedule(
             to_eid = dep.to_event_id
             remap_from = eid_remap.get(from_eid, {})
             remap_to = eid_remap.get(to_eid, {})
-            for r, to_copy in remap_to.items():
-                from_copy = remap_from.get(r)
+            for r_offset, to_copy in remap_to.items():
+                from_copy = remap_from.get(r_offset)
                 if from_copy:
                     ts.add_dep(ScheduleDep(from_copy, to_copy, dep.dep_type))
 
