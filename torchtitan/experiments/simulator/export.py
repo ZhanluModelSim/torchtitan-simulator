@@ -751,7 +751,7 @@ def _render_swimlane_canvas(
         <button type="button" data-action="reset">Reset</button>
         <span class="muted chart-note">Drag or use horizontal scrollbar to pan.</span>
       </div>
-      <div class="chart-frame">
+      <div class="chart-frame" id="chrome-trace-frame-step-{step}">
         <canvas id="chrome-trace-step-{step}" class="trace-chart chrome-trace-chart" data-step="{step}"></canvas>
       </div>
     </details>
@@ -791,7 +791,7 @@ def _render_operator_dag_canvas(
       <button type="button" data-action="reset">Reset</button>
       <span class="muted">Canvas DAG view for {escape(phase)}</span>
     </div>
-    <div class="chart-frame">
+    <div class="chart-frame" id="{escape(canvas_id)}-frame">
       <canvas id="{escape(canvas_id)}" class="trace-chart dag-chart" data-phase="{escape(phase)}" data-max-nodes="{max_nodes}"></canvas>
     </div>
     """
@@ -817,7 +817,7 @@ def _render_memory_trace_canvas(result: SimulationResult) -> str:
       <button type="button" data-action="reset">Reset</button>
       <span class="muted chart-note">{lifetimed} lifetimed events, {len(result.memory_events)} total memory events.</span>
     </div>
-    <div class="chart-frame">
+    <div class="chart-frame" id="memory-trace-frame">
       <canvas id="memory-trace" class="trace-chart memory-chart"></canvas>
     </div>
     <div class="memory-table-wrap">
@@ -950,8 +950,9 @@ def export_html(
     .chart-toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:12px 0 8px; }}
     .chart-toolbar button {{ background:#1e293b; color:var(--text); border:1px solid #475569; border-radius:8px; padding:6px 10px; cursor:pointer; }}
     .chart-toolbar button:hover {{ background:#334155; }}
-    .chart-frame {{ overflow:auto; max-width:100%; border:1px solid var(--border); border-radius:10px; background:#f8fafc; cursor:grab; }}
+    .chart-frame {{ overflow:auto; max-width:100%; position:relative; border:1px solid var(--border); border-radius:10px; background:#f8fafc; cursor:grab; }}
     .chart-frame.dragging {{ cursor:grabbing; }}
+    .cursor-line {{ position:absolute; top:0; width:0; height:100%; pointer-events:none; z-index:5; border-left:1px dashed rgba(255,255,255,0.6); }}
     canvas.trace-chart {{ display:block; background:#f8fafc; }}
     .memory-table-wrap {{ overflow:auto; margin-top:12px; border:1px solid var(--border); border-radius:10px; }}
     .memory-table {{ width:100%; border-collapse:collapse; min-width:760px; background:#020617; }}
@@ -962,6 +963,7 @@ def export_html(
   </style>
 </head>
 <body>
+  <div id="tooltip" style="display:none;position:fixed;z-index:1000;background:#1e1e1e;color:#e0e0e0;padding:8px 12px;border-radius:6px;font:11px/1.4 monospace;max-width:360px;pointer-events:none;box-shadow:0 2px 8px rgba(0,0,0,0.3);"></div>
   <header>
     <h1>{escape(title)}</h1>
     <div class="muted">Hierarchical trace: train step → parallel schedule swimlanes → forward/backward operator dependency DAGs.</div>
@@ -1000,6 +1002,69 @@ def export_html(
     const payload = document.getElementById('trace-data').textContent;
     const TRACE = JSON.parse(payload);
     document.getElementById('payload').textContent = JSON.stringify(TRACE, null, 2);
+
+    const tooltipEl = document.getElementById('tooltip');
+    let _barRegistry = [];
+
+    function fmt(us) {{
+      if (us === undefined || us === null) return '—';
+      if (us >= 1000) return (us / 1000).toFixed(2) + ' ms';
+      return us.toFixed(1) + ' µs';
+    }}
+
+    function showCursorLine(frameId, xClient) {{
+      const frame = document.getElementById(frameId);
+      if (!frame) return;
+      let line = frame.querySelector('.cursor-line');
+      if (!line) {{
+        line = document.createElement('div');
+        line.className = 'cursor-line';
+        frame.appendChild(line);
+      }}
+      const frameRect = frame.getBoundingClientRect();
+      line.style.display = 'block';
+      line.style.left = (xClient - frameRect.left) + 'px';
+    }}
+
+    function hideCursorLine(frameId) {{
+      const frame = document.getElementById(frameId);
+      if (!frame) return;
+      const line = frame.querySelector('.cursor-line');
+      if (line) line.style.display = 'none';
+    }}
+
+    function _installTooltip(canvas, registry) {{
+      if (canvas._tooltipInstalled) return;
+      canvas._tooltipInstalled = true;
+      const frame = canvas.closest('.chart-frame');
+      const frameId = frame ? frame.id : '';
+      canvas.addEventListener('mousemove', (event) => {{
+        const rect = canvas.getBoundingClientRect();
+        const mx = event.clientX - rect.left;
+        const my = event.clientY - rect.top;
+        let best = null;
+        for (const entry of registry) {{
+          if (mx >= entry.x && mx <= entry.x + entry.w && my >= entry.y && my <= entry.y + entry.h) {{
+            best = entry;
+            break;
+          }}
+        }}
+        if (best) {{
+          tooltipEl.style.display = 'block';
+          tooltipEl.style.left = (event.clientX + 14) + 'px';
+          tooltipEl.style.top = (event.clientY - 10) + 'px';
+          tooltipEl.innerHTML = best.tip;
+          showCursorLine(frameId, event.clientX);
+        }} else {{
+          tooltipEl.style.display = 'none';
+          hideCursorLine(frameId);
+        }}
+      }});
+      canvas.addEventListener('mouseleave', () => {{
+        tooltipEl.style.display = 'none';
+        hideCursorLine(frameId);
+      }});
+    }}
 
     const chartState = new WeakMap();
     const palette = {{
@@ -1229,6 +1294,7 @@ def export_html(
     }}
 
     function drawChromeTrace(canvas) {{
+      _barRegistry = [];
       const state = chartState.get(canvas) || {{zoom: 1}};
       chartState.set(canvas, state);
       const step = Number.parseInt(canvas.dataset.step || '0', 10);
@@ -1375,6 +1441,15 @@ def export_html(
           ctx.strokeStyle = '#334155';
           ctx.lineWidth = 0.5;
           ctx.strokeRect(x, y - barH / 2, barW, barH);
+          _barRegistry.push({{
+            x: x, y: y - barH / 2, w: barW, h: barH,
+            tip: '<b>' + shortName(ev.op_name || ev.event_type || name) + '</b><br>' +
+                 'Phase: ' + (ev.phase || '—') + '<br>' +
+                 'Start: ' + fmt(ev.perf_cumulative_start_us) + '<br>' +
+                 'Duration: ' + fmt(ev.perf_total_time_us) + '<br>' +
+                 'Engine: ' + eventEngineType(ev.event_type) +
+                 (ev.op_node_ids && ev.op_node_ids.length ? '<br>Nodes: ' + ev.op_node_ids.length : '')
+          }});
 
           // Name inside bar (if wide enough) or beside
           if (barW > 50) {{
@@ -1433,6 +1508,7 @@ def export_html(
         const e2e = desStats.e2e_step_time_us || 0;
         ctx.fillText('E2E ' + (e2e >= 1000 ? (e2e / 1000).toFixed(2) + 'ms' : e2e.toFixed(0) + 'µs'), 320, statsY);
       }}
+      _installTooltip(canvas, _barRegistry);
     }}
 
     function eventEngineType(eventType) {{
@@ -1482,6 +1558,7 @@ def export_html(
     }}
 
     function drawDagDesTemporal(canvas, phaseNodes, edges, state, phase) {{
+      _barRegistry = [];
       const computeNodes = phaseNodes.filter(n => !['comm_collective', 'comm_p2p'].includes(n.op_type));
       const commNodes = phaseNodes.filter(n => ['comm_collective', 'comm_p2p'].includes(n.op_type));
 
@@ -1540,6 +1617,15 @@ def export_html(
         ctx.strokeStyle = isContended ? '#dc2626' : '#334155';
         ctx.lineWidth = isContended ? 2 : 0.5;
         ctx.stroke();
+        _barRegistry.push({{
+          x: x, y: computeRowY - nodeH / 2, w: w, h: nodeH,
+          tip: '<b>' + shortName(node.op_name) + '</b><br>' +
+               'Type: ' + node.op_type + '<br>' +
+               'Phase: ' + node.phase + '<br>' +
+               (node.des_start_time_us ? 'DES start: ' + fmt(node.des_start_time_us) + '<br>' : '') +
+               (node.des_finish_time_us ? 'DES finish: ' + fmt(node.des_finish_time_us) + '<br>' : '') +
+               (node.perf_result ? 'Duration: ' + fmt(node.perf_result.total_time_us) + '<br>' : '')
+        }});
         ctx.fillStyle = '#0f172a';
         ctx.font = '700 9px ui-sans-serif, system-ui, sans-serif';
         if (w > 30) ctx.fillText(shortName(node.op_name, 12), x + 3, computeRowY - 6);
@@ -1564,6 +1650,15 @@ def export_html(
         ctx.strokeStyle = isContended ? '#dc2626' : '#334155';
         ctx.lineWidth = isContended ? 2 : 0.5;
         ctx.stroke();
+        _barRegistry.push({{
+          x: x, y: commRowY - nodeH / 2, w: w, h: nodeH,
+          tip: '<b>' + shortName(node.op_name) + '</b><br>' +
+               'Type: ' + node.op_type + '<br>' +
+               'Phase: ' + node.phase + '<br>' +
+               (node.des_start_time_us ? 'DES start: ' + fmt(node.des_start_time_us) + '<br>' : '') +
+               (node.des_finish_time_us ? 'DES finish: ' + fmt(node.des_finish_time_us) + '<br>' : '') +
+               (node.perf_result ? 'Duration: ' + fmt(node.perf_result.total_time_us) + '<br>' : '')
+        }});
         ctx.fillStyle = '#0f172a';
         ctx.font = '700 9px ui-sans-serif, system-ui, sans-serif';
         if (w > 30) ctx.fillText(shortName(node.op_name, 12), x + 3, commRowY - 6);
@@ -1597,9 +1692,11 @@ def export_html(
           ctx.globalAlpha = 1.0;
         }}
       }}
+      _installTooltip(canvas, _barRegistry);
     }}
 
     function drawDagTopological(canvas, phaseNodes, edges, state, phase) {{
+      _barRegistry = [];
       const preds = new Map(phaseNodes.map((node) => [node.node_id, []]));
       const succs = new Map(phaseNodes.map((node) => [node.node_id, []]));
       const indeg = new Map(phaseNodes.map((node) => [node.node_id, 0]));
@@ -1670,6 +1767,13 @@ def export_html(
         ctx.strokeStyle = '#334155';
         ctx.lineWidth = 1;
         ctx.stroke();
+        _barRegistry.push({{
+          x: pos.x, y: pos.y, w: nodeW, h: 56,
+          tip: '<b>' + shortName(node.op_name) + '</b><br>' +
+               'Type: ' + (node.op_type || 'unknown') + '<br>' +
+               'Phase: ' + (node.phase || 'unknown') + '<br>' +
+               (durUs > 0 ? 'Duration: ' + fmt(durUs) + '<br>' : '')
+        }});
         ctx.fillStyle = '#0f172a';
         ctx.font = '700 12px ui-sans-serif, system-ui, sans-serif';
         ctx.fillText(shortName(node.op_name, 28), pos.x + 8, pos.y + 17);
@@ -1684,6 +1788,7 @@ def export_html(
           ctx.fillText(timeLabel, pos.x + 8, pos.y + 47);
         }}
       }}
+      _installTooltip(canvas, _barRegistry);
     }}
 
     function memoryEvents() {{
@@ -1766,6 +1871,7 @@ def export_html(
     }}
 
     function drawMemoryTrace(canvas) {{
+      _barRegistry = [];
       const state = chartState.get(canvas) || {{zoom: 1}};
       chartState.set(canvas, state);
       const events = memoryEvents();
@@ -1906,6 +2012,14 @@ def export_html(
           ctx.fillStyle = memoryCategoryColor(category);
           ctx.fillRect(x, yTop, barW, h);
         }}
+        _barRegistry.push({{
+          x: x, y: yTop, w: barW, h: plotTop + plotHeight - yTop,
+          tip: '<b>Memory @ ' + fmt(sample.time_us) + '</b><br>' +
+               'Dynamic: ' + formatBytes(sample.dynamic_bytes || 0) + '<br>' +
+               'Total: ' + formatBytes(sample.total_bytes || sample.total || sample.dynamic_bytes || 0) + '<br>' +
+               (sample.duration_us ? 'Span: ' + fmt(sample.duration_us) + '<br>' : '') +
+               (sample.byCategory ? Object.entries(sample.byCategory instanceof Map ? Array.from(sample.byCategory.entries()) : sample.byCategory).filter(([k,b]) => b > 0).map(([cat,b]) => cat + ': ' + formatBytes(b)).join('<br>') : '')
+        }});
       }}
 
       ctx.fillStyle = '#334155';
@@ -1940,6 +2054,7 @@ def export_html(
         ctx.fillText(category, legendX + 18, legendY);
         legendX += 150;
       }}
+      _installTooltip(canvas, _barRegistry);
     }}
 
     function populateMemoryTable() {{
