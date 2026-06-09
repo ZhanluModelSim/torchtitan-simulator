@@ -2028,6 +2028,231 @@ class TestDESEngine(unittest.TestCase):
         result = simulate_single_rank_des(graph)
         assert result == 50.0, f"Expected 50.0 (5*10 linear chain), got {result}"
 
+    def test_compute_comm_overlap_on_separate_branches(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_single_rank_des
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+        )
+
+        graph = ComputeGraph()
+        root = OpNode(
+            node_id="root",
+            op_name="op_root",
+            op_type="compute",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=2.0),
+        )
+        compute = OpNode(
+            node_id="compute",
+            op_name="op_compute",
+            op_type="compute",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=100.0),
+        )
+        comm = OpNode(
+            node_id="comm",
+            op_name="all_reduce",
+            op_type="comm_collective",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=50.0),
+        )
+        join = OpNode(
+            node_id="join",
+            op_name="op_join",
+            op_type="compute",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=0.0),
+        )
+        graph.add_node(root)
+        graph.add_node(compute)
+        graph.add_node(comm)
+        graph.add_node(join)
+        graph.add_edge(DataEdge("root", "compute", "data"))
+        graph.add_edge(DataEdge("root", "comm", "data"))
+        graph.add_edge(DataEdge("compute", "join", "data"))
+        graph.add_edge(DataEdge("comm", "join", "data"))
+
+        result = simulate_single_rank_des(graph)
+        expected = 2.0 + 100.0
+        assert result == expected, f"Expected {expected} (overlap), got {result}"
+
+    def test_compute_comm_serialize_on_same_branch(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_single_rank_des
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+        )
+
+        graph = ComputeGraph()
+        compute = OpNode(
+            node_id="compute",
+            op_name="op_compute",
+            op_type="compute",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=100.0),
+        )
+        comm = OpNode(
+            node_id="comm",
+            op_name="all_reduce",
+            op_type="comm_collective",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=50.0),
+        )
+        graph.add_node(compute)
+        graph.add_node(comm)
+        graph.add_edge(DataEdge("compute", "comm", "data"))
+
+        result = simulate_single_rank_des(graph)
+        expected = 150.0
+        assert result == expected, f"Expected {expected} (no overlap), got {result}"
+
+    def test_two_comm_ops_contention(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_single_rank_des
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+        )
+
+        graph = ComputeGraph()
+        root = OpNode(
+            node_id="root",
+            op_name="op_root",
+            op_type="compute",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=2.0),
+        )
+        comm1 = OpNode(
+            node_id="comm1",
+            op_name="all_reduce_1",
+            op_type="comm_collective",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=30.0),
+        )
+        comm2 = OpNode(
+            node_id="comm2",
+            op_name="all_reduce_2",
+            op_type="comm_collective",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=40.0),
+        )
+        join = OpNode(
+            node_id="join",
+            op_name="op_join",
+            op_type="compute",
+            phase="forward",
+            inputs=[],
+            outputs=[],
+            perf_result=PerfResult(total_time_us=0.0),
+        )
+        graph.add_node(root)
+        graph.add_node(comm1)
+        graph.add_node(comm2)
+        graph.add_node(join)
+        graph.add_edge(DataEdge("root", "comm1", "data"))
+        graph.add_edge(DataEdge("root", "comm2", "data"))
+        graph.add_edge(DataEdge("comm1", "join", "data"))
+        graph.add_edge(DataEdge("comm2", "join", "data"))
+
+        result = simulate_single_rank_des(graph)
+        expected = 2.0 + 30.0 + 40.0
+        assert (
+            result == expected
+        ), f"Expected {expected} (comm contention), got {result}"
+
+    def test_multi_rank_des_with_schedule(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_multi_rank_des
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            PerfResult,
+            ScheduleDep,
+            ScheduleEvent,
+            SimulationResult,
+            TrainingSchedule,
+        )
+
+        graph = ComputeGraph()
+        fwd_node = OpNode(
+            "n_fwd",
+            "aten.mm.default",
+            "compute",
+            "forward",
+            pp_stage=0,
+            microbatch_idx=0,
+            perf_result=PerfResult(total_time_us=50.0),
+        )
+        bwd_node = OpNode(
+            "n_bwd",
+            "aten.mm.default",
+            "compute",
+            "backward",
+            pp_stage=0,
+            microbatch_idx=0,
+            perf_result=PerfResult(total_time_us=30.0),
+        )
+        graph.add_node(fwd_node)
+        graph.add_node(bwd_node)
+
+        schedule = TrainingSchedule()
+        ev_fwd0 = ScheduleEvent(
+            "e_fwd0", "pp_forward", rank=0, pp_stage=0, microbatch_idx=0
+        )
+        ev_send = ScheduleEvent(
+            "e_send", "pp_send_activation", rank=0, pp_stage=0, microbatch_idx=0
+        )
+        ev_recv = ScheduleEvent(
+            "e_recv", "pp_recv_activation", rank=1, pp_stage=1, microbatch_idx=0
+        )
+        ev_fwd1 = ScheduleEvent(
+            "e_fwd1", "pp_forward", rank=1, pp_stage=1, microbatch_idx=0
+        )
+        ev_bwd0 = ScheduleEvent(
+            "e_bwd0", "pp_backward", rank=0, pp_stage=0, microbatch_idx=0
+        )
+        ev_bwd1 = ScheduleEvent(
+            "e_bwd1", "pp_backward", rank=1, pp_stage=1, microbatch_idx=0
+        )
+        schedule.add_event(ev_fwd0)
+        schedule.add_event(ev_send)
+        schedule.add_event(ev_recv)
+        schedule.add_event(ev_fwd1)
+        schedule.add_event(ev_bwd0)
+        schedule.add_event(ev_bwd1)
+        schedule.add_dep(ScheduleDep("e_fwd0", "e_send", "pp_comm"))
+        schedule.add_dep(ScheduleDep("e_send", "e_recv", "pp_comm"))
+        schedule.add_dep(ScheduleDep("e_recv", "e_fwd1", "control"))
+        schedule.add_dep(ScheduleDep("e_fwd1", "e_bwd1", "control"))
+        schedule.add_dep(ScheduleDep("e_fwd0", "e_bwd0", "control"))
+
+        result = SimulationResult(compute_graph=graph, schedule=schedule)
+        step_time = simulate_multi_rank_des(result)
+        assert step_time >= 80.0, f"Expected >= 80.0, got {step_time}"
+
 
 if __name__ == "__main__":
     unittest.main()

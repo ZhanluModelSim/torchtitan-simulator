@@ -53,9 +53,9 @@ class _OpComponent(sim.Component):
         yield self.request(self._resource)
         start = self.env.now()
         yield self.hold(self._duration)
-        self._finish_state.set(True)
         self.release(self._resource)
         finish = self.env.now()
+        self._finish_state.set(True)
 
         if self._node is not None:
             self._node.des_start_time_us = round(start, 3)
@@ -177,9 +177,9 @@ class _ScheduleEventComponent(sim.Component):
         yield self.request(self._resource)
         start = self.env.now()
         yield self.hold(self._duration)
-        self._finish_state.set(True)
         self.release(self._resource)
         finish = self.env.now()
+        self._finish_state.set(True)
 
         if self._schedule_event is not None:
             self._schedule_event.des_start_time_us = round(start, 3)
