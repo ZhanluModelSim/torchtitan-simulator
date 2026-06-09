@@ -301,6 +301,10 @@ class ComputeGraph:
                 op_name=f"phase_end_{prev_phase}",
                 op_type="phase_boundary",
                 phase=prev_phase,
+                perf_result=PerfResult(
+                    total_time_us=0.0,
+                    metadata={"phase_boundary": True},
+                ),
             )
             self.add_node(sentinel)
 

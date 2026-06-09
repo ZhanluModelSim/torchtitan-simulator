@@ -129,6 +129,34 @@ class TestComputeGraph(unittest.TestCase):
         assert g.nodes["c1"].phase == "backward", \
             "comm node with only backward predecessors should be backward"
 
+    def test_phase_boundary_sentinel_has_perf_result(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+        )
+
+        g = ComputeGraph()
+        fwd = OpNode(
+            "f1", "compute_op", "compute", "forward", [], [],
+            perf_result=PerfResult(total_time_us=10.0),
+        )
+        bwd = OpNode(
+            "b1", "compute_op", "compute", "backward", [], [],
+            perf_result=PerfResult(total_time_us=20.0),
+        )
+        g.add_node(fwd)
+        g.add_node(bwd)
+        g.add_edge(DataEdge("f1", "b1", "data"))
+
+        g.add_phase_boundary_edges()
+        sentinel = g.nodes["phase_end_forward"]
+        assert sentinel.perf_result is not None, "sentinel should have PerfResult"
+        assert sentinel.perf_result.total_time_us == 0.0, "sentinel should have zero duration"
+        assert sentinel.perf_result.metadata.get("phase_boundary") is True, \
+            "sentinel PerfResult should be marked as phase_boundary"
+
     def test_fix_comm_phase_labels_mixed_phase_deps_unchanged(self):
         from torchtitan.experiments.simulator.nodes import (
             ComputeGraph,
