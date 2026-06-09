@@ -31,6 +31,7 @@ Quick start::
 """
 
 from .cost_model import apply_cost_model, CostModel, MockCostModel
+from .des_engine import DESEngine, simulate_multi_rank_des, simulate_single_rank_des
 from .export import (
     export_chrome_trace,
     export_dot,
@@ -63,6 +64,10 @@ __all__ = [
     "TensorMeta",
     "ScheduleEvent",
     "ScheduleDep",
+    # DES engine
+    "DESEngine",
+    "simulate_single_rank_des",
+    "simulate_multi_rank_des",
     # Cost model
     "CostModel",
     "MockCostModel",

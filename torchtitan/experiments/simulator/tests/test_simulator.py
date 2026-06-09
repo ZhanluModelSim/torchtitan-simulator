@@ -2262,6 +2262,73 @@ class TestDESEngine(unittest.TestCase):
         step_time = simulate_multi_rank_des(result)
         assert step_time >= 80.0, f"Expected >= 80.0, got {step_time}"
 
+    def test_des_accounts_for_comm_contention_while_cp_does_not(self):
+        from torchtitan.experiments.simulator.cost_model import _critical_path_time_us
+        from torchtitan.experiments.simulator.des_engine import simulate_single_rank_des
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+        )
+
+        graph = ComputeGraph()
+        root = OpNode(
+            "root",
+            "input",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=1.0),
+        )
+        c1 = OpNode(
+            "c1",
+            "all_gather",
+            "comm_collective",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=50.0),
+            comm_op="all_gather",
+            comm_group_size=2,
+        )
+        c2 = OpNode(
+            "c2",
+            "reduce_scatter",
+            "comm_collective",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=60.0),
+            comm_op="reduce_scatter",
+            comm_group_size=2,
+        )
+        join = OpNode(
+            "join",
+            "output",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=1.0),
+        )
+        graph.add_node(root)
+        graph.add_node(c1)
+        graph.add_node(c2)
+        graph.add_node(join)
+        graph.add_edge(DataEdge("root", "c1", "data"))
+        graph.add_edge(DataEdge("root", "c2", "data"))
+        graph.add_edge(DataEdge("c1", "join", "data"))
+        graph.add_edge(DataEdge("c2", "join", "data"))
+
+        cp_time = _critical_path_time_us(graph)
+        des_time = simulate_single_rank_des(graph)
+        assert des_time >= cp_time, f"DES ({des_time}) < CP ({cp_time})"
+        assert (
+            des_time > cp_time
+        ), f"DES ({des_time}) should be > CP ({cp_time}) due to comm contention"
+
 
 if __name__ == "__main__":
     unittest.main()
