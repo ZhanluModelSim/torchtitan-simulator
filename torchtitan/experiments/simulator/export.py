@@ -208,14 +208,38 @@ def export_chrome_trace(
             return node.perf_result.total_time_us
         return us_per_op
 
+    has_des = any(
+        n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
+    )
+
     events: list[dict[str, Any]] = []
-    for node in result.compute_graph.nodes.values():
-        phase = node.phase or "unknown"
-        tid = _get_tid(phase)
-        ts = phase_ts.get(phase, 0.0)
-        dur = _node_dur_us(node)
-        events.append(_op_to_chrome_event(node, pid=0, tid=tid, ts_us=ts, dur_us=dur))
-        phase_ts[phase] = ts + dur
+    if has_des:
+        for node in result.compute_graph.nodes.values():
+            phase = node.phase or "unknown"
+            tid = _get_tid(phase)
+            ts_us = (
+                node.des_start_time_us if node.des_start_time_us is not None else 0.0
+            )
+            if (
+                node.des_finish_time_us is not None
+                and node.des_start_time_us is not None
+            ):
+                dur_us = node.des_finish_time_us - node.des_start_time_us
+            else:
+                dur_us = _node_dur_us(node)
+            events.append(
+                _op_to_chrome_event(node, pid=0, tid=tid, ts_us=ts_us, dur_us=dur_us)
+            )
+    else:
+        for node in result.compute_graph.nodes.values():
+            phase = node.phase or "unknown"
+            tid = _get_tid(phase)
+            ts = phase_ts.get(phase, 0.0)
+            dur = _node_dur_us(node)
+            events.append(
+                _op_to_chrome_event(node, pid=0, tid=tid, ts_us=ts, dur_us=dur)
+            )
+            phase_ts[phase] = ts + dur
 
     # Add FSDP events as a separate process
     for ev in result.fsdp_events:
@@ -459,21 +483,9 @@ def _json_script_payload(result: SimulationResult) -> str:
 
 
 def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> None:
-    """Pre-compute per-schedule-event timing by aggregating OpNode perf_results.
-
-    Since the simulator runs on a single CPU process, OpNodes share
-    ``pp_stage=None`` and ``microbatch_idx=0``.  Schedule events are
-    therefore matched by *phase* only — all forward events split the
-    forward phase total evenly, all backward events split the backward
-    total, etc.
-
-    Adds ``data["perf_schedule"]`` with:
-    * ``events`` — each schedule event enriched with ``perf_total_time_us``
-    * ``phase_totals`` — per-phase aggregates
-    * ``grand_total_us`` — sum of all annotated OpNode times
-    """
+    """Pre-compute per-schedule-event timing using DES results when available."""
     graph = result.compute_graph
-    # Aggregate OpNode times by phase only (pp_stage/microbatch are None/0)
+
     phase_totals: dict[str, float] = {}
     for node in graph.nodes.values():
         if node.perf_result is None:
@@ -484,7 +496,6 @@ def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> N
         )
     grand_total = sum(phase_totals.values())
 
-    # Count schedule events per mapped phase
     event_counts: dict[str, int] = {}
     schedule = data.get("schedule")
     if schedule and schedule.get("events"):
@@ -495,28 +506,44 @@ def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> N
             phase = _schedule_event_to_phase(ev_type, strategy)
             event_counts[phase] = event_counts.get(phase, 0) + 1
 
-    # Enrich schedule events with timing
     enriched_events: list[dict[str, Any]] = []
     if schedule and schedule.get("events"):
+        des_event_map: dict[str, tuple[float, float]] = {}
+        if result.schedule is not None:
+            for ev in result.schedule.events:
+                if (
+                    ev.des_start_time_us is not None
+                    and ev.des_finish_time_us is not None
+                ):
+                    des_event_map[ev.event_id] = (
+                        ev.des_start_time_us,
+                        ev.des_finish_time_us,
+                    )
+
         cumulative_per_phase: dict[str, float] = {}
         for ev in schedule["events"]:
             ev_type = ev.get("event_type", "")
             metadata = ev.get("metadata", {}) or {}
             strategy = metadata.get("strategy", "")
             phase = _schedule_event_to_phase(ev_type, strategy)
-
-            count = event_counts.get(phase, 1)
-            phase_total = phase_totals.get(phase, 0.0)
-            per_event = phase_total / max(count, 1)
+            eid = ev.get("event_id", "")
 
             ev_copy = dict(ev)
-            ev_copy["perf_total_time_us"] = round(per_event, 3)
-            ev_copy["perf_cumulative_start_us"] = round(
-                cumulative_per_phase.get(phase, 0.0), 3
-            )
-            cumulative_per_phase[phase] = (
-                cumulative_per_phase.get(phase, 0.0) + per_event
-            )
+            if eid in des_event_map:
+                start, finish = des_event_map[eid]
+                ev_copy["perf_total_time_us"] = round(finish - start, 3)
+                ev_copy["perf_cumulative_start_us"] = round(start, 3)
+            else:
+                count = event_counts.get(phase, 1)
+                phase_total = phase_totals.get(phase, 0.0)
+                per_event = phase_total / max(count, 1)
+                ev_copy["perf_total_time_us"] = round(per_event, 3)
+                ev_copy["perf_cumulative_start_us"] = round(
+                    cumulative_per_phase.get(phase, 0.0), 3
+                )
+                cumulative_per_phase[phase] = (
+                    cumulative_per_phase.get(phase, 0.0) + per_event
+                )
             enriched_events.append(ev_copy)
 
         schedule["events"] = enriched_events
@@ -1704,7 +1731,7 @@ def export_text_summary(result: SimulationResult) -> str:
     # ------------------------------------------------------------------
     cost_summary = result.metadata.get("cost_model", {}) or {}
     if cost_summary:
-        section("Performance Estimate (CostModel)")
+        section("Performance Estimate (DES Engine)")
         lines.append(
             f"  E2E step time       : {_format_time_us(cost_summary.get('e2e_step_time_us', 0))}"
         )
