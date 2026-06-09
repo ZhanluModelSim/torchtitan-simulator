@@ -2000,6 +2000,34 @@ class TestDESEngine(unittest.TestCase):
         assert d["des_start_time_us"] == 0.0
         assert d["des_finish_time_us"] == 10.0
 
+    def test_single_rank_linear_chain(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_single_rank_des
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+        )
+
+        graph = ComputeGraph()
+        for i in range(5):
+            graph.add_node(
+                OpNode(
+                    node_id=f"n{i}",
+                    op_name=f"op{i}",
+                    op_type="compute",
+                    phase="forward",
+                    inputs=[],
+                    outputs=[],
+                    perf_result=PerfResult(total_time_us=10.0),
+                )
+            )
+            if i > 0:
+                graph.add_edge(DataEdge(f"n{i - 1}", f"n{i}", "data"))
+
+        result = simulate_single_rank_des(graph)
+        assert result == 50.0, f"Expected 50.0 (5*10 linear chain), got {result}"
+
 
 if __name__ == "__main__":
     unittest.main()
