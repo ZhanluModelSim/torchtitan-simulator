@@ -2330,5 +2330,263 @@ class TestDESEngine(unittest.TestCase):
         ), f"DES ({des_time}) should be > CP ({cp_time}) due to comm contention"
 
 
+class TestDESUtilization(unittest.TestCase):
+    def _make_des_annotated_result(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+            SimulationResult,
+        )
+
+        graph = ComputeGraph()
+        root = OpNode(
+            "root",
+            "input",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=10.0),
+        )
+        compute = OpNode(
+            "compute",
+            "mm",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=100.0),
+        )
+        comm = OpNode(
+            "comm",
+            "all_reduce",
+            "comm_collective",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=50.0),
+        )
+        join = OpNode(
+            "join",
+            "output",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=10.0),
+        )
+        graph.add_node(root)
+        graph.add_node(compute)
+        graph.add_node(comm)
+        graph.add_node(join)
+        graph.add_edge(DataEdge("root", "compute", "data"))
+        graph.add_edge(DataEdge("root", "comm", "data"))
+        graph.add_edge(DataEdge("compute", "join", "data"))
+        graph.add_edge(DataEdge("comm", "join", "data"))
+
+        from torchtitan.experiments.simulator.des_engine import simulate_single_rank_des
+
+        simulate_single_rank_des(graph)
+        return SimulationResult(compute_graph=graph)
+
+    def test_compute_des_utilization_basic(self):
+        from torchtitan.experiments.simulator.des_engine import compute_des_utilization
+
+        result = self._make_des_annotated_result()
+        stats = compute_des_utilization(result)
+        assert "e2e_step_time_us" in stats
+        assert "compute_busy_pct" in stats
+        assert "comm_busy_pct" in stats
+        assert "overlap_pct" in stats
+        assert "contention_count" in stats
+        assert "cp_step_time_us" in stats
+        assert "des_vs_cp_ratio" in stats
+        assert stats["e2e_step_time_us"] > 0
+        assert stats["compute_busy_pct"] >= 0
+        assert stats["overlap_pct"] >= 0
+
+    def test_compute_des_utilization_no_des_timing(self):
+        from torchtitan.experiments.simulator.des_engine import compute_des_utilization
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            PerfResult,
+            SimulationResult,
+        )
+
+        graph = ComputeGraph()
+        graph.add_node(
+            OpNode(
+                "n1",
+                "mm",
+                "compute",
+                "forward",
+                [],
+                [],
+                perf_result=PerfResult(total_time_us=10.0),
+            )
+        )
+        result = SimulationResult(compute_graph=graph)
+        stats = compute_des_utilization(result)
+        assert stats["e2e_step_time_us"] == 0.0
+        assert stats["compute_busy_pct"] == 0.0
+
+    def test_overlap_percentage(self):
+        result = self._make_des_annotated_result()
+        from torchtitan.experiments.simulator.des_engine import compute_des_utilization
+
+        stats = compute_des_utilization(result)
+        assert (
+            stats["overlap_pct"] > 0
+        ), f"Expected overlap > 0, got {stats['overlap_pct']}"
+
+
+class TestDESMemoryTimeline(unittest.TestCase):
+    def _make_result_with_memory(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_single_rank_des
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            MemoryEvent,
+            OpNode,
+            PerfResult,
+            SimulationResult,
+        )
+
+        graph = ComputeGraph()
+        n0 = OpNode(
+            "n0",
+            "input",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=10.0),
+        )
+        n1 = OpNode(
+            "n1",
+            "mm",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=50.0),
+        )
+        n2 = OpNode(
+            "n2",
+            "relu",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=5.0),
+        )
+        n3 = OpNode(
+            "n3",
+            "mm_bwd",
+            "compute",
+            "backward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=30.0),
+        )
+        graph.add_node(n0)
+        graph.add_node(n1)
+        graph.add_node(n2)
+        graph.add_node(n3)
+        graph.add_edge(DataEdge("n0", "n1", "data"))
+        graph.add_edge(DataEdge("n1", "n2", "data"))
+        simulate_single_rank_des(graph)
+
+        return SimulationResult(
+            compute_graph=graph,
+            memory_events=[
+                MemoryEvent(
+                    event_id="act_fwd",
+                    category="activation",
+                    bytes=100000,
+                    phase="forward",
+                    lifetime_start=1,
+                    lifetime_end=3,
+                ),
+                MemoryEvent(
+                    event_id="grad",
+                    category="gradient",
+                    bytes=80000,
+                    phase="backward",
+                    lifetime_start=3,
+                    lifetime_end=3,
+                ),
+                MemoryEvent(
+                    event_id="param",
+                    category="parameter",
+                    bytes=200000,
+                    phase="model_state",
+                ),
+            ],
+        )
+
+    def test_memory_timeline_basic(self):
+        from torchtitan.experiments.simulator.des_engine import (
+            compute_des_memory_timeline,
+        )
+
+        result = self._make_result_with_memory()
+        timeline = compute_des_memory_timeline(result)
+        assert "static_memory_bytes" in timeline
+        assert "peak_dynamic_bytes" in timeline
+        assert "peak_total_bytes" in timeline
+        assert "timeline" in timeline
+        assert timeline["static_memory_bytes"] == 200000
+        assert timeline["peak_dynamic_bytes"] > 0
+        assert len(timeline["timeline"]) > 0
+
+    def test_memory_timeline_has_des_timestamps(self):
+        from torchtitan.experiments.simulator.des_engine import (
+            compute_des_memory_timeline,
+        )
+
+        result = self._make_result_with_memory()
+        timeline = compute_des_memory_timeline(result)
+        for sample in timeline["timeline"]:
+            assert "time_us" in sample
+            assert "total_bytes" in sample
+            assert sample["time_us"] >= 0
+
+    def test_memory_timeline_no_des(self):
+        from torchtitan.experiments.simulator.des_engine import (
+            compute_des_memory_timeline,
+        )
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            MemoryEvent,
+            OpNode,
+            PerfResult,
+            SimulationResult,
+        )
+
+        graph = ComputeGraph()
+        graph.add_node(
+            OpNode(
+                "n1",
+                "mm",
+                "compute",
+                "forward",
+                [],
+                [],
+                perf_result=PerfResult(total_time_us=10.0),
+            )
+        )
+        result = SimulationResult(
+            compute_graph=graph,
+            memory_events=[MemoryEvent(event_id="p", category="parameter", bytes=1000)],
+        )
+        timeline = compute_des_memory_timeline(result)
+        assert timeline["static_memory_bytes"] == 1000
+        assert timeline["peak_dynamic_bytes"] == 0
+
+
 if __name__ == "__main__":
     unittest.main()

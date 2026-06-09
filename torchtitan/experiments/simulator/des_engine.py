@@ -25,7 +25,7 @@ import salabim as sim
 
 sim.yieldless(False)
 
-from .nodes import ComputeGraph, OpNode, SimulationResult
+from .nodes import ComputeGraph, MemoryEvent, OpNode, SimulationResult
 
 _COMM_OP_TYPES = ("comm_collective", "comm_p2p")
 
@@ -310,3 +310,251 @@ class DESEngine:
         step_time = self.predict_step_time_us(result, cost_model)
         result.metadata.setdefault("des_engine", {})["e2e_step_time_us"] = step_time
         return step_time
+
+
+def compute_des_utilization(result: SimulationResult) -> dict[str, Any]:
+    """Compute DES engine utilization stats from annotated nodes/events."""
+    from .cost_model import _critical_path_time_us
+
+    graph = result.compute_graph
+    nodes = list(graph.nodes.values())
+
+    has_des = any(n.des_start_time_us is not None for n in nodes)
+
+    if not has_des:
+        return {
+            "e2e_step_time_us": 0.0,
+            "single_rank_step_time_us": 0.0,
+            "compute_busy_us": 0.0,
+            "comm_busy_us": 0.0,
+            "overlap_us": 0.0,
+            "compute_busy_pct": 0.0,
+            "comm_busy_pct": 0.0,
+            "overlap_pct": 0.0,
+            "contention_count": 0,
+            "per_phase": {},
+            "cp_step_time_us": 0.0,
+            "des_vs_cp_ratio": 0.0,
+        }
+
+    compute_intervals: list[tuple[float, float]] = []
+    comm_intervals: list[tuple[float, float]] = []
+    contention_count = 0
+
+    for node in nodes:
+        if node.des_start_time_us is None or node.des_finish_time_us is None:
+            continue
+        start = node.des_start_time_us
+        finish = node.des_finish_time_us
+        dur = finish - start
+        if node.op_type in ("comm_collective", "comm_p2p"):
+            comm_intervals.append((start, finish))
+        else:
+            compute_intervals.append((start, finish))
+        perf_dur = node.perf_result.total_time_us if node.perf_result else 0.0
+        if dur > perf_dur + 0.1:
+            contention_count += 1
+
+    e2e_step = max(
+        (n.des_finish_time_us for n in nodes if n.des_finish_time_us is not None),
+        default=0.0,
+    )
+    cp_step = _critical_path_time_us(graph)
+
+    compute_busy = _merge_interval_total(compute_intervals)
+    comm_busy = _merge_interval_total(comm_intervals)
+    overlap = _compute_overlap(compute_intervals, comm_intervals)
+
+    return {
+        "e2e_step_time_us": round(e2e_step, 3),
+        "single_rank_step_time_us": round(e2e_step, 3),
+        "compute_busy_us": round(compute_busy, 3),
+        "comm_busy_us": round(comm_busy, 3),
+        "overlap_us": round(overlap, 3),
+        "compute_busy_pct": round(
+            compute_busy / e2e_step * 100 if e2e_step > 0 else 0.0, 2
+        ),
+        "comm_busy_pct": round(comm_busy / e2e_step * 100 if e2e_step > 0 else 0.0, 2),
+        "overlap_pct": round(overlap / e2e_step * 100 if e2e_step > 0 else 0.0, 2),
+        "contention_count": contention_count,
+        "per_phase": {},
+        "cp_step_time_us": round(cp_step, 3),
+        "des_vs_cp_ratio": round(e2e_step / cp_step if cp_step > 0 else 0.0, 4),
+    }
+
+
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    sorted_ivs = sorted(intervals)
+    merged = [sorted_ivs[0]]
+    for start, end in sorted_ivs[1:]:
+        if start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _merge_interval_total(intervals: list[tuple[float, float]]) -> float:
+    merged = _merge_intervals(intervals)
+    return sum(end - start for start, end in merged)
+
+
+def _compute_overlap(
+    compute_intervals: list[tuple[float, float]],
+    comm_intervals: list[tuple[float, float]],
+) -> float:
+    merged_compute = _merge_intervals(compute_intervals)
+    merged_comm = _merge_intervals(comm_intervals)
+    overlap = 0.0
+    for cs, ce in merged_compute:
+        for ms, me in merged_comm:
+            os = max(cs, ms)
+            oe = min(ce, me)
+            if oe > os:
+                overlap += oe - os
+    return overlap
+
+
+def compute_des_memory_timeline(result: SimulationResult) -> dict[str, Any]:
+    """Map MemoryEvent lifetimes to DES wall-clock timestamps."""
+    graph = result.compute_graph
+    nodes_list = list(graph.nodes.values())
+    memory_events = result.memory_events
+
+    index_to_des_time: list[float] = []
+    for node in nodes_list:
+        if node.des_start_time_us is not None:
+            index_to_des_time.append(node.des_start_time_us)
+        else:
+            index_to_des_time.append(0.0)
+
+    static_events: list[MemoryEvent] = []
+    dynamic_events: list[MemoryEvent] = []
+    for me in memory_events:
+        if me.lifetime_start is None or me.lifetime_end is None:
+            static_events.append(me)
+        else:
+            dynamic_events.append(me)
+
+    static_memory_bytes = sum(me.bytes for me in static_events)
+
+    dynamic_with_times: list[dict[str, Any]] = []
+    for me in dynamic_events:
+        alloc_time = index_to_des_time[me.lifetime_start]
+        free_node = nodes_list[me.lifetime_end]
+        if free_node.des_finish_time_us is not None:
+            free_time = free_node.des_finish_time_us
+        else:
+            free_time = index_to_des_time[me.lifetime_end]
+        dynamic_with_times.append(
+            {
+                "alloc_time": alloc_time,
+                "free_time": free_time,
+                "bytes": me.bytes,
+                "category": me.category,
+                "phase": me.phase,
+            }
+        )
+
+    if not dynamic_with_times and static_memory_bytes == 0:
+        return {
+            "static_memory_bytes": 0,
+            "peak_dynamic_bytes": 0,
+            "peak_total_bytes": 0,
+            "timeline": [],
+            "timeline_samples": 0,
+            "phase_peak": {},
+        }
+
+    timestamps: set[float] = set()
+    for dw in dynamic_with_times:
+        timestamps.add(dw["alloc_time"])
+        timestamps.add(dw["free_time"])
+    sorted_ts = sorted(timestamps)
+
+    timeline: list[dict[str, Any]] = []
+    peak_dynamic = 0
+    peak_total = 0
+    for ts in sorted_ts:
+        dynamic_bytes = 0
+        by_category: dict[str, int] = {}
+        for dw in dynamic_with_times:
+            if dw["alloc_time"] <= ts <= dw["free_time"]:
+                dynamic_bytes += dw["bytes"]
+                by_category[dw["category"]] = (
+                    by_category.get(dw["category"], 0) + dw["bytes"]
+                )
+        total_bytes = static_memory_bytes + dynamic_bytes
+        timeline.append(
+            {
+                "time_us": ts,
+                "static_bytes": static_memory_bytes,
+                "dynamic_bytes": dynamic_bytes,
+                "total_bytes": total_bytes,
+                "by_category": by_category,
+            }
+        )
+        peak_dynamic = max(peak_dynamic, dynamic_bytes)
+        peak_total = max(peak_total, total_bytes)
+
+    if not dynamic_with_times:
+        timeline.append(
+            {
+                "time_us": 0.0,
+                "static_bytes": static_memory_bytes,
+                "dynamic_bytes": 0,
+                "total_bytes": static_memory_bytes,
+                "by_category": {},
+            }
+        )
+        peak_total = static_memory_bytes
+
+    phase_ranges: dict[str, tuple[float, float]] = {}
+    for i, node in enumerate(nodes_list):
+        phase = node.phase or "unknown"
+        if phase not in phase_ranges:
+            if node.des_start_time_us is not None:
+                phase_ranges[phase] = (node.des_start_time_us, node.des_start_time_us)
+            else:
+                phase_ranges[phase] = (0.0, 0.0)
+        else:
+            start, end = phase_ranges[phase]
+            node_finish = (
+                node.des_finish_time_us
+                if node.des_finish_time_us is not None
+                else (
+                    node.des_start_time_us
+                    if node.des_start_time_us is not None
+                    else 0.0
+                )
+            )
+            phase_ranges[phase] = (start, max(end, node_finish))
+
+    phase_peak: dict[str, dict[str, Any]] = {}
+    for phase, (p_start, p_end) in phase_ranges.items():
+        phase_samples = [s for s in timeline if p_start <= s["time_us"] <= p_end]
+        if not phase_samples:
+            continue
+        max_total = max(s["total_bytes"] for s in phase_samples)
+        max_dynamic = max(s["dynamic_bytes"] for s in phase_samples)
+        peak_cat: dict[str, int] = {}
+        for s in phase_samples:
+            if s["total_bytes"] == max_total:
+                peak_cat = s["by_category"]
+                break
+        phase_peak[phase] = {
+            "peak_total_bytes": max_total,
+            "peak_dynamic_bytes": max_dynamic,
+            "by_category": peak_cat,
+        }
+
+    return {
+        "static_memory_bytes": static_memory_bytes,
+        "peak_dynamic_bytes": peak_dynamic,
+        "peak_total_bytes": peak_total,
+        "timeline": timeline,
+        "timeline_samples": len(timeline),
+        "phase_peak": phase_peak,
+    }
