@@ -31,9 +31,13 @@ from __future__ import annotations
 _COMM_MARKERS = (
     "_c10d_functional",
     "c10d_functional",
+    "c10d.",
     "all_reduce",
     "all_gather",
+    "allgather",
+    "_allgather_base",
     "reduce_scatter",
+    "_reduce_scatter_base",
     "all_to_all",
     "broadcast",
     "wait_tensor",
@@ -69,7 +73,10 @@ TRIVIAL_TARGETS = frozenset(
 
 COMM_OP_MAP: list[tuple[str, str]] = [
     ("reduce_scatter", "reduce_scatter"),
+    ("reduce_scatter_base", "reduce_scatter"),
     ("all_gather", "all_gather"),
+    ("allgather", "all_gather"),
+    ("all_gather_base", "all_gather"),
     ("all_reduce", "all_reduce"),
     ("all_to_all", "all_to_all"),
     ("broadcast", "broadcast"),
