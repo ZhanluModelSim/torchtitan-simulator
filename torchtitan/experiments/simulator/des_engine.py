@@ -225,19 +225,27 @@ def simulate_multi_rank_des(result: SimulationResult) -> float:
     }
 
     event_durations: dict[str, float] = {}
+    duration_key_cache: dict[tuple[str, int | None, int | None], float] = {}
     for event in result.schedule.events:
-        if event.op_node_ids:
-            total = 0.0
-            for nid in event.op_node_ids:
-                node = result.compute_graph.nodes.get(nid)
-                if node and node.perf_result:
-                    total += node.perf_result.total_time_us
-            event_durations[event.event_id] = total
+        key = (event.event_type, event.rank, event.pp_stage)
+        if key in duration_key_cache:
+            event_durations[event.event_id] = duration_key_cache[key]
         else:
-            phase = event_phase_map.get(event.event_type, "unknown")
-            phase_total = phase_duration.get(phase, 0.0)
-            count = event_type_counts.get(event.event_type, 1)
-            event_durations[event.event_id] = phase_total / count
+            if event.op_node_ids:
+                total = 0.0
+                for nid in event.op_node_ids:
+                    node = result.compute_graph.nodes.get(nid)
+                    if node and node.perf_result:
+                        total += node.perf_result.total_time_us
+                event_durations[event.event_id] = total
+                duration_key_cache[key] = total
+            else:
+                phase = event_phase_map.get(event.event_type, "unknown")
+                phase_total = phase_duration.get(phase, 0.0)
+                count = event_type_counts.get(event.event_type, 1)
+                per_event = phase_total / count
+                event_durations[event.event_id] = per_event
+                duration_key_cache[key] = per_event
 
     event_pred_map: dict[str, list[str]] = {}
     for dep in result.schedule.deps:

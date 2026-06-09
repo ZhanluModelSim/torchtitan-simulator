@@ -2329,6 +2329,92 @@ class TestDESEngine(unittest.TestCase):
             des_time > cp_time
         ), f"DES ({des_time}) should be > CP ({cp_time}) due to comm contention"
 
+    def test_multi_rank_duration_memoization(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_multi_rank_des
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            PerfResult,
+            ScheduleDep,
+            ScheduleEvent,
+            SimulationResult,
+            TrainingSchedule,
+        )
+
+        graph = ComputeGraph()
+        for stage in range(2):
+            graph.add_node(
+                OpNode(
+                    f"n_fwd_{stage}",
+                    "aten.mm.default",
+                    "compute",
+                    "forward",
+                    pp_stage=stage,
+                    microbatch_idx=0,
+                    perf_result=PerfResult(total_time_us=50.0),
+                )
+            )
+            graph.add_node(
+                OpNode(
+                    f"n_bwd_{stage}",
+                    "aten.mm.default",
+                    "compute",
+                    "backward",
+                    pp_stage=stage,
+                    microbatch_idx=0,
+                    perf_result=PerfResult(total_time_us=30.0),
+                )
+            )
+
+        schedule = TrainingSchedule()
+        for mb in range(3):
+            for stage in range(2):
+                schedule.add_event(
+                    ScheduleEvent(
+                        f"e_fwd_{mb}_{stage}",
+                        "pp_forward",
+                        rank=stage,
+                        pp_stage=stage,
+                        microbatch_idx=mb,
+                    )
+                )
+            schedule.add_event(
+                ScheduleEvent(
+                    f"e_send_{mb}_0",
+                    "pp_send_activation",
+                    rank=0,
+                    pp_stage=0,
+                    microbatch_idx=mb,
+                )
+            )
+            schedule.add_event(
+                ScheduleEvent(
+                    f"e_recv_{mb}_1",
+                    "pp_recv_activation",
+                    rank=1,
+                    pp_stage=1,
+                    microbatch_idx=mb,
+                )
+            )
+            for stage in range(2):
+                schedule.add_event(
+                    ScheduleEvent(
+                        f"e_bwd_{mb}_{stage}",
+                        "pp_backward",
+                        rank=stage,
+                        pp_stage=stage,
+                        microbatch_idx=mb,
+                    )
+                )
+            schedule.add_dep(ScheduleDep(f"e_fwd_{mb}_0", f"e_send_{mb}_0", "pp_comm"))
+            schedule.add_dep(ScheduleDep(f"e_send_{mb}_0", f"e_recv_{mb}_1", "pp_comm"))
+            schedule.add_dep(ScheduleDep(f"e_recv_{mb}_1", f"e_fwd_{mb}_1", "control"))
+
+        result = SimulationResult(compute_graph=graph, schedule=schedule)
+        step_time = simulate_multi_rank_des(result)
+        assert step_time > 0, f"Expected positive step time, got {step_time}"
+        assert all(e.des_start_time_us is not None for e in schedule.events)
+
 
 class TestDESUtilization(unittest.TestCase):
     def _make_des_annotated_result(self):
