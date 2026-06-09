@@ -507,6 +507,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         }
     )
 
+    result.compute_graph.fix_comm_phase_labels()
     result.compute_graph.add_phase_boundary_edges()
 
     attach_model_state_memory(

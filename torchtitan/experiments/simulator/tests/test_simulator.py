@@ -97,8 +97,68 @@ class TestComputeGraph(unittest.TestCase):
         g = ComputeGraph(metadata={"rank": 0})
         g.add_node(OpNode("n1", "aten.mm.default", "compute", "forward", [], []))
         d = g.to_dict()
-        # Must be JSON-serializable
         json.dumps(d)
+
+    def test_fix_comm_phase_labels_cross_phase_dep(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+        )
+
+        g = ComputeGraph()
+        fwd = OpNode(
+            "f1", "compute_op", "compute", "forward", [], [],
+            perf_result=PerfResult(total_time_us=10.0),
+        )
+        bwd = OpNode(
+            "b1", "compute_op", "compute", "backward", [], [],
+            perf_result=PerfResult(total_time_us=20.0),
+        )
+        comm = OpNode(
+            "c1", "reduce_scatter", "comm_collective", "forward", [], [],
+            comm_op="reduce_scatter",
+            perf_result=PerfResult(comm_time_us=5.0, total_time_us=5.0),
+        )
+        g.add_node(fwd)
+        g.add_node(bwd)
+        g.add_node(comm)
+        g.add_edge(DataEdge("b1", "c1", "data"))
+        g.fix_comm_phase_labels()
+        assert g.nodes["c1"].phase == "backward", \
+            "comm node with only backward predecessors should be backward"
+
+    def test_fix_comm_phase_labels_mixed_phase_deps_unchanged(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+        )
+
+        g = ComputeGraph()
+        fwd = OpNode(
+            "f1", "compute_op", "compute", "forward", [], [],
+            perf_result=PerfResult(total_time_us=10.0),
+        )
+        bwd = OpNode(
+            "b1", "compute_op", "compute", "backward", [], [],
+            perf_result=PerfResult(total_time_us=20.0),
+        )
+        comm = OpNode(
+            "c1", "all_reduce", "comm_collective", "forward", [], [],
+            comm_op="all_reduce",
+            perf_result=PerfResult(comm_time_us=5.0, total_time_us=5.0),
+        )
+        g.add_node(fwd)
+        g.add_node(bwd)
+        g.add_node(comm)
+        g.add_edge(DataEdge("f1", "c1", "data"))
+        g.add_edge(DataEdge("b1", "c1", "data"))
+        g.fix_comm_phase_labels()
+        assert g.nodes["c1"].phase == "forward", \
+            "comm node with mixed-phase predecessors should keep original phase"
 
 
 class TestSimulationResultSave(unittest.TestCase):

@@ -204,6 +204,42 @@ class ComputeGraph:
     def add_edge(self, edge: DataEdge) -> None:
         self.edges.append(edge)
 
+    def fix_comm_phase_labels(self) -> None:
+        """Re-label comm nodes whose data-flow predecessors are all in a
+        different phase.
+
+        In FSDP backward, ``reduce_scatter`` fires after backward
+        computation finishes but may be recorded with ``phase="forward"``
+        because the tracer's ``current_phase`` is set temporally.  This
+        method corrects such mislabeling: if a comm node has *only*
+        backward data-flow predecessors but is labeled ``"forward"``, it
+        becomes ``"backward"`` (and vice versa).  Comm nodes with
+        mixed-phase or no data-flow predecessors keep their original
+        label.
+
+        Must be called **before** ``add_phase_boundary_edges`` so the
+        corrected labels are used for the sentinel fan-in.
+        """
+        COMM_TYPES = {"comm_collective", "comm_p2p"}
+        data_pred_phases: dict[str, set[str]] = {}
+        for edge in self.edges:
+            if edge.edge_type == "data":
+                src = self.nodes.get(edge.src_node_id)
+                if src:
+                    data_pred_phases.setdefault(edge.dst_node_id, set()).add(
+                        src.phase or "unknown"
+                    )
+
+        for nid, node in self.nodes.items():
+            if node.op_type not in COMM_TYPES:
+                continue
+            pred_phases = data_pred_phases.get(nid)
+            if pred_phases is None or len(pred_phases) != 1:
+                continue
+            single_pred_phase = next(iter(pred_phases))
+            if single_pred_phase != node.phase:
+                node.phase = single_pred_phase
+
     def add_phase_boundary_edges(self) -> None:
         """Add control-flow edges between consecutive training phases.
 
