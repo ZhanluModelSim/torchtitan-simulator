@@ -215,8 +215,11 @@ def export_chrome_trace(
     events: list[dict[str, Any]] = []
     if has_des:
         for node in result.compute_graph.nodes.values():
-            phase = node.phase or "unknown"
-            tid = _get_tid(phase)
+            if node.op_type in ("comm_collective", "comm_p2p"):
+                engine = "comm_engine"
+            else:
+                engine = "compute_engine"
+            tid = _get_tid(engine)
             ts_us = (
                 node.des_start_time_us if node.des_start_time_us is not None else 0.0
             )
@@ -229,6 +232,28 @@ def export_chrome_trace(
                 dur_us = _node_dur_us(node)
             events.append(
                 _op_to_chrome_event(node, pid=0, tid=tid, ts_us=ts_us, dur_us=dur_us)
+            )
+
+        phase_starts: dict[str, float] = {}
+        for node in result.compute_graph.nodes.values():
+            phase = node.phase or "unknown"
+            if node.des_start_time_us is not None:
+                if (
+                    phase not in phase_starts
+                    or node.des_start_time_us < phase_starts[phase]
+                ):
+                    phase_starts[phase] = node.des_start_time_us
+        for phase, start_us in sorted(phase_starts.items()):
+            events.append(
+                {
+                    "ph": "i",
+                    "pid": 0,
+                    "tid": _get_tid("phase_markers"),
+                    "ts": start_us / 1000.0,
+                    "name": f"{phase} phase start",
+                    "cat": "phase_boundary",
+                    "s": "g",
+                }
             )
     else:
         for node in result.compute_graph.nodes.values():
@@ -265,13 +290,21 @@ def export_chrome_trace(
 
     # Metadata events (thread_name for each tid)
     for phase, tid in phase_tid.items():
+        name = phase
+        if has_des:
+            if phase == "compute_engine":
+                name = "Compute Engine"
+            elif phase == "comm_engine":
+                name = "Comm Engine"
+            elif phase == "phase_markers":
+                name = "Phase Markers"
         events.append(
             {
                 "ph": "M",
                 "pid": 0,
                 "tid": tid,
                 "name": "thread_name",
-                "args": {"name": phase},
+                "args": {"name": name},
             }
         )
 

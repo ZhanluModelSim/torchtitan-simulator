@@ -692,6 +692,83 @@ class TestExport(unittest.TestCase):
                 has_positive_ts
             ), "Schedule events should have DES timing (positive ts) in trace.json"
 
+    def test_chrome_trace_des_dual_track(self):
+        from torchtitan.experiments.simulator.des_engine import simulate_single_rank_des
+        from torchtitan.experiments.simulator.export import export_chrome_trace
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+            SimulationResult,
+        )
+
+        graph = ComputeGraph()
+        compute_node = OpNode(
+            "compute",
+            "mm",
+            "compute",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=50.0),
+        )
+        comm_node = OpNode(
+            "comm",
+            "all_reduce",
+            "comm_collective",
+            "forward",
+            [],
+            [],
+            perf_result=PerfResult(total_time_us=30.0),
+        )
+        graph.add_node(compute_node)
+        graph.add_node(comm_node)
+        graph.add_edge(DataEdge("compute", "comm", "data"))
+        simulate_single_rank_des(graph)
+        result = SimulationResult(compute_graph=graph)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "trace.json")
+            export_chrome_trace(result, path)
+            with open(path) as f:
+                data = json.load(f)
+            compute_events = [
+                e
+                for e in data["traceEvents"]
+                if e.get("ph") == "X"
+                and e.get("pid") == 0
+                and e.get("cat") == "compute"
+            ]
+            comm_events = [
+                e
+                for e in data["traceEvents"]
+                if e.get("ph") == "X"
+                and e.get("pid") == 0
+                and e.get("cat") in ("comm_collective", "comm_p2p")
+            ]
+            assert len(compute_events) >= 1
+            assert len(comm_events) >= 1
+            assert (
+                compute_events[0]["tid"] != comm_events[0]["tid"]
+            ), "Compute and comm should be on separate threads when DES timing available"
+            phase_marker_events = [
+                e
+                for e in data["traceEvents"]
+                if e.get("ph") == "i" and e.get("cat") == "phase_boundary"
+            ]
+            assert len(phase_marker_events) >= 1
+            thread_names = {
+                e["tid"]: e["args"]["name"]
+                for e in data["traceEvents"]
+                if e.get("ph") == "M"
+                and e.get("name") == "thread_name"
+                and e.get("pid") == 0
+            }
+            assert "Compute Engine" in thread_names.values()
+            assert "Comm Engine" in thread_names.values()
+            assert "Phase Markers" in thread_names.values()
+
 
 class TestTrainerRunnerExtensionHooks(unittest.TestCase):
     def test_collect_extension_metadata(self):
