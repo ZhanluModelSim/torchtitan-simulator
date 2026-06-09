@@ -1722,17 +1722,42 @@ def export_html(
       return {{samples, categories, peak, residentTotal: Array.from(residentByCategory.values()).reduce((acc, value) => acc + value, 0)}};
     }}
 
+    function buildDesMemorySamples(desMemory, events) {{
+      const categories = memoryCategories(events);
+      const timeline = desMemory.timeline || [];
+      const staticBytes = desMemory.static_memory_bytes || 0;
+      const peak = desMemory.peak_total_bytes || 0;
+      const residentTotal = staticBytes;
+      const samples = timeline.map(s => ({{time_us: s.time_us, static_bytes: s.static_bytes, dynamic_bytes: s.dynamic_bytes, total_bytes: s.total_bytes, byCategory: new Map(Object.entries(s.by_category || {{}})), total: s.total_bytes}}));
+      return {{samples, categories, peak, residentTotal, hasDes: true, staticBytes}};
+    }}
+
     function drawMemoryTrace(canvas) {{
       const state = chartState.get(canvas) || {{zoom: 1}};
       chartState.set(canvas, state);
       const events = memoryEvents();
-      const {{samples, categories, peak, residentTotal}} = buildMemorySamples(events);
+      const desMemory = TRACE.metadata?.des_memory;
+      const useDes = desMemory && desMemory.timeline && desMemory.timeline.length > 0;
+      const data = useDes ? buildDesMemorySamples(desMemory, events) : buildMemorySamples(events);
+      const {{samples, categories, peak, residentTotal}} = data;
+      const hasDes = data.hasDes || false;
+      const staticBytes = data.staticBytes || 0;
       const scale = 14 * state.zoom;
       const plotLeft = 90;
       const plotTop = 38;
       const plotHeight = 250;
       const legendTop = plotTop + plotHeight + 42;
-      const width = Math.max(980, plotLeft + 90 + Math.max(1, samples.length) * scale);
+      let width, minTime, timeRange, pixelsPerTime, plotWidth;
+      if (hasDes) {{
+        minTime = Math.min(...samples.map(s => s.time_us));
+        timeRange = Math.max(1, Math.max(...samples.map(s => s.time_us)) - minTime);
+        pixelsPerTime = 58 * state.zoom / Math.max(1, timeRange / 100);
+        width = Math.max(980, plotLeft + 90 + timeRange * pixelsPerTime);
+        plotWidth = width - plotLeft - 90;
+      }} else {{
+        width = Math.max(980, plotLeft + 90 + Math.max(1, samples.length) * scale);
+        plotWidth = width - plotLeft - 90;
+      }}
       const height = 390;
       const ctx = resizeCanvas(canvas, width, height);
       ctx.clearRect(0, 0, width, height);
@@ -1741,21 +1766,32 @@ def export_html(
 
       const note = document.querySelector('.chart-toolbar[data-target="' + canvas.id + '"] .chart-note');
       if (note) {{
-        const lifetimedCount = events.filter((event) =>
-          event.lifetime_start !== null && event.lifetime_start !== undefined &&
-          event.lifetime_end !== null && event.lifetime_end !== undefined
-        ).length;
-        note.textContent = lifetimedCount + ' lifetimed events, ' + events.length +
-          ' total. Estimated total peak including resident baseline: ' + formatBytes(peak) +
-          ' (resident baseline ' + formatBytes(residentTotal) + ').';
+        if (hasDes) {{
+          note.textContent = samples.length + ' DES memory samples. Peak: ' + formatBytes(peak) + ' (static ' + formatBytes(staticBytes) + ', dynamic peak ' + formatBytes(peak - staticBytes) + ').';
+        }} else {{
+          const lifetimedCount = events.filter((event) =>
+            event.lifetime_start !== null && event.lifetime_start !== undefined &&
+            event.lifetime_end !== null && event.lifetime_end !== undefined
+          ).length;
+          note.textContent = lifetimedCount + ' lifetimed events, ' + events.length +
+            ' total. Estimated total peak including resident baseline: ' + formatBytes(peak) +
+            ' (resident baseline ' + formatBytes(residentTotal) + ').';
+        }}
       }}
 
       ctx.fillStyle = '#0f172a';
       ctx.font = '700 13px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText('Estimated live memory by operator order', plotLeft, 18);
-      ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillStyle = '#475569';
-      ctx.fillText('x: graph node order, y: bytes. Resident model-state estimates are drawn as a baseline.', plotLeft, 34);
+      if (hasDes) {{
+        ctx.fillText('Estimated live memory by DES wall-clock time', plotLeft, 18);
+        ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillStyle = '#475569';
+        ctx.fillText('x: DES time, y: bytes. Static memory shown as baseline band. Phase boundaries marked with dashed lines.', plotLeft, 34);
+      }} else {{
+        ctx.fillText('Estimated live memory by operator order', plotLeft, 18);
+        ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillStyle = '#475569';
+        ctx.fillText('x: graph node order, y: bytes. Resident model-state estimates are drawn as a baseline.', plotLeft, 34);
+      }}
 
       ctx.strokeStyle = '#94a3b8';
       ctx.lineWidth = 1;
@@ -1778,10 +1814,57 @@ def export_html(
         ctx.fillText(formatBytes(value), 8, y);
       }}
 
+      if (hasDes && staticBytes > 0) {{
+        const staticH = (staticBytes / safePeak) * plotHeight;
+        const staticY = plotTop + plotHeight - staticH;
+        ctx.fillStyle = '#64748b';
+        ctx.globalAlpha = 0.35;
+        ctx.fillRect(plotLeft, staticY, plotWidth, staticH);
+        ctx.globalAlpha = 1.0;
+        ctx.fillStyle = '#334155';
+        ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillText('static ' + formatBytes(staticBytes), plotLeft + 3, staticY + 10);
+      }}
+
+      if (hasDes) {{
+        const phaseBoundaries = new Map();
+        for (const node of TRACE.compute_graph?.nodes || []) {{
+          const phase = node.phase || 'unknown';
+          const start = node.des_start_time_us;
+          if (start !== null && start !== undefined) {{
+            if (!phaseBoundaries.has(phase) || start < phaseBoundaries.get(phase)) {{
+              phaseBoundaries.set(phase, start);
+            }}
+          }}
+        }}
+        const phaseColors = {{forward: '#93c5fd', backward: '#fca5a5', optimizer: '#86efac'}};
+        for (const [phase, time] of phaseBoundaries) {{
+          const x = plotLeft + (time - minTime) * pixelsPerTime;
+          if (x < plotLeft || x > plotLeft + plotWidth) continue;
+          ctx.strokeStyle = phaseColors[phase] || '#94a3b8';
+          ctx.lineWidth = 1;
+          ctx.setLineDash([5, 4]);
+          ctx.beginPath();
+          ctx.moveTo(x, plotTop);
+          ctx.lineTo(x, plotTop + plotHeight);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.fillStyle = '#475569';
+          ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+          ctx.fillText(phase, x + 3, plotTop - 6);
+        }}
+      }}
+
       for (const sample of samples) {{
         let yTop = plotTop + plotHeight;
-        const x = plotLeft + sample.idx * scale;
-        const barW = Math.max(2, scale - 1);
+        let x, barW;
+        if (hasDes) {{
+          x = plotLeft + (sample.time_us - minTime) * pixelsPerTime;
+          barW = Math.max(2, plotWidth / Math.max(1, samples.length));
+        }} else {{
+          x = plotLeft + sample.idx * scale;
+          barW = Math.max(2, scale - 1);
+        }}
         for (const category of categories) {{
           const bytes = sample.byCategory.get(category) || 0;
           if (bytes <= 0) continue;
@@ -1794,10 +1877,21 @@ def export_html(
 
       ctx.fillStyle = '#334155';
       ctx.font = '11px ui-sans-serif, system-ui, sans-serif';
-      const maxIdx = Math.max(0, samples.length - 1);
-      for (const idx of [0, Math.floor(maxIdx / 2), maxIdx]) {{
-        const x = plotLeft + idx * scale;
-        ctx.fillText(String(idx), x, plotTop + plotHeight + 18);
+      if (hasDes) {{
+        const maxTimeVal = minTime + timeRange;
+        const numTicks = Math.min(8, Math.ceil(timeRange / 50));
+        const tickInterval = Math.max(1, timeRange / numTicks);
+        for (let t = minTime; t <= maxTimeVal; t += tickInterval) {{
+          const x = plotLeft + (t - minTime) * pixelsPerTime;
+          const label = t >= 1000 ? (t / 1000).toFixed(1) + 'ms' : Math.round(t) + 'µs';
+          ctx.fillText(label, x, plotTop + plotHeight + 18);
+        }}
+      }} else {{
+        const maxIdx = Math.max(0, samples.length - 1);
+        for (const idx of [0, Math.floor(maxIdx / 2), maxIdx]) {{
+          const x = plotLeft + idx * scale;
+          ctx.fillText(String(idx), x, plotTop + plotHeight + 18);
+        }}
       }}
 
       let legendX = plotLeft;
