@@ -62,6 +62,7 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
         path: Output file path (will be created / overwritten).
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    _populate_des_metadata(result)
     data = result.to_dict()
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, default=str)
@@ -519,26 +520,33 @@ def _add_aggregated_phase_events(
 # ---------------------------------------------------------------------------
 
 
-def _json_script_payload(result: SimulationResult) -> str:
-    data = result.to_dict()
-    _inject_schedule_timing(data, result)
+def _populate_des_metadata(result: SimulationResult) -> None:
     has_des = any(
         n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
     )
-    if has_des:
-        from .des_engine import compute_des_memory_timeline, compute_des_utilization
+    if not has_des:
+        return
+    from .des_engine import compute_des_memory_timeline, compute_des_utilization
 
-        util = compute_des_utilization(result)
-        result.metadata.setdefault("des_engine", {}).update(util)
+    util = compute_des_utilization(result)
+    result.metadata.setdefault("des_engine", {}).update(util)
+    mem = compute_des_memory_timeline(result)
+    result.metadata["des_memory"] = {
+        "static_memory_bytes": mem["static_memory_bytes"],
+        "peak_dynamic_bytes": mem["peak_dynamic_bytes"],
+        "peak_total_bytes": mem["peak_total_bytes"],
+        "timeline": mem["timeline"],
+        "phase_peak": mem["phase_peak"],
+    }
+
+
+def _json_script_payload(result: SimulationResult) -> str:
+    data = result.to_dict()
+    _inject_schedule_timing(data, result)
+    _populate_des_metadata(result)
+    if "des_engine" in result.metadata:
         data["metadata"]["des_engine"] = result.metadata["des_engine"]
-        mem = compute_des_memory_timeline(result)
-        result.metadata["des_memory"] = {
-            "static_memory_bytes": mem["static_memory_bytes"],
-            "peak_dynamic_bytes": mem["peak_dynamic_bytes"],
-            "peak_total_bytes": mem["peak_total_bytes"],
-            "timeline": mem["timeline"],
-            "phase_peak": mem["phase_peak"],
-        }
+    if "des_memory" in result.metadata:
         data["metadata"]["des_memory"] = result.metadata["des_memory"]
     return escape(json.dumps(data, default=str), quote=False)
 
@@ -858,6 +866,28 @@ def export_html(
     perf_grand_total_us = cost_summary.get("e2e_step_time_us", 0)
     data_payload = _json_script_payload(result)
     steps = sorted({_event_step(ev) for ev in schedule_events}) or [0]
+    has_des = any(
+        n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
+    )
+    des_cards = ""
+    if has_des:
+        des_util = result.metadata.get("des_engine", {})
+        des_mem = result.metadata.get("des_memory", {})
+        des_step = _format_time_us(des_util.get("e2e_step_time_us", 0))
+        compute_pct = f"{des_util.get('compute_busy_pct', 0):.1f}%"
+        comm_pct = f"{des_util.get('comm_busy_pct', 0):.1f}%"
+        overlap_pct = f"{des_util.get('overlap_pct', 0):.1f}%"
+        ratio = f"{des_util.get('des_vs_cp_ratio', 0):.3f}x"
+        contention = str(des_util.get("contention_count", 0))
+        peak_des_mem = _format_bytes(des_mem.get("peak_total_bytes", 0))
+        des_cards = f"""
+      <div class="card"><div class="num">{escape(des_step)}</div><div>DES step time</div></div>
+      <div class="card"><div class="num">{compute_pct}</div><div>Compute utilization</div></div>
+      <div class="card"><div class="num">{comm_pct}</div><div>Comm utilization</div></div>
+      <div class="card"><div class="num">{overlap_pct}</div><div>Overlap</div></div>
+      <div class="card"><div class="num">{ratio}</div><div>DES / Critical Path</div></div>
+      <div class="card"><div class="num">{contention}</div><div>Contended ops</div></div>
+      <div class="card"><div class="num">{escape(peak_des_mem)}</div><div>Peak DES memory</div></div>"""
 
     def _phase_sections_for_step(step: int) -> str:
         step_prefix = f"step{step}_"
@@ -941,6 +971,7 @@ def export_html(
       <div class="card"><div class="num">{escape(_format_bytes(peak_memory))}</div><div>Estimated live memory peak</div></div>
       <div class="card"><div class="num">{len(result.memory_events)}</div><div>Memory events</div></div>
       <div class="card"><div class="num">{_format_time_us(perf_grand_total_us)}</div><div>Predicted step time</div></div>
+      {des_cards}
     </section>
     <details open>
       <summary>Memory trace timeline and event breakdown</summary>
@@ -2141,10 +2172,68 @@ def export_text_summary(result: SimulationResult) -> str:
             f"  Nodes with perf data: {annotated} / {len(result.compute_graph.nodes)}"
         )
 
+    des_engine = result.metadata.get("des_engine", {}) or {}
+    if des_engine:
+        section("DES Engine Summary")
+        lines.append(
+            f"  E2E step time (DES)  : {_format_time_us(des_engine.get('e2e_step_time_us', 0))}"
+        )
+        lines.append(
+            f"  Compute busy time   : {_format_time_us(des_engine.get('compute_busy_us', 0))}"
+        )
+        lines.append(
+            f"  Comm busy time      : {_format_time_us(des_engine.get('comm_busy_us', 0))}"
+        )
+        lines.append(
+            f"  Overlap time        : {_format_time_us(des_engine.get('overlap_us', 0))}"
+        )
+        lines.append(
+            f"  Compute utilization : {des_engine.get('compute_busy_pct', 0):.1f}%"
+        )
+        lines.append(
+            f"  Comm utilization    : {des_engine.get('comm_busy_pct', 0):.1f}%"
+        )
+        lines.append(f"  Overlap             : {des_engine.get('overlap_pct', 0):.1f}%")
+        lines.append(f"  Contended ops       : {des_engine.get('contention_count', 0)}")
+        lines.append(
+            f"  CP step time        : {_format_time_us(des_engine.get('cp_step_time_us', 0))}"
+        )
+        lines.append(
+            f"  DES / CP ratio      : {des_engine.get('des_vs_cp_ratio', 0):.3f}x"
+        )
+        per_phase = des_engine.get("per_phase", {}) or {}
+        if per_phase:
+            lines.append("")
+            lines.append("  Per-phase DES breakdown:")
+            for phase, data in sorted(per_phase.items()):
+                lines.append(f"    {phase}: {data}")
+
+    des_memory = result.metadata.get("des_memory", {}) or {}
+    if des_memory:
+        section("DES Memory Estimate")
+        lines.append(
+            f"  Static memory       : {_format_bytes(des_memory.get('static_memory_bytes', 0))}"
+        )
+        lines.append(
+            f"  Peak dynamic memory : {_format_bytes(des_memory.get('peak_dynamic_bytes', 0))}"
+        )
+        lines.append(
+            f"  Peak total memory   : {_format_bytes(des_memory.get('peak_total_bytes', 0))}"
+        )
+        lines.append(f"  Timeline samples    : {des_memory.get('timeline_samples', 0)}")
+        phase_peak = des_memory.get("phase_peak", {}) or {}
+        if phase_peak:
+            lines.append("")
+            lines.append("  Per-phase peak memory:")
+            for phase, data in sorted(phase_peak.items()):
+                lines.append(
+                    f"    {phase:<14}: peak={_format_bytes(data.get('peak_total_bytes', 0))}  dynamic={_format_bytes(data.get('peak_dynamic_bytes', 0))}"
+                )
+
     section("Metadata")
     for k, v in result.metadata.items():
-        if k == "cost_model":
-            continue  # already rendered above
+        if k in ("cost_model", "des_engine", "des_memory"):
+            continue
         lines.append(f"  {k}: {v}")
 
     return "\n".join(lines)
