@@ -1274,6 +1274,7 @@ class TestScheduleGraphLinking(unittest.TestCase):
 class TestMultiRankStepTime(unittest.TestCase):
     def test_predict_with_schedule_returns_max_rank_finish(self):
         from torchtitan.experiments.simulator.cost_model import (
+            CostModel,
             predict_multi_rank_step_time_us,
         )
         from torchtitan.experiments.simulator.nodes import (
@@ -1286,6 +1287,12 @@ class TestMultiRankStepTime(unittest.TestCase):
             TensorMeta,
             TrainingSchedule,
         )
+
+        class _PreservingCostModel(CostModel):
+            def estimate_node(self, node):
+                if node.perf_result is not None:
+                    return node.perf_result
+                return PerfResult()
 
         graph = ComputeGraph()
         fwd = OpNode(
@@ -1322,7 +1329,9 @@ class TestMultiRankStepTime(unittest.TestCase):
 
         result = SimulationResult(compute_graph=graph, schedule=schedule)
 
-        step_time = predict_multi_rank_step_time_us(result)
+        step_time = predict_multi_rank_step_time_us(
+            result, cost_model=_PreservingCostModel()
+        )
         assert step_time == 30.0, f"Expected 30.0, got {step_time}"
 
     def test_predict_no_schedule_falls_back(self):

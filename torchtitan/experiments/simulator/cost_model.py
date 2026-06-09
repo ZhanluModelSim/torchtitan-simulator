@@ -283,12 +283,10 @@ class CostModel:
         self.estimate_graph(result.compute_graph)
 
     def predict_step_time_us(self, graph: ComputeGraph) -> float:
-        """Predict total step time from annotated performance data.
+        """Predict total step time using salabim DES engine.
 
-        The default implementation computes the critical-path time through
-        the graph using a topological longest-path algorithm.  Subclasses may
-        override this with more sophisticated models (e.g. accounting for
-        operator fusion, wave-level parallelism, or communication overlap).
+        Models compute/comm resource contention and overlap.
+        Subclasses may override with more sophisticated models.
 
         Args:
             graph: Annotated graph (must have ``perf_result`` on every node).
@@ -296,7 +294,9 @@ class CostModel:
         Returns:
             Predicted step time in microseconds.
         """
-        return _critical_path_time_us(graph)
+        from .des_engine import simulate_single_rank_des
+
+        return simulate_single_rank_des(graph)
 
 
 # ---------------------------------------------------------------------------
@@ -424,8 +424,10 @@ class MockCostModel(CostModel):
         )
 
     def predict_step_time_us(self, graph: ComputeGraph) -> float:
-        """Predict step time via critical-path analysis of the annotated graph."""
-        return _critical_path_time_us(graph)
+        """Predict step time using salabim DES engine."""
+        from .des_engine import simulate_single_rank_des
+
+        return simulate_single_rank_des(graph)
 
 
 # ---------------------------------------------------------------------------
@@ -576,17 +578,9 @@ def predict_multi_rank_step_time_us(
     result: SimulationResult,
     cost_model: CostModel | None = None,
 ) -> float:
-    """Predict step time using multi-rank schedule dependency graph.
+    """Predict step time using multi-rank salabim DES.
 
-    Falls back to single-rank critical-path if the schedule has no events
-    or the cost model has no annotations.
-
-    The algorithm:
-    1. Link schedule events to compute graph nodes via (phase, pp_stage, mb_idx).
-    2. For each schedule event, compute its duration from linked OpNode perf_results.
-       - If no linked nodes, fall back to cost_model.estimate_node().
-    3. Run longest-path on the schedule deps graph (events as nodes, deps as edges).
-    4. Return the maximum finish time across all ranks.
+    Falls back to single-rank DES if no schedule events.
 
     Args:
         result: SimulationResult with populated schedule and compute_graph.
@@ -595,81 +589,19 @@ def predict_multi_rank_step_time_us(
     Returns:
         Predicted step time in microseconds.
     """
+    from .des_engine import simulate_multi_rank_des
+
     if result.schedule is None or len(result.schedule.events) == 0:
         if cost_model is None:
             cost_model = MockCostModel()
         cost_model.estimate_graph(result.compute_graph)
         return cost_model.predict_step_time_us(result.compute_graph)
 
-    # Step 1: link schedule to graph
-    link_schedule_to_graph(result)
+    if cost_model is None:
+        cost_model = MockCostModel()
+    cost_model.estimate_graph(result.compute_graph)
 
-    # Step 1b: compute total per-phase duration for proportional splitting
-    phase_duration: dict[str, float] = {}
-    for node in result.compute_graph.nodes.values():
-        phase = node.phase or "unknown"
-        if node.perf_result:
-            phase_duration.setdefault(phase, 0.0)
-            phase_duration[phase] += node.perf_result.total_time_us
-
-    # Count events of each type for proportional splitting
-    event_type_counts: dict[str, int] = {}
-    for event in result.schedule.events:
-        event_type_counts.setdefault(event.event_type, 0)
-        event_type_counts[event.event_type] += 1
-
-    # Map event types to phases
-    event_phase_map = {
-        "pp_forward": "forward",
-        "pp_backward": "backward",
-        "fsdp2_all_gather": "forward",
-        "fsdp2_reduce_scatter": "backward",
-        "dp_gradient_sync": "backward",
-        "optimizer_step": "optimizer",
-    }
-
-    # Step 2: compute event durations
-    event_durations: dict[str, float] = {}
-    for event in result.schedule.events:
-        if event.op_node_ids:
-            total = 0.0
-            for nid in event.op_node_ids:
-                node = result.compute_graph.nodes.get(nid)
-                if node and node.perf_result:
-                    total += node.perf_result.total_time_us
-            event_durations[event.event_id] = total
-        else:
-            # Proportional split: events without linked nodes get
-            # (phase_total_duration / num_events_of_same_type).
-            # This avoids duplicating the entire phase duration
-            # across every event of the same type.
-            phase = event_phase_map.get(event.event_type, "unknown")
-            phase_total = phase_duration.get(phase, 0.0)
-            count = event_type_counts.get(event.event_type, 1)
-            event_durations[event.event_id] = phase_total / count
-
-    # Step 3: longest-path on schedule deps
-    # Build adjacency from deps
-    dep_adj: dict[str, list[str]] = {}
-    for dep in result.schedule.deps:
-        dep_adj.setdefault(dep.from_event_id, []).append(dep.to_event_id)
-
-    # Topological longest-path
-    event_finish: dict[str, float] = {}
-    max_time = 0.0
-
-    # Process events in order (schedule.events is already logically sorted)
-    for event in result.schedule.events:
-        dur = event_durations.get(event.event_id, 0.0)
-        pred_finish = 0.0
-        for dep in result.schedule.deps:
-            if dep.to_event_id == event.event_id and dep.from_event_id in event_finish:
-                pred_finish = max(pred_finish, event_finish[dep.from_event_id])
-        event_finish[event.event_id] = pred_finish + dur
-        if event_finish[event.event_id] > max_time:
-            max_time = event_finish[event.event_id]
-
-    return round(max_time, 3)
+    return simulate_multi_rank_des(result)
 
 
 # ---------------------------------------------------------------------------
