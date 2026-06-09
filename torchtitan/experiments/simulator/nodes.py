@@ -133,6 +133,8 @@ class OpNode:
     comm_group_size: int | None = None
     # Performance estimation (filled by CostModel)
     perf_result: PerfResult | None = None
+    des_start_time_us: float | None = None
+    des_finish_time_us: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = {
@@ -151,6 +153,10 @@ class OpNode:
         }
         if self.perf_result is not None:
             d["perf_result"] = self.perf_result.to_dict()
+        if self.des_start_time_us is not None:
+            d["des_start_time_us"] = self.des_start_time_us
+        if self.des_finish_time_us is not None:
+            d["des_finish_time_us"] = self.des_finish_time_us
         return d
 
 
@@ -233,9 +239,11 @@ class ScheduleEvent:
     # Links to fine-grained OpNodes in the compute graph (populated by link_schedule_to_graph)
     op_node_ids: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    des_start_time_us: float | None = None
+    des_finish_time_us: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "event_id": self.event_id,
             "event_type": self.event_type,
             "rank": self.rank,
@@ -246,6 +254,11 @@ class ScheduleEvent:
             "op_node_ids": self.op_node_ids,
             "metadata": self.metadata,
         }
+        if self.des_start_time_us is not None:
+            d["des_start_time_us"] = self.des_start_time_us
+        if self.des_finish_time_us is not None:
+            d["des_finish_time_us"] = self.des_finish_time_us
+        return d
 
 
 @dataclass

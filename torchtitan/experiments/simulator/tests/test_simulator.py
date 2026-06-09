@@ -1982,5 +1982,24 @@ class TestFSDP1FakeProcessGroupIntegration(unittest.TestCase):
         ), f"no reduce_scatter: {ops}"
 
 
+class TestDESEngine(unittest.TestCase):
+    def test_op_node_des_fields(self):
+        from torchtitan.experiments.simulator.nodes import OpNode, PerfResult
+
+        node = OpNode(
+            node_id="n1",
+            op_name="mm",
+            op_type="compute",
+            phase="forward",
+            perf_result=PerfResult(total_time_us=10.0),
+        )
+        node.des_start_time_us = 0.0
+        node.des_finish_time_us = 10.0
+        d = node.to_dict()
+        assert "des_start_time_us" in d
+        assert d["des_start_time_us"] == 0.0
+        assert d["des_finish_time_us"] == 10.0
+
+
 if __name__ == "__main__":
     unittest.main()
