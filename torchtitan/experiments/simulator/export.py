@@ -1436,6 +1436,137 @@ def export_html(
       const nodeIds = new Set(phaseNodes.map((node) => node.node_id));
       const edges = (TRACE.compute_graph?.edges || []).filter((edge) => nodeIds.has(edge.src) && nodeIds.has(edge.dst));
 
+      const hasDes = phaseNodes.some((node) => node.des_start_time_us !== null && node.des_start_time_us !== undefined);
+
+      if (hasDes) {{
+        drawDagDesTemporal(canvas, phaseNodes, edges, state, phase);
+      }} else {{
+        drawDagTopological(canvas, phaseNodes, edges, state, phase);
+      }}
+    }}
+
+    function drawDagDesTemporal(canvas, phaseNodes, edges, state, phase) {{
+      const computeNodes = phaseNodes.filter(n => !['comm_collective', 'comm_p2p'].includes(n.op_type));
+      const commNodes = phaseNodes.filter(n => ['comm_collective', 'comm_p2p'].includes(n.op_type));
+
+      const maxTime = Math.max(...phaseNodes.map(n => n.des_finish_time_us || 0));
+      const minTime = Math.min(...phaseNodes.map(n => n.des_start_time_us || 0));
+      const timeRange = Math.max(1, maxTime - minTime);
+
+      const pixelsPerUnit = 58 * state.zoom / Math.max(1, timeRange / 100);
+      const labelW = 140;
+      const computeRowY = 50;
+      const commRowY = 110;
+      const nodeH = 36;
+      const width = Math.max(1100, labelW + 40 + timeRange * pixelsPerUnit + 100);
+      const memoryMarkerY = commRowY + 50;
+      const height = Math.max(200, memoryMarkerY + 30);
+      const ctx = resizeCanvas(canvas, width, height);
+      ctx.clearRect(0, 0, width, height);
+
+      ctx.strokeStyle = '#94a3b8';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(labelW, 20);
+      ctx.lineTo(width - 30, 20);
+      ctx.stroke();
+      const numTicks = Math.min(10, Math.ceil(timeRange / 50));
+      const tickInterval = Math.max(1, timeRange / numTicks);
+      for (let t = minTime; t <= maxTime; t += tickInterval) {{
+        const x = labelW + (t - minTime) * pixelsPerUnit;
+        ctx.fillStyle = '#64748b';
+        ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
+        const label = t >= 1000 ? (t / 1000).toFixed(1) + 'ms' : Math.round(t) + 'µs';
+        ctx.fillText(label, x, 12);
+        ctx.beginPath();
+        ctx.moveTo(x, 18);
+        ctx.lineTo(x, 22);
+        ctx.stroke();
+      }}
+
+      ctx.fillStyle = '#1e293b';
+      ctx.font = 'bold 10px ui-sans-serif, system-ui, sans-serif';
+      ctx.fillText('Compute Engine', 6, computeRowY);
+      ctx.fillText('Comm Engine', 6, commRowY);
+
+      const positions = new Map();
+      for (const node of computeNodes) {{
+        const start = node.des_start_time_us || minTime;
+        const finish = node.des_finish_time_us || start;
+        const x = labelW + (start - minTime) * pixelsPerUnit;
+        const w = Math.max(4, (finish - start) * pixelsPerUnit);
+        positions.set(node.node_id, {{x, y: computeRowY - nodeH / 2, w, endX: labelW + (finish - minTime) * pixelsPerUnit}});
+        const fill = palette[node.op_type] || palette.unknown;
+        const isContended = finish - start > (node.perf_result?.total_time_us || 0) + 0.1;
+        roundedRect(ctx, x, computeRowY - nodeH / 2, w, nodeH, 4);
+        ctx.fillStyle = fill;
+        ctx.fill();
+        ctx.strokeStyle = isContended ? '#dc2626' : '#334155';
+        ctx.lineWidth = isContended ? 2 : 0.5;
+        ctx.stroke();
+        ctx.fillStyle = '#0f172a';
+        ctx.font = '700 9px ui-sans-serif, system-ui, sans-serif';
+        if (w > 30) ctx.fillText(shortName(node.op_name, 12), x + 3, computeRowY - 6);
+        if (w > 60) {{
+          ctx.font = 'italic 8px ui-sans-serif, system-ui, sans-serif';
+          const dur = finish - start;
+          ctx.fillText(dur >= 1000 ? (dur / 1000).toFixed(1) + 'ms' : dur.toFixed(0) + 'µs', x + 3, computeRowY + 8);
+        }}
+      }}
+
+      for (const node of commNodes) {{
+        const start = node.des_start_time_us || minTime;
+        const finish = node.des_finish_time_us || start;
+        const x = labelW + (start - minTime) * pixelsPerUnit;
+        const w = Math.max(4, (finish - start) * pixelsPerUnit);
+        positions.set(node.node_id, {{x, y: commRowY - nodeH / 2, w, endX: labelW + (finish - minTime) * pixelsPerUnit}});
+        const fill = palette[node.op_type] || palette.unknown;
+        const isContended = finish - start > (node.perf_result?.total_time_us || 0) + 0.1;
+        roundedRect(ctx, x, commRowY - nodeH / 2, w, nodeH, 4);
+        ctx.fillStyle = fill;
+        ctx.fill();
+        ctx.strokeStyle = isContended ? '#dc2626' : '#334155';
+        ctx.lineWidth = isContended ? 2 : 0.5;
+        ctx.stroke();
+        ctx.fillStyle = '#0f172a';
+        ctx.font = '700 9px ui-sans-serif, system-ui, sans-serif';
+        if (w > 30) ctx.fillText(shortName(node.op_name, 12), x + 3, commRowY - 6);
+        if (w > 60) {{
+          ctx.font = 'italic 8px ui-sans-serif, system-ui, sans-serif';
+          const dur = finish - start;
+          ctx.fillText(dur >= 1000 ? (dur / 1000).toFixed(1) + 'ms' : dur.toFixed(0) + 'µs', x + 3, commRowY + 8);
+        }}
+      }}
+
+      for (const edge of edges) {{
+        const src = positions.get(edge.src);
+        const dst = positions.get(edge.dst);
+        if (!src || !dst) continue;
+        arrowLine(ctx, src.endX, src.y + nodeH / 2, dst.x - 4, dst.y + nodeH / 2, edge.type === 'data' ? '#2563eb' : '#64748b', edge.type !== 'data', 1);
+      }}
+
+      const desMemory = TRACE.metadata?.des_memory;
+      if (desMemory && desMemory.timeline) {{
+        const memoryPaletteMap = {{activation: '#60a5fa', gradient: '#fb7185', comm_buffer: '#f59e0b', optimizer_state: '#a78bfa', parameter: '#22c55e'}};
+        for (const sample of desMemory.timeline) {{
+          const x = labelW + (sample.time_us - minTime) * pixelsPerUnit;
+          if (x < labelW || x > width - 30) continue;
+          for (const [cat, bytes] of Object.entries(sample.by_category || {{}})) {{
+            if (bytes > 0) {{
+              ctx.fillStyle = memoryPaletteMap[cat] || '#94a3b8';
+              ctx.beginPath();
+              ctx.moveTo(x, memoryMarkerY);
+              ctx.lineTo(x - 4, memoryMarkerY + 8);
+              ctx.lineTo(x + 4, memoryMarkerY + 8);
+              ctx.closePath();
+              ctx.fill();
+            }}
+          }}
+        }}
+      }}
+    }}
+
+    function drawDagTopological(canvas, phaseNodes, edges, state, phase) {{
       const preds = new Map(phaseNodes.map((node) => [node.node_id, []]));
       const succs = new Map(phaseNodes.map((node) => [node.node_id, []]));
       const indeg = new Map(phaseNodes.map((node) => [node.node_id, 0]));
@@ -1497,7 +1628,6 @@ def export_html(
         const fill = palette[node.op_type] || palette.unknown;
         const pr = node.perf_result || {{}};
         const durUs = Number(pr.total_time_us || 0);
-        // Scale node width by relative duration (log scale clamped)
         const maxDur = Math.max(1, ...phaseNodes.map(n => Number((n.perf_result || {{}}).total_time_us || 0)));
         const logScale = durUs > 0 ? Math.max(0.15, Math.log2(1 + durUs) / Math.log2(1 + maxDur)) : 0.15;
         const nodeW = 140 + logScale * 120;
@@ -1514,7 +1644,6 @@ def export_html(
         ctx.fillStyle = '#334155';
         ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
         ctx.fillText(shortName((node.op_type || 'unknown') + ' ' + shape, 32), pos.x + 8, pos.y + 32);
-        // Perf timing annotation
         if (durUs > 0) {{
           const timeLabel = durUs >= 1000 ? (durUs / 1000).toFixed(2) + 'ms' : durUs.toFixed(1) + 'µs';
           ctx.fillStyle = durUs > 50 ? '#b91c1c' : '#047857';
