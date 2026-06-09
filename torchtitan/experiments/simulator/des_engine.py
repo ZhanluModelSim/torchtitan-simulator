@@ -584,6 +584,20 @@ def compute_des_memory_timeline(result: SimulationResult) -> dict[str, Any]:
         )
         peak_total = static_memory_bytes
 
+    # Fill duration_us: each sample spans from its time_us to the next
+    # sample's time_us (or to the step end for the last sample).  This
+    # makes the timeline continuous — memory level is held constant
+    # between alloc/free transitions.
+    step_end = 0.0
+    for node in nodes_list:
+        if node.des_finish_time_us is not None:
+            step_end = max(step_end, node.des_finish_time_us)
+    for i, s in enumerate(timeline):
+        if i < len(timeline) - 1:
+            s["duration_us"] = timeline[i + 1]["time_us"] - s["time_us"]
+        else:
+            s["duration_us"] = max(0.0, step_end - s["time_us"])
+
     phase_ranges: dict[str, tuple[float, float]] = {}
     for i, node in enumerate(nodes_list):
         phase = node.phase or "unknown"

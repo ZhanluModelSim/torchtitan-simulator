@@ -25,7 +25,14 @@ from .export import (
 )
 from .extension_hooks import postprocess_extension_result
 from .fx_capture import capture_forward_fx, capture_joint_fx
-from .memory_estimator import attach_model_state_memory, dtype_size
+from .memory_estimator import (
+    attach_model_state_memory,
+    dtype_size,
+    estimate_comm_memory,
+    estimate_graph_memory,
+    finalize_memory_summary,
+    merge_memory_summary,
+)
 from .nodes import DataEdge, OpNode, TensorMeta
 from .schedule_extract import extract_schedule_from_pytorch
 from .unified_trace import TraceRecorder, unified_trace
@@ -497,10 +504,32 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         }
     )
 
+    result.compute_graph.add_phase_boundary_edges()
+
     attach_model_state_memory(
         result,
         trainer.model_parts,
         optimizer_name=getattr(trainer.config.optimizer, "name", None),
+    )
+
+    graph_mem_events, graph_mem_summary = estimate_graph_memory(result.compute_graph)
+    comm_mem_events = estimate_comm_memory(result.comm_events)
+    result.memory_events.extend(graph_mem_events)
+    result.memory_events.extend(comm_mem_events)
+    merged_summary = merge_memory_summary(
+        graph_mem_summary,
+        {
+            "total_event_bytes": sum(e.bytes for e in comm_mem_events),
+            "by_category": {"comm_event_buffer": sum(e.bytes for e in comm_mem_events)},
+        },
+    )
+    merged_summary["graph_peak_live_bytes"] = graph_mem_summary.get(
+        "peak_live_bytes", 0
+    )
+    result.metadata["memory"] = finalize_memory_summary(
+        result.memory_events,
+        merged_summary,
+        existing_metadata=result.metadata.get("memory"),
     )
 
     if comm_backend != "gloo":

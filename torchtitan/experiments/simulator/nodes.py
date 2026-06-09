@@ -204,6 +204,88 @@ class ComputeGraph:
     def add_edge(self, edge: DataEdge) -> None:
         self.edges.append(edge)
 
+    def add_phase_boundary_edges(self) -> None:
+        """Add control-flow edges between consecutive training phases.
+
+        In PyTorch, ``loss.backward()`` cannot begin until the forward
+        pass has completed.  The compute graph only captures data-flow
+        edges, so backward nodes that have a forward data-flow
+        predecessor can start as soon as *that single* predecessor
+        finishes — even while other forward ops are still running.
+        This method bridges the gap by inserting a synthetic
+        ``phase_end`` sentinel node per phase boundary and connecting
+        it to every node in the next phase, ensuring the next phase
+        cannot start until the previous phase finishes.
+
+        For each pair of consecutive phases (forward→backward,
+        backward→optimizer):
+
+        1.  Create a sentinel ``phase_end_{phase}`` node with
+            ``op_type="phase_boundary"`` and zero duration.
+        2.  Add a ``phase_boundary`` control edge from **every**
+            node in the previous phase to the sentinel.
+        3.  Add a ``phase_boundary`` control edge from the sentinel
+            to **every** node in the next phase.
+
+        The sentinel acts as a fan-in/fan-out junction: backward
+        cannot start until *all* forward nodes have finished, not
+        just the last one by trace order.
+        """
+        phase_order = ["forward", "backward", "optimizer"]
+        node_ids = list(self.nodes.keys())
+
+        cross_phase_preds: dict[str, set[str]] = {}
+        for edge in self.edges:
+            src_phase = self.nodes[edge.src_node_id].phase
+            dst_phase = self.nodes[edge.dst_node_id].phase
+            if src_phase != dst_phase and edge.edge_type != "phase_boundary":
+                cross_phase_preds.setdefault(edge.dst_node_id, set()).add(
+                    edge.src_node_id
+                )
+
+        for i in range(len(phase_order) - 1):
+            prev_phase = phase_order[i]
+            next_phase = phase_order[i + 1]
+
+            prev_nodes = [
+                nid
+                for nid in node_ids
+                if self.nodes[nid].phase == prev_phase and nid not in cross_phase_preds
+            ]
+            next_nodes = [
+                nid for nid in node_ids if self.nodes[nid].phase == next_phase
+            ]
+
+            if not prev_nodes or not next_nodes:
+                continue
+
+            sentinel_id = f"phase_end_{prev_phase}"
+            sentinel = OpNode(
+                node_id=sentinel_id,
+                op_name=f"phase_end_{prev_phase}",
+                op_type="phase_boundary",
+                phase=prev_phase,
+            )
+            self.add_node(sentinel)
+
+            for nid in prev_nodes:
+                self.add_edge(
+                    DataEdge(
+                        src_node_id=nid,
+                        dst_node_id=sentinel_id,
+                        edge_type="phase_boundary",
+                    )
+                )
+
+            for nid in next_nodes:
+                self.add_edge(
+                    DataEdge(
+                        src_node_id=sentinel_id,
+                        dst_node_id=nid,
+                        edge_type="phase_boundary",
+                    )
+                )
+
     def summary(self) -> dict[str, int]:
         """Return op-type counts for a quick overview."""
         counts: dict[str, int] = {}

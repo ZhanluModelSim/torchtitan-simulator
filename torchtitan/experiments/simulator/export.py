@@ -1408,10 +1408,11 @@ def export_html(
         ctx.globalAlpha = 1.0;
         for (const sample of desMemory.timeline) {{
           const x = labelW + sample.time_us * pixelsPerUnit;
+          const w = Math.max(2, (sample.duration_us || 0) * pixelsPerUnit);
           const dynRatio = sample.dynamic_bytes / peakBytes;
           ctx.fillStyle = '#60a5fa';
           ctx.globalAlpha = 0.3;
-          ctx.fillRect(x, memLaneY - barH / 2, Math.max(2, 4 * pixelsPerUnit), barH * dynRatio);
+          ctx.fillRect(x, memLaneY - barH / 2, w, barH * dynRatio);
           ctx.globalAlpha = 1.0;
         }}
       }}
@@ -1583,20 +1584,17 @@ def export_html(
       const desMemory = TRACE.metadata?.des_memory;
       if (desMemory && desMemory.timeline) {{
         const memoryPaletteMap = {{activation: '#60a5fa', gradient: '#fb7185', comm_buffer: '#f59e0b', optimizer_state: '#a78bfa', parameter: '#22c55e'}};
+        const peakMem = desMemory.peak_total_bytes || 1;
+        const memBarH = 12;
         for (const sample of desMemory.timeline) {{
-          const x = labelW + (sample.time_us - minTime) * pixelsPerUnit;
-          if (x < labelW || x > width - 30) continue;
-          for (const [cat, bytes] of Object.entries(sample.by_category || {{}})) {{
-            if (bytes > 0) {{
-              ctx.fillStyle = memoryPaletteMap[cat] || '#94a3b8';
-              ctx.beginPath();
-              ctx.moveTo(x, memoryMarkerY);
-              ctx.lineTo(x - 4, memoryMarkerY + 8);
-              ctx.lineTo(x + 4, memoryMarkerY + 8);
-              ctx.closePath();
-              ctx.fill();
-            }}
-          }}
+          const xStart = labelW + (sample.time_us - minTime) * pixelsPerUnit;
+          const w = Math.max(2, (sample.duration_us || 0) * pixelsPerUnit);
+          if (xStart + w < labelW || xStart > width - 30) continue;
+          const dynRatio = (sample.dynamic_bytes || 0) / peakMem;
+          ctx.fillStyle = '#60a5fa';
+          ctx.globalAlpha = 0.25;
+          ctx.fillRect(xStart, memoryMarkerY - memBarH / 2, w, memBarH * dynRatio);
+          ctx.globalAlpha = 1.0;
         }}
       }}
     }}
@@ -1895,7 +1893,7 @@ def export_html(
         let x, barW;
         if (hasDes) {{
           x = plotLeft + (sample.time_us - minTime) * pixelsPerTime;
-          barW = Math.max(2, plotWidth / Math.max(1, samples.length));
+          barW = Math.max(2, (sample.duration_us || 0) * pixelsPerTime);
         }} else {{
           x = plotLeft + sample.idx * scale;
           barW = Math.max(2, scale - 1);
