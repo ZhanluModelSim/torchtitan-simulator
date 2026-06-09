@@ -58,11 +58,14 @@ class SimulationConfig:
     """
     comm_backend: str = ""
     """Distributed backend for communication capture.
-    ``\"\"`` (empty, default) uses fake_backend (config validation only, no
-    real comm).  ``\"gloo\"`` enables real CPU communication capture via
-    the gloo backend, which can record FSDP all-gather / reduce-scatter,
-    TP all-reduce, and other collectives with actual tensor shapes.
-    Requires ``torchrun`` or ``mp.spawn`` for multi-process execution."""
+
+    ``""`` (empty, default) uses fake_backend (shape-only, no real
+    comm).  ``"gloo"`` applies FSDP1 wrapping on CPU tensors and
+    captures all-gather / reduce-scatter / all-reduce events via
+    ``CommRecorder`` interception.  Uses ``FakeProcessGroup`` for
+    ``init_distributed`` so single-process execution suffices — no
+    ``torchrun`` required.
+    """
     device_mode: str = ""
     """Device mode for model construction and trace capture.
     ``\"\"`` (empty) auto-selects: ``\"meta\"`` for fake_backend, ``\"cpu\"``
@@ -83,12 +86,26 @@ def _cpu_noop_parallelize(model, **__):
 
 
 def _cpu_gloo_parallelize_llama(model: Any, **__: Any) -> Any:
-    """CPU+gloo Llama3 parallelize: apply FSDP1 on CPU.
+    """CPU+gloo parallelize stub: return model unchanged.
 
-    Uses ``torch.distributed.fsdp.FullyShardedDataParallel`` (FSDP1) with
-    ``SHARD_GRAD_OP`` sharding, which works on CPU with the gloo backend.
-    This captures real all_gather / reduce_scatter communication events
-    with correct tensor shapes.
+    FSDP1 wrapping is applied **after** ``Trainer.__init__`` completes
+    (when parameters are fully materialised on CPU), not here during
+    model construction where parameters are still on ``meta`` device.
+    """
+    return model
+
+
+def _cpu_gloo_parallelize_dsv4(model: Any, **__: Any) -> Any:
+    """CPU+gloo DeepSeek V4 parallelize stub (see ``_cpu_gloo_parallelize_llama``)."""
+    return _cpu_gloo_parallelize_llama(model, **__)
+
+
+def _apply_fsdp1_on_cpu(model: Any) -> Any:
+    """Wrap a fully-materialised CPU model with FSDP1 for comm capture.
+
+    FSDP1 ``SHARD_GRAD_OP`` sharding on CPU creates real all-gather /
+    reduce-scatter calls whose shapes the ``CommRecorder`` intercepts.
+    Requires ``dist.is_initialized()`` with ``world_size > 1``.
     """
     import torch.distributed as dist
 
@@ -109,18 +126,17 @@ def _cpu_gloo_parallelize_llama(model: Any, **__: Any) -> Any:
         return model
 
 
-def _cpu_gloo_parallelize_dsv4(model: Any, **__: Any) -> Any:
-    """CPU+gloo DeepSeek V4 parallelize: apply FSDP1 on CPU."""
-    return _cpu_gloo_parallelize_llama(model, **__)
-
-
-def _cpu_noop_pipeline(model, **__):
-    """CPU-only pipelining stub: return single-part list.
+def _cpu_noop_pipeline(model, parallelize_fn=None, **__):
+    """CPU-only pipelining stub: apply parallelize_fn then return single-part list.
 
     The real ``pipeline_llm`` shards the model across pipeline stages,
     which triggers the same meta-tensor problem as ``parallelize_llama``.
-    For simulation we treat the whole model as a single stage.
+    For simulation we treat the whole model as a single stage, but
+    still apply the ``parallelize_fn`` (e.g. FSDP1 wrapping for gloo
+    mode) so that communication ops are present in the forward pass.
     """
+    if parallelize_fn is not None:
+        model = parallelize_fn(model, **__)
     return None, [model], True, True
 
 
@@ -174,6 +190,12 @@ class SimulationTrainer(Trainer):
         if pp * tp * ds * dr > 1:
             _set_fake_world_size(config)
 
+        # Force comm.mode to fake_backend so init_distributed uses the
+        # fake process group (no NCCL/gloo rendezvous, no multi-process
+        # requirement).  The simulator captures communication separately
+        # via CommRecorder/FSDP hooks, not through init_distributed.
+        config.comm.mode = "fake_backend"
+
         if comm_backend == "gloo":
             model_name = getattr(config.model_spec, "name", "")
             if "deepseek" in model_name.lower():
@@ -190,6 +212,13 @@ class SimulationTrainer(Trainer):
         self.parallel_dims.tp = 1
         self.parallel_dims.dp_shard = 1
         self.parallel_dims.dp_replicate = 1
+
+        # Apply FSDP1 wrapping after model is fully initialised on CPU.
+        # Must happen after super().__init__() because the Trainer builds
+        # the model on meta, then calls to_empty + init_weights to
+        # materialise CPU tensors.  FSDP1 on meta/empty tensors crashes.
+        if comm_backend == "gloo":
+            self.model_parts = [_apply_fsdp1_on_cpu(m) for m in self.model_parts]
 
     def train(self):
         comm_backend = getattr(self.config.simulation, "comm_backend", "") or ""

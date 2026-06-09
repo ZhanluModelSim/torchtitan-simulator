@@ -1836,5 +1836,151 @@ class TestSimulatorUnified(unittest.TestCase):
         assert len(runtime_compute) > 0
 
 
+class TestFSDP1FakeProcessGroupIntegration(unittest.TestCase):
+    """Test that FSDP1 + FakeProcessGroup + CommRecorder captures
+    all_gather / reduce_scatter events without multi-process execution."""
+
+    def setUp(self):
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            os.environ.setdefault("NGPU", "2")
+            dist.init_process_group("fake", rank=0, world_size=2)
+
+    def tearDown(self):
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    def test_fsdp1_wraps_on_fake_backend(self):
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+        )
+
+        m = nn.Linear(16, 4)
+        wrapped = FSDP(
+            m,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            device_id=torch.device("cpu"),
+        )
+        assert isinstance(wrapped, FSDP)
+
+    def test_fsdp1_forward_backward_produces_comm_events(self):
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+        )
+
+        from torchtitan.experiments.simulator.comm_interceptor import (
+            capture_comms,
+            CommRecorder,
+        )
+
+        m = nn.Linear(16, 4)
+        wrapped = FSDP(
+            m,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            device_id=torch.device("cpu"),
+        )
+        recorder = CommRecorder(rank=0)
+        recorder.current_phase = "forward"
+        x = torch.randn(2, 16)
+        with capture_comms(recorder):
+            y = wrapped(x)
+            assert y.shape == (2, 4)
+            recorder.current_phase = "backward"
+            y.sum().backward()
+
+        assert (
+            len(recorder.events) >= 2
+        ), f"expected >=2 comm events, got {len(recorder.events)}"
+        ops = [e["op"] for e in recorder.events]
+        assert (
+            "all_gather" in ops or "all_gather_into_tensor" in ops
+        ), f"no all_gather: {ops}"
+        assert (
+            "reduce_scatter" in ops or "reduce_scatter_tensor" in ops
+        ), f"no reduce_scatter: {ops}"
+
+    def test_fsdp1_comm_events_have_correct_group_size(self):
+        import torch.distributed as dist
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+        )
+
+        from torchtitan.experiments.simulator.comm_interceptor import (
+            capture_comms,
+            CommRecorder,
+        )
+
+        world_size = dist.get_world_size()
+        m = nn.Linear(16, 4)
+        wrapped = FSDP(
+            m,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            device_id=torch.device("cpu"),
+        )
+        recorder = CommRecorder(rank=0)
+        x = torch.randn(2, 16)
+        with capture_comms(recorder):
+            y = wrapped(x)
+            y.sum().backward()
+
+        for ev in recorder.events:
+            assert (
+                ev.get("group_size") == world_size
+            ), f"expected group_size={world_size}, got {ev.get('group_size')}"
+
+    def test_unified_trace_captures_fsdp1_comm_nodes(self):
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            ShardingStrategy,
+        )
+
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        m = nn.Linear(16, 4)
+        wrapped = FSDP(
+            m,
+            sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+            device_id=torch.device("cpu"),
+        )
+        recorder = TraceRecorder(rank=0)
+        x = torch.randn(2, 16)
+        with unified_trace(
+            recorder,
+            wrapped,
+            (x,),
+            use_fake_mode=False,
+            phase="forward",
+            capture_comm=True,
+            capture_fsdp=False,
+        ):
+            y = wrapped(x)
+            recorder.current_phase = "backward"
+            y.sum().backward()
+
+        result = recorder.build_result()
+        comm_nodes = [
+            n
+            for n in result.compute_graph.nodes.values()
+            if n.op_type == "comm_collective"
+        ]
+        assert len(comm_nodes) >= 2, f"expected >=2 comm nodes, got {len(comm_nodes)}"
+        ops = {n.op_name for n in comm_nodes}
+        assert (
+            "all_gather" in ops or "all_gather_into_tensor" in ops
+        ), f"no all_gather: {ops}"
+        assert (
+            "reduce_scatter" in ops or "reduce_scatter_tensor" in ops
+        ), f"no reduce_scatter: {ops}"
+
+
 if __name__ == "__main__":
     unittest.main()

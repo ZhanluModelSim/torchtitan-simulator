@@ -332,6 +332,46 @@ Meta tensors 具有 `tensor.numel()` 和 `tensor.dtype` 但 `tensor.element_size
 | 阶段2：创建 UnifiedTraceMode | ✅ 完成 | `0d3b4efc` | 7 TestUnifiedTrace |
 | 阶段3：Meta Device Patching | ✅ 完成 | `0d3b4efc` | 4 TestMetaDevicePatch + 4 TestSimulatorUnified |
 | 阶段4：集成到 trainer 路径 | ✅ 完成 | `e40d0c33` | — |
-| 阶段5：清理和验证 | ✅ 完成 | — | 91 tests total |
+| 阶段5：清理和验证 | ✅ 完成 | `889372f5` | 91 tests total |
 
-**总测试数：91**（69 原始 + 7 TestOpClassification + 7 TestUnifiedTrace + 4 TestMetaDevicePatch + 4 TestSimulatorUnified）
+### 阶段6：分布式超时修复 + FSDP1 CommCapture ✅ 完成
+
+**问题：** DeepSeek V4 smoketest (PP=2 TP=2 DP=2, 8 ranks) 在不指定
+`COMM_MODE=fake_backend` 时因分布式初始化超时失败。根因是
+`SimulationTrainer` 覆盖 env vars (`RANK=0 WORLD_SIZE=8`) 但
+`config.comm.mode` 默认 `"default"` 导致 `init_distributed()` 尝试
+NCCL/gloo rendezvous，而模拟器设计为单进程运行。
+
+**修复（三个变更）：**
+
+1. **`config.comm.mode = "fake_backend"` 强制** — 在
+   `SimulationTrainer.__init__` 中将 `config.comm.mode` 强制为
+   `"fake_backend"`，使 `init_distributed()` 使用 `FakeProcessGroup`
+   (backend=`"fake"`)，无需 NCCL/gloo rendezvous 或多进程执行。
+
+2. **FSDP1 后置包裹** — `_cpu_gloo_parallelize_llama/dsv4` 不在模型
+   构建期间包裹 FSDP1（模型此时在 meta device 上，FSDP1 无法处理
+   meta tensors），而是在 `super().__init__()` **之后**（模型已
+   materialised 到 CPU）通过 `_apply_fsdp1_on_cpu()` 包裹。这样
+   `CommRecorder` 可以拦截 FSDP1 的 `all_gather` / `reduce_scatter`
+   调用并记录正确 tensor shapes 和 `group_size`。
+
+3. **`_cpu_noop_pipeline` 传递 `parallelize_fn`** — pipelining stub
+   现在将 `parallelize_fn` kwarg 转发给模型，确保 PP 启用时也能调用
+   parallelize 逻辑。
+
+**结果：** DeepSeek V4 smoketest 在单 CPU 进程上成功运行，捕获
+真实 FSDP1 comm events（`all_gather` + `reduce_scatter`，
+`group_size=8`），不再需要 `torchrun` 或多进程执行。
+
+**Tests：** 4 TestFSDP1FakeProcessGroupIntegration
+
+| 测试 | 验证 |
+|------|------|
+| `test_fsdp1_wraps_on_fake_backend` | FSDP1 能包裹 SimpleModel 在 FakeProcessGroup 上 |
+| `test_fsdp1_forward_backward_produces_comm_events` | FSDP1 fwd+bwd 产生 ≥2 CommRecorder events |
+| `test_fsdp1_comm_events_have_correct_group_size` | 每个 comm event 的 `group_size == world_size` |
+| `test_unified_trace_captures_fsdp1_comm_nodes` | `unified_trace(capture_comm=True)` 将 comm events 合入 compute_graph |
+
+**总测试数：95**（69 原始 + 7 TestOpClassification + 7 TestUnifiedTrace +
+4 TestMetaDevicePatch + 4 TestSimulatorUnified + 4 TestFSDP1FakeProcessGroupIntegration）
