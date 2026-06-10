@@ -16,9 +16,8 @@ visualisation shows the full parallel topology.
 
 from __future__ import annotations
 
-from typing import Any
-
 from .nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
+from .schedule_extract import replicate_events_to_ranks
 
 
 def _unique_id(prefix: str, counter: list[int]) -> str:
@@ -367,55 +366,14 @@ def generate_interleaved_1f1b_schedule(
                 deps=[(dp_sync, "control")],
             )
 
-    # ── Post-hoc: replicate PP-group schedule across TP/DP ranks ─────
-    # PP/FSDP/TP events are generated for the base rank of each PP group.
-    # We copy them to sibling ranks so the swimlane shows balanced work.
-    # dp_gradient_sync and optimizer_step are already emitted per-rank.
     group_size = tp_degree * dp_degree
-    original_events = [
-        e
-        for e in schedule.events
-        if e.metadata.get("strategy") in ("pp", "fsdp2", "tp", "compute")
-    ]
-    original_deps = list(schedule.deps)
-
-    eid_remap: dict[str, dict[int, str]] = {}
-    for ev in original_events:
-        base_rank = ev.rank
-        pp_group_base = (base_rank // group_size) * group_size
-        for r in range(pp_group_base, pp_group_base + group_size):
-            if r == base_rank:
-                continue
-            new_eid = nid(ev.event_type)
-            new_ev = ScheduleEvent(
-                event_id=new_eid,
-                event_type=ev.event_type,
-                rank=r,
-                pp_rank=ev.pp_rank,
-                pp_stage=ev.pp_stage,
-                microbatch_idx=ev.microbatch_idx,
-                logical_clock=rank_clock.get(r, 0),
-                metadata=dict(ev.metadata),
-            )
-            schedule.add_event(new_ev)
-            rank_clock[r] = rank_clock.get(r, 0) + 1
-
-            if ev.event_id not in eid_remap:
-                eid_remap[ev.event_id] = {}
-            eid_remap[ev.event_id][r] = new_eid
-
-            if r in prev_per_rank:
-                schedule.add_dep(ScheduleDep(prev_per_rank[r], new_eid, "control"))
-            prev_per_rank[r] = new_eid
-
-    for dep in original_deps:
-        from_eid = dep.from_event_id
-        to_eid = dep.to_event_id
-        remap_from = eid_remap.get(from_eid, {})
-        remap_to = eid_remap.get(to_eid, {})
-        for r, to_copy in remap_to.items():
-            from_copy = remap_from.get(r)
-            if from_copy:
-                schedule.add_dep(ScheduleDep(from_copy, to_copy, dep.dep_type))
+    replicate_events_to_ranks(
+        schedule,
+        group_size,
+        {"pp", "fsdp2", "tp", "compute"},
+        prev_per_rank,
+        lambda prefix: nid(prefix),
+        rank_clock=rank_clock,
+    )
 
     return schedule

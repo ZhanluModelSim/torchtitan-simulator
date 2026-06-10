@@ -41,6 +41,7 @@ import torch.utils._pytree as pytree
 from torch._subclasses import FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from .graph_assembler import comm_event_to_op_node
 from .nodes import (
     ComputeGraph,
     DataEdge,
@@ -235,52 +236,26 @@ class TraceRecorder:
                     )
                 last_in_group[key] = n.node_id
 
-        # Merge comm events as OpNode entries
         for ev in self.comm_events:
-            node_id = ev.get("event_id", f"comm_{len(graph.nodes)+1:07d}")
-            op_name = ev.get("op", "collective_unknown")
-            phase = ev.get("phase", "unknown")
-            input_metas: list[TensorMeta] = []
-            output_metas: list[TensorMeta] = []
-            shape_entries = ev.get("tensor_shapes") or []
-            if not shape_entries:
-                tm = ev.get("tensor_meta")
-                if tm:
-                    shape_entries = [tm]
-            for entry in shape_entries:
-                if entry is None:
-                    continue
-                meta = TensorMeta(
-                    shape=tuple(entry.get("shape", [])),
-                    dtype=entry.get("dtype", "unknown"),
-                    device=_normalize_device(entry.get("device", "cpu")),
-                    is_dtensor=entry.get("is_dtensor", False),
-                    placements=entry.get("placements"),
-                )
-                input_metas.append(meta)
-                output_metas.append(meta)
-            op_type = ev.get("op_type", "comm_collective")
-            comm_node = OpNode(
-                node_id=node_id,
-                op_name=op_name,
-                op_type=op_type,
-                phase=phase,
-                inputs=input_metas,
-                outputs=output_metas,
-                comm_op=op_name,
-                comm_group_size=ev.get("group_size"),
-                pp_stage=ev.get("pp_stage"),
-                microbatch_idx=ev.get("microbatch"),
-                attrs={
-                    "group": str(ev.get("group", "")),
-                    "tag": str(ev.get("tag", "")),
-                    "src_rank": ev.get("src_rank"),
-                    "dst_rank": ev.get("dst_rank"),
-                    "rank": ev.get("rank"),
-                },
+            normalized_ev = dict(ev)
+            if "tensor_shapes" in normalized_ev:
+                normalized_ev["tensor_shapes"] = [
+                    {**s, "device": _normalize_device(s.get("device", "cpu"))}
+                    if s
+                    else s
+                    for s in (normalized_ev.get("tensor_shapes") or [])
+                ]
+            if "tensor_meta" in normalized_ev and normalized_ev["tensor_meta"]:
+                tm = dict(normalized_ev["tensor_meta"])
+                tm["device"] = _normalize_device(tm.get("device", "cpu"))
+                normalized_ev["tensor_meta"] = tm
+
+            node_id = normalized_ev.get(
+                "event_id", f"comm_{len(graph.nodes) + 1:07d}"
             )
+            comm_node = comm_event_to_op_node(normalized_ev, node_id=node_id)
             graph.add_node(comm_node)
-            for src_id in ev.get("source_node_ids", []):
+            for src_id in normalized_ev.get("source_node_ids", []):
                 if src_id in graph.nodes:
                     graph.add_edge(
                         DataEdge(

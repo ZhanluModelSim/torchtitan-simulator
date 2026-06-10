@@ -263,6 +263,60 @@ def _stage_to_pp_rank(stage_index: int, schedule: Any, pp_degree: int) -> int:
     return stage_index // pp_degree if pp_degree > 0 else 0
 
 
+def replicate_events_to_ranks(
+    schedule: TrainingSchedule,
+    group_size: int,
+    strategies: set[str],
+    per_rank_prev: dict[Any, str],
+    next_id_fn: Any,
+    rank_clock: dict[int, int] | None = None,
+) -> None:
+    if group_size <= 1:
+        return
+    original_events = [
+        e for e in schedule.events if e.metadata.get("strategy") in strategies
+    ]
+    original_deps = list(schedule.deps)
+    eid_remap: dict[str, dict[int, str]] = {}
+
+    for ev in original_events:
+        base_rank = ev.rank
+        group_base = (base_rank // group_size) * group_size
+        for r_offset in range(1, group_size):
+            r = group_base + r_offset
+            new_eid = next_id_fn(ev.event_type)
+            if rank_clock is not None:
+                clock = rank_clock.get(r, 0)
+                rank_clock[r] = clock + 1
+            else:
+                clock = ev.logical_clock
+            new_ev = ScheduleEvent(
+                event_id=new_eid,
+                event_type=ev.event_type,
+                rank=r,
+                pp_rank=ev.pp_rank,
+                pp_stage=ev.pp_stage,
+                microbatch_idx=ev.microbatch_idx,
+                logical_clock=clock,
+                metadata=dict(ev.metadata),
+            )
+            schedule.add_event(new_ev)
+            if ev.event_id not in eid_remap:
+                eid_remap[ev.event_id] = {}
+            eid_remap[ev.event_id][r_offset] = new_eid
+            if r in per_rank_prev:
+                schedule.add_dep(ScheduleDep(per_rank_prev[r], new_eid, "control"))
+            per_rank_prev[r] = new_eid
+
+    for dep in original_deps:
+        remap_from = eid_remap.get(dep.from_event_id, {})
+        remap_to = eid_remap.get(dep.to_event_id, {})
+        for r_offset, to_copy in remap_to.items():
+            from_copy = remap_from.get(r_offset)
+            if from_copy:
+                schedule.add_dep(ScheduleDep(from_copy, to_copy, dep.dep_type))
+
+
 def _convert_pipeline_order_to_training_schedule(
     pipeline_order: dict[int, list[Any]],
     *,
@@ -397,52 +451,15 @@ def _convert_pipeline_order_to_training_schedule(
                 if recv_pp_r != pp_r:
                     ts.add_dep(ScheduleDep(ev.event_id, recv_ev.event_id, "pp_comm"))
 
-    # ── Replicate PP-group events across TP and DP ranks ─────────────
-    # PP events are generated per PP rank.  Replicate them to sibling
-    # ranks in the same PP group so the swimlane shows balanced work.
-
     group_size = tp_degree * dp_degree
     if group_size > 1:
-        original_events = [e for e in ts.events if e.metadata.get("strategy") == "pp"]
-        original_deps = list(ts.deps)
-
-        eid_remap: dict[str, dict[int, str]] = {}
-        for ev in original_events:
-            base_rank = ev.rank
-            dp_tp_offset = base_rank % group_size
-            pp_group_base = (base_rank // group_size) * group_size
-            for r_offset in range(1, group_size):
-                r = pp_group_base + r_offset
-                new_eid = _next_id(ev.event_type)
-                new_ev = ScheduleEvent(
-                    event_id=new_eid,
-                    event_type=ev.event_type,
-                    rank=r,
-                    pp_rank=ev.pp_rank,
-                    pp_stage=ev.pp_stage,
-                    microbatch_idx=ev.microbatch_idx,
-                    logical_clock=ev.logical_clock,
-                    metadata=dict(ev.metadata),
-                )
-                ts.add_event(new_ev)
-
-                if ev.event_id not in eid_remap:
-                    eid_remap[ev.event_id] = {}
-                eid_remap[ev.event_id][r_offset] = new_eid
-
-                if r in per_rank_prev:
-                    ts.add_dep(ScheduleDep(per_rank_prev[r], new_eid, "control"))
-                per_rank_prev[r] = new_eid
-
-        for dep in original_deps:
-            from_eid = dep.from_event_id
-            to_eid = dep.to_event_id
-            remap_from = eid_remap.get(from_eid, {})
-            remap_to = eid_remap.get(to_eid, {})
-            for r_offset, to_copy in remap_to.items():
-                from_copy = remap_from.get(r_offset)
-                if from_copy:
-                    ts.add_dep(ScheduleDep(from_copy, to_copy, dep.dep_type))
+        replicate_events_to_ranks(
+            ts,
+            group_size,
+            {"pp"},
+            per_rank_prev,
+            lambda prefix: _next_id(prefix),
+        )
 
     # ── Add optimizer step per rank ───────────────────────────────────
     # After REDUCE_GRAD (or last backward if no REDUCE_GRAD), add optimizer step.
