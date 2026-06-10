@@ -483,3 +483,393 @@ def _convert_pipeline_order_to_training_schedule(
             ts.add_dep(ScheduleDep(last_eid, opt_eid, "control"))
 
     return ts
+
+
+# ---------------------------------------------------------------------------
+# PPScheduleExtractor helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_event_id(prefix: str, counter: list[int]) -> str:
+    counter[0] += 1
+    return f"{prefix}_{counter[0]:07d}"
+
+
+_ACTION_FWD = "F"
+_ACTION_BWD = "B"
+_ACTION_SEND_FWD = "SEND_F"
+_ACTION_RECV_FWD = "RECV_F"
+_ACTION_SEND_BWD = "SEND_B"
+_ACTION_RECV_BWD = "RECV_B"
+_ACTION_SEND_ACT = "SEND_ACT"
+_ACTION_RECV_ACT = "RECV_ACT"
+
+
+def _pp_action_str_to_event_type(action: str) -> str:
+    mapping = {
+        _ACTION_FWD: "fwd",
+        _ACTION_BWD: "bwd",
+        _ACTION_SEND_FWD: "send_fwd",
+        _ACTION_RECV_FWD: "recv_fwd",
+        _ACTION_SEND_BWD: "send_bwd",
+        _ACTION_RECV_BWD: "recv_bwd",
+        _ACTION_SEND_ACT: "send_activation",
+        _ACTION_RECV_ACT: "recv_activation",
+    }
+    return mapping.get(action, action.lower())
+
+
+# ---------------------------------------------------------------------------
+# PPScheduleExtractor
+# ---------------------------------------------------------------------------
+
+
+class PPScheduleExtractor:
+    """
+    Extracts the static schedule from a ``_PipelineSchedule`` instance.
+
+    The extracted :class:`TrainingSchedule` contains one
+    :class:`ScheduleEvent` per (rank, clock-cycle, action) triple, plus
+    causal dependency edges between matching send/recv pairs.
+
+    Args:
+        schedule: An instantiated pipeline schedule.
+        pp_rank: The rank for which to extract the schedule.
+            Pass -1 (default) to extract for *all* ranks.
+        world_size: Number of PP ranks (used when extracting all ranks).
+        n_microbatches: Number of microbatches.  If ``None``, read from
+            ``schedule.n_microbatches``.
+    """
+
+    def __init__(
+        self,
+        schedule: Any,
+        pp_rank: int = -1,
+        world_size: int = 1,
+        n_microbatches: int | None = None,
+    ) -> None:
+        self.schedule = schedule
+        self.pp_rank = pp_rank
+        self.world_size = world_size
+        self.n_microbatches = n_microbatches or getattr(
+            schedule, "n_microbatches", getattr(schedule, "_n_microbatches", 1)
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def extract(self) -> TrainingSchedule:
+        """Return a :class:`TrainingSchedule` describing the full pipeline schedule.
+
+        Primary path: read ``pipeline_order_with_comms`` (multi-stage) or
+        ``pipeline_order`` (single-stage) from the schedule object, then
+        convert to TrainingSchedule via the shared conversion function.
+        Falls back to heuristic reconstruction if neither attribute exists.
+        """
+        pipeline_order = None
+        if hasattr(self.schedule, "pipeline_order_with_comms"):
+            pipeline_order = self.schedule.pipeline_order_with_comms
+        elif hasattr(self.schedule, "pipeline_order"):
+            pipeline_order = self.schedule.pipeline_order
+
+        if pipeline_order is not None:
+            pp_group_size = getattr(self.schedule, "pp_group_size", self.world_size)
+            return _convert_pipeline_order_to_training_schedule(
+                pipeline_order,
+                schedule=self.schedule,
+                pp_degree=pp_group_size,
+                tp_degree=1,
+                dp_degree=1,
+                n_microbatches=self.n_microbatches,
+                schedule_name=type(self.schedule).__name__,
+                virtual_stages_per_rank=1,
+            )
+
+        logger.warning(
+            "No pipeline_order found on schedule %s; using heuristic 1F1B",
+            type(self.schedule).__name__,
+        )
+        metadata = {
+            "schedule_type": type(self.schedule).__name__,
+            "n_microbatches": self.n_microbatches,
+            "pp_rank": self.pp_rank,
+            "world_size": self.world_size,
+            "extraction_method": "heuristic_fallback",
+        }
+        ts = TrainingSchedule(metadata=metadata)
+        self._build_schedule_heuristic(ts)
+        self._add_send_recv_deps(ts)
+        return ts
+
+    # ------------------------------------------------------------------
+    # Action-table extraction strategies
+    # ------------------------------------------------------------------
+
+    def _extract_action_table(self) -> dict[int, list[tuple[str, int]]] | None:
+        """
+        Try to read the internal action table from the schedule.
+
+        Returns a dict mapping ``rank -> list[(action_type, microbatch_id)]``
+        covering one full pipeline step, or ``None`` if unavailable.
+        """
+        schedule = self.schedule
+
+        if hasattr(schedule, "_actions"):
+            actions = schedule._actions
+            if actions:
+                return self._parse_runtime_actions(actions)
+
+        if hasattr(schedule, "_compute_clock_cycles"):
+            try:
+                clock_cycles = schedule._compute_clock_cycles()
+                return self._parse_clock_cycles(clock_cycles)
+            except Exception:
+                pass
+
+        return None
+
+    def _parse_runtime_actions(self, actions: Any) -> dict[int, list[tuple[str, int]]]:
+        """
+        Parse the actions dict from ``_PipelineScheduleRuntime._actions``.
+        """
+        table: dict[int, list[tuple[str, int]]] = {}
+
+        if isinstance(actions, list):
+            for item in actions:
+                if isinstance(item, dict):
+                    rank = item.get("rank", 0)
+                    action = item.get("type", item.get("action", "F"))
+                    mb = item.get("microbatch", item.get("mb", 0))
+                    table.setdefault(rank, []).append((str(action).upper(), int(mb)))
+                elif hasattr(item, "computation_type") and hasattr(
+                    item, "microbatch_index"
+                ):
+                    rank = int(getattr(item, "stage_index", 0))
+                    action_type, mb = self._unpack_action(item)
+                    table.setdefault(rank, []).append((action_type, mb))
+                else:
+                    action_type, mb = self._unpack_action(item)
+                    table.setdefault(0, []).append((action_type, mb))
+            return table
+
+        if isinstance(actions, dict):
+            for rank, rank_actions in actions.items():
+                rank = int(rank)
+                parsed: list[tuple[str, int]] = []
+                for act in rank_actions:
+                    if isinstance(act, dict):
+                        parsed.append(
+                            (
+                                str(act.get("type", "F")).upper(),
+                                int(act.get("microbatch", 0)),
+                            )
+                        )
+                    elif hasattr(act, "type") and hasattr(act, "microbatch"):
+                        parsed.append((str(act.type).upper(), int(act.microbatch)))
+                    else:
+                        action_type, mb = self._unpack_action(act)
+                        parsed.append((action_type, mb))
+                table[rank] = parsed
+            return table
+
+        return {}
+
+    def _parse_clock_cycles(
+        self, clock_cycles: Any
+    ) -> dict[int, list[tuple[str, int]]]:
+        """Parse output of ``_compute_clock_cycles()``."""
+        table: dict[int, list[tuple[str, int]]] = {}
+
+        if not clock_cycles:
+            return table
+
+        if isinstance(clock_cycles[0], list):
+            for clock_idx, rank_actions in enumerate(clock_cycles):
+                for rank_idx, action in enumerate(rank_actions):
+                    if action is None:
+                        continue
+                    action_type, mb = self._unpack_action(action)
+                    table.setdefault(rank_idx, []).append((action_type, mb))
+        else:
+            for idx, action in enumerate(clock_cycles):
+                if action is None:
+                    continue
+                action_type, mb = self._unpack_action(action)
+                table.setdefault(0, []).append((action_type, mb))
+
+        return table
+
+    @staticmethod
+    def _unpack_action(action: Any) -> tuple[str, int]:
+        """Extract (action_type_str, microbatch_id) from an action object."""
+        if hasattr(action, "computation_type") and hasattr(action, "microbatch_index"):
+            t = str(action.computation_type).upper()
+            mb = int(action.microbatch_index)
+        elif hasattr(action, "type") and hasattr(action, "microbatch"):
+            t = str(action.type).upper()
+            mb = int(action.microbatch)
+        elif isinstance(action, tuple) and len(action) >= 2:
+            t, mb = str(action[0]).upper(), int(action[1])
+        elif isinstance(action, str):
+            t, mb = action.upper(), 0
+        else:
+            t, mb = str(action).upper(), 0
+        if "FORWARD" in t or t == "F":
+            t = "F"
+        elif "BACKWARD" in t or t == "B":
+            t = "B"
+        elif "SEND" in t and "FWD" in t:
+            t = "SEND_F"
+        elif "RECV" in t and "FWD" in t:
+            t = "RECV_F"
+        elif "SEND" in t and "BWD" in t:
+            t = "SEND_B"
+        elif "RECV" in t and "BWD" in t:
+            t = "RECV_B"
+        return t, mb
+
+    # ------------------------------------------------------------------
+    # Schedule construction from action table
+    # ------------------------------------------------------------------
+
+    def _build_schedule_from_table(
+        self,
+        ts: TrainingSchedule,
+        action_table: dict[int, list[tuple[str, int]]],
+    ) -> None:
+        counter = [0]
+
+        ranks = list(action_table.keys()) if self.pp_rank == -1 else [self.pp_rank]
+
+        for rank in ranks:
+            actions = action_table.get(rank, [])
+            for clock, (action_type, mb) in enumerate(actions):
+                event = ScheduleEvent(
+                    event_id=_make_event_id("pp", counter),
+                    event_type=_pp_action_str_to_event_type(action_type),
+                    rank=rank,
+                    pp_rank=rank,
+                    microbatch_idx=mb,
+                    logical_clock=clock,
+                    metadata={"schedule_action": action_type},
+                )
+                ts.add_event(event)
+
+    def _build_schedule_heuristic(self, ts: TrainingSchedule) -> None:
+        """
+        Reconstruct a 1F1B-style schedule heuristically when the schedule
+        does not expose an action table.
+        """
+        n_mb = self.n_microbatches
+        n_ranks = self.world_size
+        counter = [0]
+
+        ranks = list(range(n_ranks)) if self.pp_rank == -1 else [self.pp_rank]
+
+        for rank in ranks:
+            clock = 0
+            for mb in range(min(rank + 1, n_mb)):
+                ts.add_event(
+                    ScheduleEvent(
+                        event_id=_make_event_id("pp", counter),
+                        event_type="fwd",
+                        rank=rank,
+                        pp_rank=rank,
+                        microbatch_idx=mb,
+                        logical_clock=clock,
+                    )
+                )
+                clock += 1
+            fwd_mb = rank + 1
+            bwd_mb = 0
+            while fwd_mb < n_mb or bwd_mb < rank + 1:
+                if fwd_mb < n_mb:
+                    ts.add_event(
+                        ScheduleEvent(
+                            event_id=_make_event_id("pp", counter),
+                            event_type="fwd",
+                            rank=rank,
+                            pp_rank=rank,
+                            microbatch_idx=fwd_mb,
+                            logical_clock=clock,
+                        )
+                    )
+                    fwd_mb += 1
+                    clock += 1
+                if bwd_mb < rank + 1:
+                    ts.add_event(
+                        ScheduleEvent(
+                            event_id=_make_event_id("pp", counter),
+                            event_type="bwd",
+                            rank=rank,
+                            pp_rank=rank,
+                            microbatch_idx=bwd_mb,
+                            logical_clock=clock,
+                        )
+                    )
+                    bwd_mb += 1
+                    clock += 1
+            while bwd_mb < n_mb:
+                ts.add_event(
+                    ScheduleEvent(
+                        event_id=_make_event_id("pp", counter),
+                        event_type="bwd",
+                        rank=rank,
+                        pp_rank=rank,
+                        microbatch_idx=bwd_mb,
+                        logical_clock=clock,
+                    )
+                )
+                bwd_mb += 1
+                clock += 1
+
+    # ------------------------------------------------------------------
+    # Dependency construction
+    # ------------------------------------------------------------------
+
+    def _add_send_recv_deps(self, ts: TrainingSchedule) -> None:
+        """
+        Add causal ``pp_comm`` dependency edges between matching send/recv
+        event pairs.
+        """
+        index: dict[tuple[str, int | None, int], ScheduleEvent] = {}
+        for ev in ts.events:
+            key = (ev.event_type, ev.microbatch_idx, ev.rank)
+            index[key] = ev
+
+        def _dep(src: ScheduleEvent, dst: ScheduleEvent) -> None:
+            ts.add_dep(
+                ScheduleDep(
+                    from_event_id=src.event_id,
+                    to_event_id=dst.event_id,
+                    dep_type="pp_comm",
+                )
+            )
+
+        for (etype, mb, rank), ev in list(index.items()):
+            if etype == "send_fwd":
+                recv_key = ("recv_fwd", mb, rank + 1)
+                if recv_key in index:
+                    _dep(ev, index[recv_key])
+
+        for (etype, mb, rank), ev in list(index.items()):
+            if etype == "send_bwd" and rank > 0:
+                recv_key = ("recv_bwd", mb, rank - 1)
+                if recv_key in index:
+                    _dep(ev, index[recv_key])
+
+        rank_clocks: dict[int, list[ScheduleEvent]] = {}
+        for ev in ts.events:
+            rank_clocks.setdefault(ev.rank, []).append(ev)
+
+        for rank, evs in rank_clocks.items():
+            evs_sorted = sorted(evs, key=lambda e: e.logical_clock)
+            for prev, curr in zip(evs_sorted, evs_sorted[1:]):
+                ts.add_dep(
+                    ScheduleDep(
+                        from_event_id=prev.event_id,
+                        to_event_id=curr.event_id,
+                        dep_type="control",
+                    )
+                )

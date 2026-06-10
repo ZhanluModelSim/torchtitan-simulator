@@ -1456,7 +1456,7 @@ class TestPPScheduleExtractor(unittest.TestCase):
         return MockSchedule()
 
     def test_extract_from_actions(self):
-        from torchtitan.experiments.simulator.pp_schedule_extractor import (
+        from torchtitan.experiments.simulator.schedule_extract import (
             PPScheduleExtractor,
         )
 
@@ -1470,7 +1470,7 @@ class TestPPScheduleExtractor(unittest.TestCase):
         assert len(event_types) > 0
 
     def test_schedule_has_deps(self):
-        from torchtitan.experiments.simulator.pp_schedule_extractor import (
+        from torchtitan.experiments.simulator.schedule_extract import (
             PPScheduleExtractor,
         )
 

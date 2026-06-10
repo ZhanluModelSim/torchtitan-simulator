@@ -41,7 +41,7 @@ from .export import export_result
 from .fx_capture import capture_forward_fx, capture_joint_fx
 from .meta_env import patch_device_type_to_meta
 from .nodes import SimulationResult
-from .pp_schedule_extractor import PPScheduleExtractor
+from .schedule_extract import PPScheduleExtractor
 from .unified_trace import compute_loss, TraceRecorder, unified_trace
 
 
