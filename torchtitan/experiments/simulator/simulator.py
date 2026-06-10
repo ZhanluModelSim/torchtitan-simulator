@@ -40,19 +40,13 @@ import torch.nn as nn
 
 from .comm_interceptor import capture_comms, CommRecorder
 from .cpu_env import cpu_distributed_context, patch_device_type_to_cpu
-from .export import (
-    export_chrome_trace,
-    export_dot,
-    export_html,
-    export_json,
-    export_text_summary,
-)
+from .export import export_result
 from .fx_capture import capture_forward_fx, capture_joint_fx
 from .meta_env import patch_device_type_to_meta
 from .nodes import SimulationResult, TrainingSchedule
 from .pp_schedule_extractor import PPScheduleExtractor
 from .runtime_capture import RuntimeCapture
-from .unified_trace import TraceRecorder, unified_trace
+from .unified_trace import compute_loss, TraceRecorder, unified_trace
 
 
 class Simulator:
@@ -203,16 +197,7 @@ class Simulator:
                 self._log("  running forward pass …")
                 capture.set_phase("forward")
                 output = model(*example_inputs)
-
-                if loss_fn is not None and example_labels is not None:
-                    loss = loss_fn(output, example_labels)
-                elif isinstance(output, torch.Tensor):
-                    loss = output.sum()
-                else:
-                    import torch.utils._pytree as pytree
-
-                    flat, _ = pytree.tree_flatten(output)
-                    loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
+                loss = compute_loss(output, loss_fn=loss_fn, labels=example_labels)
 
                 self._log("  running backward pass …")
                 capture.set_phase("backward")
@@ -343,16 +328,7 @@ class Simulator:
         ):
             self._log("  running forward pass …")
             output = model(*example_inputs)
-
-            if loss_fn is not None and example_labels is not None:
-                loss = loss_fn(output, example_labels)
-            elif isinstance(output, torch.Tensor):
-                loss = output.sum()
-            else:
-                import torch.utils._pytree as pytree
-
-                flat, _ = pytree.tree_flatten(output)
-                loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
+            loss = compute_loss(output, loss_fn=loss_fn, labels=example_labels)
 
             self._log("  running backward pass …")
             recorder.current_phase = "backward"
@@ -445,36 +421,12 @@ class Simulator:
         rt_result.metadata["fx_graph_node_count"] = len(fx_result.compute_graph.nodes)
 
         # 4. Export
-        os.makedirs(output_dir, exist_ok=True)
-        self._log(f"=== Exporting to {output_dir} ===")
-
-        if "json" in output_formats:
-            p = os.path.join(output_dir, "simulation_result.json")
-            export_json(rt_result, p)
-            self._log(f"  JSON → {p}")
-
-        if "dot" in output_formats:
-            p = os.path.join(output_dir, "compute_graph.dot")
-            export_dot(rt_result.compute_graph, p, title="ComputeGraph")
-            self._log(f"  DOT  → {p}")
-
-        if "chrome_trace" in output_formats:
-            p = os.path.join(output_dir, "trace.json")
-            export_chrome_trace(rt_result, p)
-            self._log(f"  Chrome trace → {p}")
-
-        if "html" in output_formats:
-            p = os.path.join(output_dir, "trace.html")
-            export_html(rt_result, p)
-            self._log(f"  HTML trace → {p}")
-
-        if "text" in output_formats:
-            summary = export_text_summary(rt_result)
-            p = os.path.join(output_dir, "summary.txt")
-            with open(p, "w", encoding="utf-8") as f:
-                f.write(summary)
-            self._log(f"  Text summary → {p}")
-            if self.verbose:
-                print(summary)
+        export_result(
+            rt_result,
+            output_dir,
+            output_formats,
+            log_fn=self._log if self.verbose else None,
+            print_summary=self.verbose,
+        )
 
         return rt_result

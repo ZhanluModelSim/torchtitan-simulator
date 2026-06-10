@@ -140,6 +140,7 @@ def _run_simulation(
     world_size: int,
     output_formats: list[str],
 ) -> None:
+    from torchtitan.experiments.simulator.export import export_result
     from torchtitan.experiments.simulator.simulator import Simulator
 
     sim = Simulator(rank=rank, world_size=world_size, verbose=(rank == 0))
@@ -166,7 +167,13 @@ def _run_simulation(
 
     if mode == "fx":
         result = sim.simulate_fx(model_parts[0], example_inputs)
-        _export_result(result, output_dir, output_formats, sim)
+        export_result(
+            result,
+            output_dir,
+            output_formats,
+            log_fn=sim._log if sim.verbose else None,
+            print_summary=sim.verbose,
+        )
 
     elif mode == "runtime":
         result = sim.simulate_runtime(
@@ -175,7 +182,13 @@ def _run_simulation(
             pp_schedule=pp_schedule,
             pp_stages=pp_stages,
         )
-        _export_result(result, output_dir, output_formats, sim)
+        export_result(
+            result,
+            output_dir,
+            output_formats,
+            log_fn=sim._log if sim.verbose else None,
+            print_summary=sim.verbose,
+        )
 
     elif mode == "schedule":
         if pp_schedule is None:
@@ -184,7 +197,13 @@ def _run_simulation(
             )
             return
         result = sim.simulate_pp_schedule(pp_schedule)
-        _export_result(result, output_dir, output_formats, sim)
+        export_result(
+            result,
+            output_dir,
+            output_formats,
+            log_fn=sim._log if sim.verbose else None,
+            print_summary=sim.verbose,
+        )
 
     else:  # "all"
         result = sim.simulate_all(
@@ -195,47 +214,6 @@ def _run_simulation(
             output_dir=output_dir,
             output_formats=output_formats,
         )
-
-
-def _export_result(
-    result: Any, output_dir: str, output_formats: list[str], sim: Any
-) -> None:
-    from torchtitan.experiments.simulator.export import (
-        export_chrome_trace,
-        export_dot,
-        export_html,
-        export_json,
-        export_text_summary,
-    )
-
-    rank = int(os.environ.get("RANK", "0"))
-    if rank != 0:
-        return
-    os.makedirs(output_dir, exist_ok=True)
-    if "json" in output_formats:
-        p = os.path.join(output_dir, "simulation_result.json")
-        export_json(result, p)
-        sim._log(f"JSON → {p}")
-    if "dot" in output_formats:
-        p = os.path.join(output_dir, "compute_graph.dot")
-        export_dot(result.compute_graph, p)
-        sim._log(f"DOT  → {p}")
-    if "chrome_trace" in output_formats:
-        p = os.path.join(output_dir, "trace.json")
-        export_chrome_trace(result, p)
-        sim._log(f"Chrome trace → {p}")
-    if "html" in output_formats:
-        p = os.path.join(output_dir, "trace.html")
-        export_html(result, p)
-        sim._log(f"HTML trace → {p}")
-    if "text" in output_formats:
-        summary = export_text_summary(result)
-        p = os.path.join(output_dir, "summary.txt")
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(summary)
-        sim._log(f"Text summary → {p}")
-        if sim.verbose:
-            print(summary)
 
 
 def _build_model_cpu(

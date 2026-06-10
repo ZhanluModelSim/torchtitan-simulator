@@ -100,6 +100,19 @@ def _collect_output_metas(output: Any) -> list[TensorMeta]:
     return metas
 
 
+def compute_loss(
+    output: Any,
+    loss_fn: Any | None = None,
+    labels: Any | None = None,
+) -> torch.Tensor:
+    if loss_fn is not None and labels is not None:
+        return loss_fn(output, labels)
+    if isinstance(output, torch.Tensor):
+        return output.sum()
+    flat, _ = pytree.tree_flatten(output)
+    return sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
+
+
 class TraceRecorder:
     """Thread-safe container that accumulates :class:`OpNode` entries and
     data-flow edges during a unified trace session.
