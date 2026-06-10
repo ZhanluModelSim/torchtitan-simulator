@@ -192,7 +192,7 @@ def simulate_multi_rank_des(result: SimulationResult) -> float:
     Returns:
         Maximum finish time across all ranks (E2E step time in us).
     """
-    from .cost_model import link_schedule_to_graph
+    from .schedule_analysis import link_schedule_to_graph
 
     if result.schedule is None or len(result.schedule.events) == 0:
         return simulate_single_rank_des(result.compute_graph)
@@ -322,7 +322,7 @@ class DESEngine:
 
 def compute_des_utilization(result: SimulationResult) -> dict[str, Any]:
     """Compute DES engine utilization stats from annotated nodes/events."""
-    from .cost_model import _critical_path_time_us
+    from .schedule_analysis import _critical_path_time_us
 
     graph = result.compute_graph
     nodes = list(graph.nodes.values())
