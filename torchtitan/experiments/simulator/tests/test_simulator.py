@@ -324,21 +324,21 @@ class TestMemoryEstimator(unittest.TestCase):
 
 
 # ===========================================================================
-# Dispatch interceptor tests
+# Unified trace mode tests (replaces dispatch interceptor tests)
 # ===========================================================================
 
 
 class TestOpCaptureMode(unittest.TestCase):
     def test_captures_matmul(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder()
         a = torch.randn(4, 8)
         b = torch.randn(8, 4)
-        with capture_ops(recorder, phase="forward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
             torch.mm(a, b)
 
         assert len(recorder.nodes) > 0
@@ -346,58 +346,56 @@ class TestOpCaptureMode(unittest.TestCase):
         assert any("mm" in name.lower() for name in op_names), f"ops: {op_names}"
 
     def test_phase_labelling(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder()
         x = torch.randn(3, 3)
-        with capture_ops(recorder, phase="backward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="backward"):
             _ = x @ x
 
         phases = {n.phase for n in recorder.nodes}
         assert "backward" in phases
 
     def test_categorizes_relu(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder()
         x = torch.randn(4)
-        with capture_ops(recorder, phase="forward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
             torch.relu(x)
 
-        # relu is a compute op
         types = {n.op_type for n in recorder.nodes}
         assert "compute" in types
 
     def test_tensor_meta_captured(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder()
         x = torch.randn(3, 5)
-        with capture_ops(recorder, phase="forward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
             torch.sigmoid(x)
 
-        # At least one output shape should be (3, 5)
         shapes = [tuple(m.shape) for n in recorder.nodes for m in n.outputs]
         assert (3, 5) in shapes, f"shapes={shapes}"
 
     def test_runtime_data_edges_from_tensor_producers(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder()
         x = torch.randn(2, 2)
-        with capture_ops(recorder, phase="forward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
             y = torch.relu(x)
             _ = y + 1.0
 
@@ -468,15 +466,15 @@ class TestCommRecorder(unittest.TestCase):
             capture_comms,
             CommRecorder,
         )
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
         comm = CommRecorder(rank=0)
-        ops = OpRecorder()
+        ops = TraceRecorder()
         x = torch.ones(4)
-        with capture_ops(ops, phase="forward"):
+        with unified_trace(ops, use_fake_mode=False, phase="forward"):
             y = x + 1
             with capture_comms(comm):
                 dist.all_reduce(y)
@@ -574,37 +572,13 @@ class TestFxCapture(unittest.TestCase):
 
 
 # ===========================================================================
-# Graph assembler tests
+# Comm merge tests (moved from graph_assembler)
 # ===========================================================================
 
 
-class TestGraphAssembler(unittest.TestCase):
-    def _make_nodes(self, n: int):
-        from torchtitan.experiments.simulator.nodes import OpNode
-
-        return [
-            OpNode(
-                node_id=f"n{i}",
-                op_name=f"aten.op_{i}",
-                op_type="compute",
-                phase="forward",
-                inputs=[],
-                outputs=[],
-            )
-            for i in range(n)
-        ]
-
-    def test_from_runtime_sequential_edges(self):
-        from torchtitan.experiments.simulator.graph_assembler import GraphAssembler
-
-        nodes = self._make_nodes(4)
-        graph = GraphAssembler.from_runtime(nodes)
-        assert len(graph.nodes) == 4
-        # 3 sequential edges
-        assert len(graph.edges) == 3
-
+class TestMergeCommEvents(unittest.TestCase):
     def test_merge_comm_events(self):
-        from torchtitan.experiments.simulator.graph_assembler import GraphAssembler
+        from torchtitan.experiments.simulator.fx_capture import merge_comm_events
         from torchtitan.experiments.simulator.nodes import ComputeGraph
 
         graph = ComputeGraph()
@@ -616,7 +590,7 @@ class TestGraphAssembler(unittest.TestCase):
                 "phase": "backward",
             },
         ]
-        GraphAssembler.merge_comm_events(graph, comm_events)
+        merge_comm_events(graph, comm_events)
         assert len(graph.nodes) == 2
         types = {n.op_type for n in graph.nodes.values()}
         assert "comm_collective" in types

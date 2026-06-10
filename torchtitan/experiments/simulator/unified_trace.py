@@ -43,7 +43,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from ._recorder_registry import pop_recorder, push_recorder
 
-from .graph_assembler import comm_event_to_op_node
+from .fx_capture import comm_event_to_op_node
 from .nodes import (
     ComputeGraph,
     DataEdge,

@@ -47,6 +47,77 @@ from .nodes import ComputeGraph, DataEdge, OpNode, TensorMeta
 from .op_classification import classify_op, TRIVIAL_TARGETS
 
 
+def comm_event_to_op_node(
+    ev: dict[str, Any],
+    node_id: str | None = None,
+    phase_override: str | None = None,
+) -> OpNode:
+    nid = node_id or ev.get("event_id", "comm_unknown")
+    op_name = ev.get("op", "collective_unknown")
+    phase = phase_override or ev.get("phase", "unknown")
+
+    input_metas: list[TensorMeta] = []
+    output_metas: list[TensorMeta] = []
+    shape_entries = ev.get("tensor_shapes") or []
+    if not shape_entries:
+        tm = ev.get("tensor_meta")
+        if tm:
+            shape_entries = [tm]
+    for entry in shape_entries:
+        if entry is None:
+            continue
+        meta = TensorMeta(
+            shape=tuple(entry.get("shape", [])),
+            dtype=entry.get("dtype", "unknown"),
+            device=entry.get("device", "cpu"),
+            is_dtensor=entry.get("is_dtensor", False),
+            placements=entry.get("placements"),
+        )
+        input_metas.append(meta)
+        output_metas.append(meta)
+
+    return OpNode(
+        node_id=nid,
+        op_name=op_name,
+        op_type=ev.get("op_type", "comm_collective"),
+        phase=phase,
+        inputs=input_metas,
+        outputs=output_metas,
+        comm_op=op_name,
+        comm_group_size=ev.get("group_size"),
+        pp_stage=ev.get("pp_stage"),
+        microbatch_idx=ev.get("microbatch"),
+        attrs={
+            "group": str(ev.get("group", "")),
+            "tag": str(ev.get("tag", "")),
+            "src_rank": ev.get("src_rank"),
+            "dst_rank": ev.get("dst_rank"),
+            "rank": ev.get("rank"),
+        },
+    )
+
+
+def merge_comm_events(
+    graph: ComputeGraph,
+    comm_events: list[dict[str, Any]],
+    phase_override: str | None = None,
+) -> ComputeGraph:
+    for ev in comm_events:
+        node_id = ev.get("event_id", f"comm_{len(graph.nodes) + 1:07d}")
+        node = comm_event_to_op_node(ev, node_id=node_id, phase_override=phase_override)
+        graph.add_node(node)
+        for src_id in ev.get("source_node_ids", []):
+            if src_id in graph.nodes:
+                graph.add_edge(
+                    DataEdge(
+                        src_node_id=src_id,
+                        dst_node_id=node.node_id,
+                        edge_type="data",
+                    )
+                )
+    return graph
+
+
 def _tensor_meta_from_val(val: Any) -> TensorMeta | None:
     """Extract TensorMeta from a FakeTensor (the ``val`` field of an FX node)."""
     if not isinstance(val, torch.Tensor):

@@ -8,12 +8,11 @@
 Unified op classification logic shared between FX tracing and dispatch
 interception.
 
-Both ``fx_capture.py`` and ``dispatch_interceptor.py`` previously maintained
-their own copies of marker lists and classification functions with subtle
-differences (e.g. ``"broadcast_"`` vs ``"broadcast"``).  This module
-consolidates them into a single source of truth so that every compute-graph
-node receives the same ``op_type`` and ``comm_op`` labels regardless of which
-capture path produced it.
+Both ``fx_capture.py`` and ``unified_trace.py`` use this module to classify
+operators.  This module consolidates marker lists and classification functions
+into a single source of truth so that every compute-graph node receives the
+same ``op_type`` and ``comm_op`` labels regardless of which capture path
+produced it.
 
 Usage::
 
