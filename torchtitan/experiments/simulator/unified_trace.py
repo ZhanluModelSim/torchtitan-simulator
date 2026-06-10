@@ -41,6 +41,8 @@ import torch.utils._pytree as pytree
 from torch._subclasses import FakeTensorMode
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from ._recorder_registry import pop_recorder, push_recorder
+
 from .graph_assembler import comm_event_to_op_node
 from .nodes import (
     ComputeGraph,
@@ -250,9 +252,7 @@ class TraceRecorder:
                 tm["device"] = _normalize_device(tm.get("device", "cpu"))
                 normalized_ev["tensor_meta"] = tm
 
-            node_id = normalized_ev.get(
-                "event_id", f"comm_{len(graph.nodes) + 1:07d}"
-            )
+            node_id = normalized_ev.get("event_id", f"comm_{len(graph.nodes) + 1:07d}")
             comm_node = comm_event_to_op_node(normalized_ev, node_id=node_id)
             graph.add_node(comm_node)
             for src_id in normalized_ev.get("source_node_ids", []):
@@ -357,14 +357,6 @@ class UnifiedTraceMode(TorchDispatchMode):
         return result
 
 
-_RECORDER_STACK: list[TraceRecorder] = []
-
-
-def get_current_recorder() -> TraceRecorder | None:
-    """Return the innermost active :class:`TraceRecorder`, or ``None``."""
-    return _RECORDER_STACK[-1] if _RECORDER_STACK else None
-
-
 @contextmanager
 def unified_trace(
     recorder: TraceRecorder,
@@ -402,7 +394,7 @@ def unified_trace(
         The same ``recorder`` instance for convenience.
     """
     recorder.current_phase = phase
-    _RECORDER_STACK.append(recorder)
+    push_recorder(recorder)
 
     comm_recorder = None
     fsdp_recorder = None
@@ -439,4 +431,4 @@ def unified_trace(
     if capture_fsdp and fsdp_recorder is not None:
         recorder.fsdp_events = list(fsdp_recorder.events)
 
-    _RECORDER_STACK.pop()
+    pop_recorder()
