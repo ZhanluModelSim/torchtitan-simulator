@@ -33,7 +33,7 @@ from .memory_estimator import (
     finalize_memory_summary,
     merge_memory_summary,
 )
-from .nodes import DataEdge, OpNode, TensorMeta
+from .nodes import ComputeGraph, DataEdge, OpNode, SimulationResult, TensorMeta
 from .schedule_extract import extract_schedule_from_pytorch
 from .unified_trace import TraceRecorder, unified_trace
 
@@ -464,51 +464,173 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         local_valid_tokens += (labels != IGNORE_INDEX).sum()
         microbatches.append((input_dict, labels))
 
-    recorder = TraceRecorder(rank=rank)
-    model_part = trainer.model_parts[0]
     use_fake = comm_backend != "gloo"
     capture_comm = comm_backend == "gloo"
 
-    if use_fake:
-        first_input_dict, first_labels = microbatches[0]
-        example_inputs = (first_input_dict["input"].to("meta"),)
+    first_input_dict, first_labels = microbatches[0]
+
+    # -- Decide if we should multi-stage trace ----------
+    model_parts = getattr(trainer, "_pp_model_parts", None) or trainer.model_parts
+    pp_degree = len(model_parts)
+
+    if pp_degree > 1:
+        # === Multi-stage per-PP trace ===
+        # Move model parts back to meta device to avoid OOM with
+        # large models (1T+ parameters materialized on CPU)
+        for m in model_parts:
+            m.to_empty("meta")
+
+        from collections import Counter
+
+        all_nodes: list[OpNode] = []
+        all_edges: list[tuple[str, str, str]] = []
+
+        # Stage 0 uses real token ids; later stages use previous stage's output
+        prev_stage_output = None
+
+        for stage_idx, model_part in enumerate(model_parts):
+            logger.info(
+                "Tracing PP stage %d/%d (%d params)",
+                stage_idx + 1,
+                pp_degree,
+                sum(p.numel() for p in model_part.parameters()),
+            )
+
+            # All model parts are on meta device (we moved them above to
+            # avoid OOM). FakeTensorMode works with meta parameters on all
+            # stages so use_fake is always True for fake_backend mode.
+            use_fake_for_stage = use_fake
+
+            if stage_idx == 0:
+                if use_fake:
+                    stage_input = (first_input_dict["input"].to("meta"),)
+                else:
+                    stage_input = (first_input_dict["input"],)
+            else:
+                # For later stages: use prev stage's output directly.
+                stage_input = (prev_stage_output,)
+
+            recorder = TraceRecorder(rank=rank)
+            recorder._counter = (
+                stage_idx + 1
+            ) * 100000  # avoid node_id collision (0 is default initial)
+            recorder.current_pp_stage = stage_idx
+
+            with unified_trace(
+                recorder,
+                model_part,
+                stage_input,
+                use_fake_mode=use_fake_for_stage,
+                phase="forward",
+                capture_comm=capture_comm,
+                capture_fsdp=True,
+                model_parts=model_parts,
+            ):
+                output = model_part(*stage_input)
+
+                if isinstance(output, torch.Tensor):
+                    loss = output.sum()
+                else:
+                    import torch.utils._pytree as pytree
+
+                    flat, _ = pytree.tree_flatten(output)
+                    loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
+
+                recorder.current_phase = "backward"
+                loss.backward()
+
+            # Save output for next stage input
+            if isinstance(output, torch.Tensor):
+                prev_stage_output = output.detach()
+            elif isinstance(output, (list, tuple)):
+                tensors = [t for t in output if isinstance(t, torch.Tensor)]
+                prev_stage_output = tensors[0].detach() if tensors else None
+
+            logger.info(
+                "  Stage %d: %d nodes (%d fwd + %d bwd), %d edges",
+                stage_idx,
+                len(recorder.nodes),
+                sum(1 for n in recorder.nodes if n.phase == "forward"),
+                sum(1 for n in recorder.nodes if n.phase == "backward"),
+                len(recorder.edges),
+            )
+
+            all_nodes.extend(recorder.nodes)
+            all_edges.extend(recorder.edges)
+
+        # -- Merge per-stage ComputeGraphs -------------------
+        merged_graph = ComputeGraph()
+        for n in all_nodes:
+            merged_graph.add_node(n)
+        for src, dst, etype in all_edges:
+            merged_graph.add_edge(
+                DataEdge(src_node_id=src, dst_node_id=dst, edge_type=etype)
+            )
+
+        merged_graph.fix_comm_phase_labels()
+        merged_graph.add_phase_boundary_edges()
+
+        result = SimulationResult(
+            compute_graph=merged_graph,
+            comm_events=[],  # multi-stage doesn't capture comm events yet
+            metadata={
+                "mode": "unified_trace",
+                "device_mode": "meta",
+                "rank": rank,
+                "pp_degree": pp_degree,
+            },
+        )
+
+        stage_counts = Counter(n.pp_stage for n in merged_graph.nodes.values())
+        logger.info(
+            "Merged graph: %d nodes across %d stages: %s",
+            len(merged_graph.nodes),
+            len(stage_counts),
+            dict(stage_counts),
+        )
     else:
-        first_input_dict, first_labels = microbatches[0]
-        example_inputs = (first_input_dict["input"],)
+        # === Single-stage trace (original logic) ===
+        recorder = TraceRecorder(rank=rank)
+        model_part = model_parts[0]
 
-    with unified_trace(
-        recorder,
-        model_part,
-        example_inputs,
-        use_fake_mode=use_fake,
-        phase="forward",
-        capture_comm=capture_comm,
-        capture_fsdp=True,
-        model_parts=trainer.model_parts,
-    ):
-        output = model_part(*example_inputs)
-
-        if isinstance(output, torch.Tensor):
-            loss = output.sum()
+        if use_fake:
+            example_inputs = (first_input_dict["input"].to("meta"),)
         else:
-            import torch.utils._pytree as pytree
+            example_inputs = (first_input_dict["input"],)
 
-            flat, _ = pytree.tree_flatten(output)
-            loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
+        with unified_trace(
+            recorder,
+            model_part,
+            example_inputs,
+            use_fake_mode=use_fake,
+            phase="forward",
+            capture_comm=capture_comm,
+            capture_fsdp=True,
+            model_parts=trainer.model_parts,
+        ):
+            output = model_part(*example_inputs)
 
-        recorder.current_phase = "backward"
-        loss.backward()
+            if isinstance(output, torch.Tensor):
+                loss = output.sum()
+            else:
+                import torch.utils._pytree as pytree
 
-    result = recorder.build_result(
-        metadata={
-            "mode": "unified_trace",
-            "device_mode": "meta" if use_fake else "cpu",
-            "rank": rank,
-        }
-    )
+                flat, _ = pytree.tree_flatten(output)
+                loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
 
-    result.compute_graph.fix_comm_phase_labels()
-    result.compute_graph.add_phase_boundary_edges()
+            recorder.current_phase = "backward"
+            loss.backward()
+
+        result = recorder.build_result(
+            metadata={
+                "mode": "unified_trace",
+                "device_mode": "meta" if use_fake else "cpu",
+                "rank": rank,
+            }
+        )
+
+        result.compute_graph.fix_comm_phase_labels()
+        result.compute_graph.add_phase_boundary_edges()
 
     attach_model_state_memory(
         result,
@@ -570,13 +692,18 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         raise RuntimeError("simulation requires at least one microbatch")
     first_input_dict, first_labels = microbatches[0]
     example_inputs = (first_input_dict["input"],)
-    try:
-        result.metadata["fx_forward_graph"] = capture_forward_fx(
-            trainer.model_parts[0],
-            example_inputs,
-        ).to_dict()
-    except Exception as exc:
-        result.metadata["fx_forward_graph_error"] = str(exc)
+    # Skip fx_forward_graph capture for multi-stage traces - the per-stage
+    # model parts are on meta device and make_fx on 1T-param models is
+    # extremely slow (~minutes).  The 99998-node merged graph already
+    # contains all ops.
+    if pp_degree <= 1:
+        try:
+            result.metadata["fx_forward_graph"] = capture_forward_fx(
+                trainer.model_parts[0],
+                example_inputs,
+            ).to_dict()
+        except Exception as exc:
+            result.metadata["fx_forward_graph_error"] = str(exc)
     if sim_opts.capture_joint_fx:
 
         def _trainer_loss_adapter(pred: Any, labels: torch.Tensor) -> torch.Tensor:

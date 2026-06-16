@@ -39,6 +39,10 @@ from typing import Any
 import torch
 import torch.utils._pytree as pytree
 from torch._subclasses import FakeTensorMode
+
+# -- Meta / fake-kernel registration for ops without built-in impls ------
+
+from torch.library import register_fake
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from .nodes import (
@@ -52,6 +56,17 @@ from .nodes import (
     TrainingSchedule,
 )
 from .op_classification import classify_op, TRIVIAL_TARGETS
+
+
+@register_fake("aten::bincount")
+def meta_bincount(
+    self: torch.Tensor, weights: torch.Tensor | None = None, minlength: int = 0
+) -> torch.Tensor:
+    """Fake (shape-only) implementation of ``torch.bincount``."""
+    out_len = minlength
+    if out_len == 0 and self.numel() > 0:
+        out_len = self.shape[0]
+    return self.new_empty(out_len, dtype=torch.long)
 
 
 def _normalize_device(device_str: str) -> str:

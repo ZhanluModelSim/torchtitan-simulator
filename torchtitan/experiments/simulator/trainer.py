@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any
 
 import torch
+
+from torchtitan.tools.logging import logger
 
 from torchtitan.trainer import Trainer
 
@@ -140,6 +143,93 @@ def _cpu_noop_pipeline(model, parallelize_fn=None, **__):
     return None, [model], True, True
 
 
+def _cpu_pp_module_split(model: Any, config: Any, model_config: Any) -> list[Any]:
+    """PP-split model on CPU without PipelineStage/DeviceMesh.
+
+    Reuses upstream ``_generate_llm_fqn_per_model_part`` and
+    ``_split_module`` but skips ``_get_pipeline_metadata`` (which
+    depends on ``model_config.layers``).
+    """
+    from torchtitan.distributed.pipeline_parallel import (
+        _generate_llm_fqn_per_model_part,
+        _split_module,
+    )
+
+    pp_degree = int(getattr(config.parallelism, "pipeline_parallel_degree", 1) or 1)
+    schedule_name = str(
+        getattr(config.parallelism, "pipeline_parallel_schedule", "1F1B") or "1F1B"
+    )
+
+    from torch.distributed.pipelining.schedules import (
+        get_schedule_class,
+        PipelineScheduleSingle,
+    )
+
+    schedule_class = get_schedule_class(schedule_name)
+    is_single = issubclass(schedule_class, PipelineScheduleSingle)
+    vpp = 1 if is_single else 2
+    num_virtual_stages = pp_degree * vpp
+
+    n_layers = getattr(model_config, "n_layers", 0)
+    if not n_layers:
+        # Fallback: count from model.layers (ModuleDict or ModuleList)
+        layers_attr = getattr(model, "layers", None)
+        if layers_attr is not None:
+            n_layers = len(layers_attr)
+        else:
+            n_layers = 0
+
+    module_names = _generate_llm_fqn_per_model_part(
+        num_virtual_stages, n_layers, input_weight=1, output_weight=1
+    )
+
+    model_parts = []
+    for stage_module_names in module_names:
+        part = _split_module(model, stage_module_names)
+        model_parts.append(part)
+    return model_parts
+
+
+def _cpu_semantic_pipeline(
+    model: Any,
+    parallelize_fn: Any = None,
+    **kwargs: Any,
+) -> tuple[Any, list[Any], bool, bool]:
+    """PP-split model on CPU for multi-stage tracing
+
+    Accepts ``config`` and ``model_parts_holder`` via ``functools.partial``.
+    The upstream ``trainer.py`` passes ``model_config`` through kwargs
+    (the ``model_spec.model`` dataclass config with training overrides applied).
+    """
+    config = kwargs.get("config")
+    model_parts_holder = kwargs.get("model_parts_holder")
+    model_config = kwargs.get("model_config")
+
+    pp_degree = (
+        int(getattr(config.parallelism, "pipeline_parallel_degree", 1) if config else 1)
+        or 1
+    )
+
+    if parallelize_fn is not None:
+        model = parallelize_fn(model, **kwargs)
+
+    if pp_degree <= 1 or model_parts_holder is None:
+        return None, [model], True, True
+
+    model_parts = _cpu_pp_module_split(model, config, model_config)
+    # Move parts back to meta device immediately to avoid OOM for large
+    # models (1T+ parameters).  The Trainer loop that follows will call
+    # to_empty + init_weights on model_parts, which would materialize
+    # 1T+ floats on CPU.  We skip that path by setting parallel_dims.pp=0
+    # after super().__init__() and replacing model_parts with these meta
+    # copies.
+    for part in model_parts:
+        part.to_empty(device="meta")
+    model_parts_holder.clear()
+    model_parts_holder.extend(model_parts)
+    return None, model_parts, True, True
+
+
 def _set_fake_world_size(config: Any) -> None:
     """Set ``NGPU``/``WORLD_SIZE`` from parallelism config for semantic schedule mode.
 
@@ -171,15 +261,6 @@ class SimulationTrainer(Trainer):
     def __init__(self, config: Config):
         sim_opts = config.simulation
         comm_backend = getattr(sim_opts, "comm_backend", "") or ""
-        device_mode = getattr(sim_opts, "device_mode", "") or ""
-        if not device_mode:
-            device_mode = "meta" if comm_backend != "gloo" else "cpu"
-        sim_opts.device_mode = device_mode
-
-        if device_mode == "meta":
-            patch_device_type_to_meta()
-        else:
-            patch_device_type_to_cpu()
 
         pp = int(getattr(config.parallelism, "pipeline_parallel_degree", 1) or 1)
         tp = int(getattr(config.parallelism, "tensor_parallel_degree", 1) or 1)
@@ -196,6 +277,32 @@ class SimulationTrainer(Trainer):
         # via CommRecorder/FSDP hooks, not through init_distributed.
         config.comm.mode = "fake_backend"
 
+        # Override comm_backend: sim_opts.comm_backend defaults to "gloo" in
+        # config_registry, but the actual --comm.mode CLI override tells us
+        # the real backend.  Treat fake_backend as "no real comm".
+        actual_comm_mode = getattr(config.comm, "mode", "") or ""
+        if actual_comm_mode == "fake_backend":
+            comm_backend = ""
+
+        # Determine device_mode AFTER comm_backend finalization so that
+        # sim_opts.comm_backend="gloo" with --comm.mode=fake_backend correctly
+        # selects meta mode instead of being derailed by the default.
+        device_mode = getattr(sim_opts, "device_mode", "") or ""
+        if not device_mode:
+            device_mode = "meta" if comm_backend != "gloo" else "cpu"
+        sim_opts.device_mode = device_mode
+
+        if device_mode == "meta":
+            patch_device_type_to_meta()
+        else:
+            patch_device_type_to_cpu()
+
+        # When running in meta device mode, set deterministic seed explicitly
+        # to avoid set_determinism trying to broadcast a meta seed tensor.
+        if device_mode == "meta":
+            if config.debug.seed is None:
+                config.debug.seed = 42
+
         if comm_backend == "gloo":
             model_name = getattr(config.model_spec, "name", "")
             if "deepseek" in model_name.lower():
@@ -204,7 +311,17 @@ class SimulationTrainer(Trainer):
                 config.model_spec.parallelize_fn = _cpu_gloo_parallelize_llama
         else:
             config.model_spec.parallelize_fn = _cpu_noop_parallelize
-        config.model_spec.pipelining_fn = _cpu_noop_pipeline
+
+        # Use PP-semantic pipeline when PP > 1 and not gloo mode
+        self._pp_model_parts: list[Any] = []
+        if pp > 1 and comm_backend != "gloo":
+            config.model_spec.pipelining_fn = partial(
+                _cpu_semantic_pipeline,
+                config=config,
+                model_parts_holder=self._pp_model_parts,
+            )
+        else:
+            config.model_spec.pipelining_fn = _cpu_noop_pipeline
 
         super().__init__(config)
 
@@ -212,6 +329,13 @@ class SimulationTrainer(Trainer):
         self.parallel_dims.tp = 1
         self.parallel_dims.dp_shard = 1
         self.parallel_dims.dp_replicate = 1
+
+        # Replace self.model_parts with PP-split parts if PP semantic pipeline ran
+        if self._pp_model_parts:
+            self.model_parts = self._pp_model_parts
+            logger.info(
+                "PP-semantic pipeline: model split into %d parts", len(self.model_parts)
+            )
 
         # Apply FSDP1 wrapping after model is fully initialised on CPU.
         # Must happen after super().__init__() because the Trainer builds

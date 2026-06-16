@@ -109,15 +109,30 @@ class TestComputeGraph(unittest.TestCase):
 
         g = ComputeGraph()
         fwd = OpNode(
-            "f1", "compute_op", "compute", "forward", [], [],
+            "f1",
+            "compute_op",
+            "compute",
+            "forward",
+            [],
+            [],
             perf_result=PerfResult(total_time_us=10.0),
         )
         bwd = OpNode(
-            "b1", "compute_op", "compute", "backward", [], [],
+            "b1",
+            "compute_op",
+            "compute",
+            "backward",
+            [],
+            [],
             perf_result=PerfResult(total_time_us=20.0),
         )
         comm = OpNode(
-            "c1", "reduce_scatter", "comm_collective", "forward", [], [],
+            "c1",
+            "reduce_scatter",
+            "comm_collective",
+            "forward",
+            [],
+            [],
             comm_op="reduce_scatter",
             perf_result=PerfResult(comm_time_us=5.0, total_time_us=5.0),
         )
@@ -126,8 +141,9 @@ class TestComputeGraph(unittest.TestCase):
         g.add_node(comm)
         g.add_edge(DataEdge("b1", "c1", "data"))
         g.fix_comm_phase_labels()
-        assert g.nodes["c1"].phase == "backward", \
-            "comm node with only backward predecessors should be backward"
+        assert (
+            g.nodes["c1"].phase == "backward"
+        ), "comm node with only backward predecessors should be backward"
 
     def test_phase_boundary_sentinel_has_perf_result(self):
         from torchtitan.experiments.simulator.nodes import (
@@ -139,11 +155,21 @@ class TestComputeGraph(unittest.TestCase):
 
         g = ComputeGraph()
         fwd = OpNode(
-            "f1", "compute_op", "compute", "forward", [], [],
+            "f1",
+            "compute_op",
+            "compute",
+            "forward",
+            [],
+            [],
             perf_result=PerfResult(total_time_us=10.0),
         )
         bwd = OpNode(
-            "b1", "compute_op", "compute", "backward", [], [],
+            "b1",
+            "compute_op",
+            "compute",
+            "backward",
+            [],
+            [],
             perf_result=PerfResult(total_time_us=20.0),
         )
         g.add_node(fwd)
@@ -153,9 +179,12 @@ class TestComputeGraph(unittest.TestCase):
         g.add_phase_boundary_edges()
         sentinel = g.nodes["phase_end_forward"]
         assert sentinel.perf_result is not None, "sentinel should have PerfResult"
-        assert sentinel.perf_result.total_time_us == 0.0, "sentinel should have zero duration"
-        assert sentinel.perf_result.metadata.get("phase_boundary") is True, \
-            "sentinel PerfResult should be marked as phase_boundary"
+        assert (
+            sentinel.perf_result.total_time_us == 0.0
+        ), "sentinel should have zero duration"
+        assert (
+            sentinel.perf_result.metadata.get("phase_boundary") is True
+        ), "sentinel PerfResult should be marked as phase_boundary"
 
     def test_fix_comm_phase_labels_mixed_phase_deps_unchanged(self):
         from torchtitan.experiments.simulator.nodes import (
@@ -167,15 +196,30 @@ class TestComputeGraph(unittest.TestCase):
 
         g = ComputeGraph()
         fwd = OpNode(
-            "f1", "compute_op", "compute", "forward", [], [],
+            "f1",
+            "compute_op",
+            "compute",
+            "forward",
+            [],
+            [],
             perf_result=PerfResult(total_time_us=10.0),
         )
         bwd = OpNode(
-            "b1", "compute_op", "compute", "backward", [], [],
+            "b1",
+            "compute_op",
+            "compute",
+            "backward",
+            [],
+            [],
             perf_result=PerfResult(total_time_us=20.0),
         )
         comm = OpNode(
-            "c1", "all_reduce", "comm_collective", "forward", [], [],
+            "c1",
+            "all_reduce",
+            "comm_collective",
+            "forward",
+            [],
+            [],
             comm_op="all_reduce",
             perf_result=PerfResult(comm_time_us=5.0, total_time_us=5.0),
         )
@@ -185,8 +229,9 @@ class TestComputeGraph(unittest.TestCase):
         g.add_edge(DataEdge("f1", "c1", "data"))
         g.add_edge(DataEdge("b1", "c1", "data"))
         g.fix_comm_phase_labels()
-        assert g.nodes["c1"].phase == "forward", \
-            "comm node with mixed-phase predecessors should keep original phase"
+        assert (
+            g.nodes["c1"].phase == "forward"
+        ), "comm node with mixed-phase predecessors should keep original phase"
 
 
 class TestSimulationResultSave(unittest.TestCase):
@@ -870,7 +915,13 @@ class TestExportResultGatedToRankZero(unittest.TestCase):
 
         g = ComputeGraph()
         g.add_node(
-            OpNode("n1", "op1", "compute", "forward", perf_result=PerfResult(total_time_us=1.0))
+            OpNode(
+                "n1",
+                "op1",
+                "compute",
+                "forward",
+                perf_result=PerfResult(total_time_us=1.0),
+            )
         )
         result = SimulationResult(compute_graph=g)
 

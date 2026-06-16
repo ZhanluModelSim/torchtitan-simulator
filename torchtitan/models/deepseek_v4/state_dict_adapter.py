@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
@@ -19,6 +25,7 @@ from typing import Any
 import torch
 from torch.distributed.checkpoint import HuggingFaceStorageReader
 from torch.distributed.tensor import DTensor
+
 from torchtitan.models.deepseek_v3 import DeepSeekV3StateDictAdapter
 from torchtitan.models.utils import MoEStateDictAdapter
 

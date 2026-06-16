@@ -26,13 +26,12 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
 )
+
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
-from torchtitan.distributed.expert_parallel import (
-    ExpertParallel,
-    TensorParallel,
-)
+from torchtitan.distributed.expert_parallel import ExpertParallel, TensorParallel
+
 try:
     from torchtitan.distributed.expert_parallel import DeepEPExpertParallel
 except ImportError:
@@ -46,13 +45,12 @@ from torchtitan.models.llama3.parallelize import apply_fsdp as _apply_fsdp_upstr
 def apply_replicate(model: nn.Module, dp_mesh: DeviceMesh):
     return model
 
+
 def apply_fsdp(*args, **kwargs):
     return _apply_fsdp_upstream(*args, **kwargs)
 
-from .model import (
-    Attention,
-    DSAIndexerLossLoggingHelper,
-)
+
+from .model import Attention, DSAIndexerLossLoggingHelper
 
 
 logger = logging.getLogger(__name__)
@@ -147,7 +145,10 @@ def parallelize_deepseek_v4(
         maybe_enable_async_tp(parallelism, compile_config, tp_mesh)
 
     # Check if using DeepEP for MoE communication
-    if parallelism.expert_parallel_comm_backend == "deepep" and DeepEPExpertParallel is not None:
+    if (
+        parallelism.expert_parallel_comm_backend == "deepep"
+        and DeepEPExpertParallel is not None
+    ):
         if not parallel_dims.ep_enabled:
             raise ValueError(
                 "DeepEP requires expert parallelism (ep_degree > 1). "

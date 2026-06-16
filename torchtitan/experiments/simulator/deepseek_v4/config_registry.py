@@ -46,3 +46,45 @@ def deepseek_v4_sim_smoketest() -> SimulationTrainer.Config:
             comm_backend="gloo",
         ),
     )
+
+
+def deepseek_v4_pro_sim_smoketest() -> SimulationTrainer.Config:
+    """
+    DeepSeek V4 Pro 61-layer simulation config with full parallelism.
+
+    Topology: pp=8, tp=8, dp_shard=-1(auto), dp_replicate=1, ep=192
+    Global batch = 384, seq_len = 4096
+    """
+    return SimulationTrainer.Config(
+        loss=ChunkedCELoss.Config(),
+        hf_assets_path="./tests/assets/tokenizer",
+        model_spec=model_registry("v4_pro_debug_61_layers"),
+        optimizer=OptimizersContainer.Config(lr=1e-5),
+        training=TrainingConfig(
+            global_batch_size=384,
+            local_batch_size=1,
+            seq_len=4096,
+            steps=1,
+            max_norm=1.0,
+        ),
+        dataloader=SyntheticTokenDataLoader.Config(vocab_size=129280, seed=42),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        parallelism=ParallelismConfig(
+            pipeline_parallel_degree=8,
+            pipeline_parallel_schedule="Interleaved1F1B",
+            pipeline_parallel_microbatch_size=8,
+            tensor_parallel_degree=8,
+            data_parallel_shard_degree=-1,
+            data_parallel_replicate_degree=1,
+            expert_parallel_degree=192,
+            context_parallel_degree=1,
+        ),
+        checkpoint=CheckpointManager.Config(enable=False),
+        simulation=SimulationConfig(
+            output_dir="./simulator_output",
+            output_formats=["json", "dot", "chrome_trace", "html", "text"],
+            semantic_schedule=True,
+            cost_model=True,
+            comm_backend="gloo",
+        ),
+    )

@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
@@ -9,6 +15,7 @@ from typing import Literal
 import torch
 import torch.nn.functional as F
 from torch import nn
+
 from torchtitan.models.common import moe as common_moe
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.linear import Linear
@@ -42,9 +49,7 @@ class TokenReorderer(Module):
         _, token_indices_experts_sorted = torch.sort(
             selected_experts_indices.reshape(-1), stable=True
         )
-        token_indices_experts_sorted = (
-            token_indices_experts_sorted // self.top_k
-        )
+        token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
         token_counts = torch.bincount(
             selected_experts_indices.flatten().long(),
             minlength=self.num_experts,
@@ -262,9 +267,7 @@ class MoE(Module):
                 num_experts=num_experts,
                 top_k=moe_args.top_k,
             ),
-
         ).build()
-
 
         self.router = TokenChoiceTopKRouter.Config(
             dim=dim,
@@ -276,7 +279,9 @@ class MoE(Module):
             route_norm=moe_args.route_norm,
             route_scale=getattr(moe_args, "route_scale", 1.0),
             vocab_size=vocab_size,
-            debug_force_load_balance=getattr(moe_args, "debug_force_load_balance", False),
+            debug_force_load_balance=getattr(
+                moe_args, "debug_force_load_balance", False
+            ),
         ).build()
 
         self.reorderer = TokenReorderer(
@@ -348,7 +353,6 @@ class MoE(Module):
                 if isinstance(m, nn.Linear) and m.weight is not None:
                     nn.init.trunc_normal_(m.weight, mean=0.0, std=init_std)
 
-    # pyrefly: ignore [bad-override]
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Forward pass for the DeepSeek MoE module.

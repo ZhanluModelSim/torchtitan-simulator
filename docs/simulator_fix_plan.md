@@ -280,7 +280,7 @@ sched = ScheduleInterleaved1F1B(stages, n_microbatches=8)  # ✅ 成功
 ```python
 class MockPipelineStage:
     """Duck-typed mock that satisfies _PipelineSchedule.__init__ attribute reads.
-    
+
     Does NOT call dist.get_rank/get_world_size — works in single-process CPU mode.
     """
     def __init__(self, stage_index, num_stages, group_rank=0, group_size=1):
@@ -314,10 +314,10 @@ def extract_schedule_from_pytorch(
     virtual_stages_per_rank: int = 1,
 ) -> TrainingSchedule:
     """Construct a real PyTorch schedule with mock stages and extract its action table."""
-    
+
     schedule_class = get_schedule_class(schedule_name)
     is_multi = issubclass(schedule_class, PipelineScheduleMulti)
-    
+
     # Build mock stages for the local rank
     if is_multi:
         # Multi-stage: each local rank holds `virtual_stages_per_rank` stages
@@ -349,14 +349,14 @@ def extract_schedule_from_pytorch(
             n_microbatches=n_microbatches,
             scale_grads=False,
         )
-    
+
     # Extract action table — already populated by __init__
     pipeline_order = schedule.pipeline_order   # dict[int, list[_Action | None]]
-    
+
     # For multi-stage schedules, also read the lowered schedule with comms
     if hasattr(schedule, "pipeline_order_with_comms"):
         pipeline_order = schedule.pipeline_order_with_comms
-    
+
     # Convert _Action → ScheduleEvent, build deps from SEND→RECV pairs
     return _convert_pipeline_order_to_training_schedule(
         pipeline_order,
@@ -403,7 +403,7 @@ def _inject_semantic_schedule(result, config):
     parallelism = getattr(config, "parallelism", None)
     if parallelism is None:
         return
-    
+
     pp_degree = int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1)
     tp_degree = int(getattr(parallelism, "tensor_parallel_degree", 1) or 1)
     dp_shard = int(getattr(parallelism, "data_parallel_shard_degree", 1) or 1)
@@ -411,12 +411,12 @@ def _inject_semantic_schedule(result, config):
         dp_shard = 1
     dp_repl = int(getattr(parallelism, "data_parallel_replicate_degree", 1) or 1)
     dp_degree = dp_shard * dp_repl
-    
+
     schedule_name = str(getattr(parallelism, "pipeline_parallel_schedule", "1F1B") or "1F1B")
     num_mb = int(getattr(parallelism, "pipeline_parallel_microbatch_size", 8) or 8)
     virtual = 2 if "Interleaved" in schedule_name else 1
     num_stages = pp_degree * virtual
-    
+
     # 使用真实 PyTorch schedule 提取，而非自制生成器
     from .schedule_extract import extract_schedule_from_pytorch
     semantic = extract_schedule_from_pytorch(
@@ -428,7 +428,7 @@ def _inject_semantic_schedule(result, config):
         schedule_name=schedule_name,
         virtual_stages_per_rank=virtual,
     )
-    
+
     existing = result.schedule
     if existing is None:
         result.schedule = semantic
@@ -459,7 +459,7 @@ class TestScheduleExtract(unittest.TestCase):
         # Schedule1F1B: warmup = pp_size - 1 - rank = 3 forward for rank 0
         assert len(rank0_fwd) == 8
         assert len(rank0_bwd) == 8
-    
+
     def test_interleaved_1f1b_schedule_has_send_recv(self):
         """Interleaved1F1B 产出 SEND_F/RECV_F/SEND_B/RECV_B"""
         result = extract_schedule_from_pytorch(
@@ -472,22 +472,22 @@ class TestScheduleExtract(unittest.TestCase):
         assert "pp_recv_activation" in types
         assert "fsdp2_all_gather" in types  # UNSHARD
         assert "fsdp2_reduce_scatter" in types  # RESHARD
-    
+
     def test_gpipe_schedule(self):
         """GPipe: 全 forward → 全 backward"""
         ...
-    
+
     def test_send_recv_cross_rank_deps(self):
         """同 microbatch 的 SEND_F(stage=s) → RECV_F(stage=s+1) 有 pp_comm 依赖"""
         ...
-    
+
     def test_dp_gradient_sync_after_backward(self):
         """REDUCE_GRAD 事件在 backward 之后"""
         ...
-    
+
     def test_all_schedule_types(self):
         """所有支持的 schedule 类型都能成功提取"""
-        for name in ["1F1B", "GPipe", "Interleaved1F1B", "LoopedBFS", 
+        for name in ["1F1B", "GPipe", "Interleaved1F1B", "LoopedBFS",
                      "ZBVZeroBubble", "DualPipeV"]:
             result = extract_schedule_from_pytorch(...)
             assert len(result.events) > 0
@@ -657,7 +657,7 @@ PPScheduleExtractor 接收的 schedule 对象（由 TorchTitan `_build_pipeline_
 class PPScheduleExtractor:
     def extract(self) -> TrainingSchedule:
         schedule = self.schedule
-        
+
         # 直接读取 __init__ 中已计算好的 action table
         if hasattr(schedule, "pipeline_order_with_comms"):
             pipeline_order = schedule.pipeline_order_with_comms
@@ -670,7 +670,7 @@ class PPScheduleExtractor:
             ts = TrainingSchedule(metadata={...})
             self._build_schedule_heuristic(ts)
             return ts
-        
+
         # 共享转换函数
         return _convert_pipeline_order_to_training_schedule(
             pipeline_order,
@@ -725,7 +725,7 @@ def predict_multi_rank_step_time_us(result: SimulationResult, cost_model: CostMo
     """基于 schedule 的多 rank 依赖图做 critical-path，取最慢 rank 的完成时间。"""
     if result.schedule is None:
         return cost_model.predict_step_time_us(result.compute_graph)
-    
+
     # 1. 为每个 ScheduleEvent 分配估算时间
     #    - compute event: 从关联的 OpNode 取 perf_result
     #    - comm event: 从 cost_model 估算
@@ -816,7 +816,7 @@ tp_allreduce_count = num_layers * 2  # attn + FFN 各一次
   └── 1.6 单元测试 ← 依赖 1.1-1.5
   注意：此阶段消除了缺陷 #1-7 全部问题（warmup/steady-state/cooldown/依赖/通信），
        因为调度算法由 PyTorch 上游保证正确性
-  
+
 阶段 2 (合成通信 + cost_model 系统性错误)
   ├── 2.1 shape=numel → 2.2 dtype从config → 2.3 matmul FLOPs → 2.4-2.5 清理
   ├── 2.6 reduce_scatter → 2.7 all-reduce scaling → 2.8 deque → 2.9 graph edge

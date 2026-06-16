@@ -445,12 +445,14 @@ def _critical_path_time_us(graph: ComputeGraph) -> float:
     Returns:
         Longest path duration in microseconds, or 0.0 if graph is unannotated.
     """
-    # Build adjacency list
+    # Build adjacency list and reverse adjacency list
     adj: dict[str, list[str]] = {nid: [] for nid in graph.nodes}
+    rev_adj: dict[str, list[str]] = {nid: [] for nid in graph.nodes}
     in_degree: dict[str, int] = {nid: 0 for nid in graph.nodes}
     for edge in graph.edges:
         if edge.src_node_id in adj and edge.dst_node_id in adj:
             adj[edge.src_node_id].append(edge.dst_node_id)
+            rev_adj[edge.dst_node_id].append(edge.src_node_id)
             in_degree[edge.dst_node_id] = in_degree.get(edge.dst_node_id, 0) + 1
 
     # Topological sort
@@ -472,11 +474,11 @@ def _critical_path_time_us(graph: ComputeGraph) -> float:
         dur = 0.0
         if node and node.perf_result:
             dur = node.perf_result.total_time_us
-        # max finish time of predecessors
+        # max finish time of predecessors - use rev for O(1) lookup
         pred_finish = 0.0
-        for edge in graph.edges:
-            if edge.dst_node_id == u and edge.src_node_id in dist:
-                pred_finish = max(pred_finish, dist[edge.src_node_id])
+        for prev_id in rev_adj.get(u, []):
+            if prev_id in dist:
+                pred_finish = max(pred_finish, dist[prev_id])
         dist[u] = pred_finish + dur
         if dist[u] > max_time:
             max_time = dist[u]
@@ -552,10 +554,22 @@ def link_schedule_to_graph(result: SimulationResult) -> None:
     for event in result.schedule.events:
         phase = phase_map.get(event.event_type, "unknown")
         lookup_key = (phase, event.pp_stage, event.microbatch_idx)
+
+        # Try exact match: (phase, pp_stage, microbatch_idx)
         exact_matches = node_lookup.get(lookup_key, [])
 
         if exact_matches:
             event.op_node_ids = exact_matches
+        elif event.microbatch_idx is not None and event.pp_stage is not None:
+            # Events have concrete microbatch_idx and pp_stage but nodes
+            # may only have pp_stage (no microbatch_idx).  Fall back to
+            # matching on (phase, pp_stage) only.
+            fallback_key = (phase, event.pp_stage, None)
+            fallback = node_lookup.get(fallback_key, [])
+            if fallback:
+                event.op_node_ids = fallback
+            else:
+                event.op_node_ids = []
         elif has_stage_labels:
             # Multi-rank trace but no exact match → event has no
             # corresponding compute ops (e.g. PP send/recv)

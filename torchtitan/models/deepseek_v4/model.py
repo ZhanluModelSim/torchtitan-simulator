@@ -1,3 +1,9 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
@@ -13,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
+
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
@@ -713,7 +720,7 @@ class SparseAttention(Module):
             (query_states.shape[0], 1, query_states.shape[2], kv_states.shape[2] + 1),
             fill_value=torch.finfo(torch.bfloat16).min,
             dtype=torch.bfloat16,
-            device="cpu",
+            device=query_states.device,
         ).scatter_(-1, topk_idxs.unsqueeze(1), 0)
 
         attn_weights = attn_weights + index_mask[..., :-1]
@@ -1479,7 +1486,9 @@ class DeepSeekV4Model(BaseModel):
             self.moe_args.load_balance_coeff = self.load_balance_coeff
             self.moe_args.n_hash_layers = 0
             self.use_sfa = False
-            self.num_mtp_modules = getattr(trainer_config.training, "num_mtp_modules", 0)
+            self.num_mtp_modules = getattr(
+                trainer_config.training, "num_mtp_modules", 0
+            )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
@@ -1645,6 +1654,7 @@ class DeepSeekV4Model(BaseModel):
             self.freqs_cis = precompute_freqs_cis(self.model_args, True)
             self.freqs_cis_wo_compressor = precompute_freqs_cis(self.model_args, False)
             import scipy  # lazy import — only needed for hadamard matrix
+
             self.hadamard_mat = torch.tensor(
                 # pyrefly: ignore [implicit-import]
                 scipy.linalg.hadamard(self.model_args.index_head_dim, float),
