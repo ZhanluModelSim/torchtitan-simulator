@@ -556,6 +556,7 @@ def _json_script_payload(result: SimulationResult) -> str:
     node_count = len(result.compute_graph.nodes)
     _populate_des_metadata(result)
     if node_count > 10000:
+        # For large graphs, embed a sampled subset for visualization
         schedule_data = None
         if result.schedule is not None:
             schedule_data = result.schedule.to_dict()
@@ -566,12 +567,40 @@ def _json_script_payload(result: SimulationResult) -> str:
         _inject_schedule_timing(
             {"schedule": schedule_data} if schedule_data else {}, result
         )
+        
+        # Sample nodes: first 500 per (phase, pp_stage) group
+        from collections import defaultdict
+        sampled_nodes = []
+        groups = defaultdict(list)
+        for node in result.compute_graph.nodes.values():
+            key = (node.phase, node.pp_stage)
+            groups[key].append(node)
+        
+        sampled_node_ids = set()
+        for key, nodes_in_group in groups.items():
+            # Take first 500 nodes from each group
+            for node in nodes_in_group[:500]:
+                sampled_nodes.append(node.to_dict())
+                sampled_node_ids.add(node.node_id)
+        
+        # Include edges between sampled nodes
+        sampled_edges = [
+            edge.to_dict()
+            for edge in result.compute_graph.edges
+            if edge.src_node_id in sampled_node_ids and edge.dst_node_id in sampled_node_ids
+        ]
+        
         compact: dict[str, Any] = {
             "metadata": result.metadata,
             "schedule": schedule_data,
-            "compute_graph_summary": result.compute_graph.summary(),
-            "node_count": node_count,
-            "edge_count": len(result.compute_graph.edges),
+            "compute_graph": {
+                "nodes": sampled_nodes,
+                "edges": sampled_edges,
+                "sampled": True,
+                "total_nodes": node_count,
+                "total_edges": len(result.compute_graph.edges),
+            },
+            "memory_events": [e.to_dict() for e in result.memory_events[:1000]],  # Limit memory events
         }
         return escape(json.dumps(compact, default=str), quote=False)
     data = result.to_dict()
