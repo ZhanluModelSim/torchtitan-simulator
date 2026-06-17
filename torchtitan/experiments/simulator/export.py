@@ -646,7 +646,12 @@ def _compress_graph_by_stage_similarity(result: SimulationResult) -> dict[str, A
     node_id_map = {}  # old_id -> new_id
     for (phase, stage) in kept_stages:
         nodes = groups[(phase, stage)]
-        for node in nodes:
+        # Limit nodes per stage to keep JSON size manageable
+        # Prioritize compute nodes over trivial ops
+        compute_nodes = [n for n in nodes if n.op_type == 'compute']
+        other_nodes = [n for n in nodes if n.op_type != 'compute']
+        limited_nodes = (compute_nodes[:200] + other_nodes[:50])[:250]
+        for node in limited_nodes:
             node_dict = node.to_dict()
             node_id_map[node.node_id] = node.node_id
             compressed_nodes.append(node_dict)
