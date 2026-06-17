@@ -239,14 +239,16 @@ def _set_fake_world_size(config: Any) -> None:
     import os
 
     p = config.parallelism
-    world = 1
-    world *= int(getattr(p, "pipeline_parallel_degree", 1) or 1)
-    world *= int(getattr(p, "tensor_parallel_degree", 1) or 1)
+    pp = int(getattr(p, "pipeline_parallel_degree", 1) or 1)
+    tp = int(getattr(p, "tensor_parallel_degree", 1) or 1)
+    cp = int(getattr(p, "context_parallel_degree", 1) or 1)
+    ep = int(getattr(p, "expert_parallel_degree", 1) or 1)
     dp_shard = int(getattr(p, "data_parallel_shard_degree", -1) or -1)
     dp_repl = int(getattr(p, "data_parallel_replicate_degree", 1) or 1)
     if dp_shard < 0:
-        dp_shard = 1
-    world *= dp_shard * dp_repl
+        min_dp_shard = max(1, -(-ep // (cp * tp))) if ep > cp * tp else 1
+        dp_shard = min_dp_shard
+    world = pp * tp * cp * dp_shard * dp_repl
     os.environ["NGPU"] = str(world)
     os.environ["WORLD_SIZE"] = str(world)
     os.environ["LOCAL_RANK"] = "0"

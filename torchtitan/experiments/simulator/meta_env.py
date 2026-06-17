@@ -41,7 +41,7 @@ def _make_meta_device_module():
         device_capability=lambda device=None: (0, 0),
         get_device_name=lambda device=None: "Meta_Simulator",
         get_device_properties=lambda device=None: types.SimpleNamespace(
-            name="Meta_Simulator", total_memory=0
+            name="Meta_Simulator", total_memory=80 * 1024**3
         ),
         get_arch_list=lambda: [],
         synchronize=lambda: None,

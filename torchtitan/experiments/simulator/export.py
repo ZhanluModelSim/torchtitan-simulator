@@ -55,7 +55,8 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
     """
     Serialize a :class:`SimulationResult` to a JSON file.
 
-    The output is pretty-printed with ``indent=2`` for readability.
+    Uses compact separators for large results (>10K nodes) to reduce
+    file size and serialization time.  Pretty-prints small results.
 
     Args:
         result: The simulation result to serialize.
@@ -65,8 +66,13 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
     _populate_des_metadata(result)
     data = result.to_dict()
     _inject_schedule_timing(data, result)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, default=str)
+    node_count = len(result.compute_graph.nodes)
+    if node_count > 10000:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"), default=str)
+    else:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +528,8 @@ def _add_aggregated_phase_events(
 
 
 def _populate_des_metadata(result: SimulationResult) -> None:
+    if "des_engine" in result.metadata:
+        return
     has_des_nodes = any(
         n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
     )
@@ -545,9 +553,29 @@ def _populate_des_metadata(result: SimulationResult) -> None:
 
 
 def _json_script_payload(result: SimulationResult) -> str:
+    node_count = len(result.compute_graph.nodes)
+    _populate_des_metadata(result)
+    if node_count > 10000:
+        schedule_data = None
+        if result.schedule is not None:
+            schedule_data = result.schedule.to_dict()
+            for ev in schedule_data.get("events", []):
+                if len(ev.get("op_node_ids", [])) > 100:
+                    ev["op_node_ids"] = ev["op_node_ids"][:100]
+                    ev["op_node_ids_truncated"] = True
+        _inject_schedule_timing(
+            {"schedule": schedule_data} if schedule_data else {}, result
+        )
+        compact: dict[str, Any] = {
+            "metadata": result.metadata,
+            "schedule": schedule_data,
+            "compute_graph_summary": result.compute_graph.summary(),
+            "node_count": node_count,
+            "edge_count": len(result.compute_graph.edges),
+        }
+        return escape(json.dumps(compact, default=str), quote=False)
     data = result.to_dict()
     _inject_schedule_timing(data, result)
-    _populate_des_metadata(result)
     if "des_engine" in result.metadata:
         data["metadata"]["des_engine"] = result.metadata["des_engine"]
     if "des_memory" in result.metadata:
@@ -865,7 +893,6 @@ def export_html(
     peak_memory = memory_summary.get(
         "peak_live_bytes", memory_summary.get("graph_peak_live_bytes", 0)
     )
-    # Compute perf grand total for summary card
     cost_summary = result.metadata.get("cost_model", {}) or {}
     perf_grand_total_us = cost_summary.get("e2e_step_time_us", 0)
     data_payload = _json_script_payload(result)
@@ -908,6 +935,11 @@ def export_html(
             for phase in step_phases
         )
 
+    event_ids_per_step: dict[int, set[str]] = {}
+    for ev in schedule_events:
+        step = _event_step(ev)
+        event_ids_per_step.setdefault(step, set()).add(ev.get("event_id"))
+
     step_sections = "\n".join(
         f"""
         <details open>
@@ -916,7 +948,7 @@ def export_html(
             <summary>PP / FSDP2 / TP / DP / communication schedule swimlanes</summary>
             {_render_swimlane_canvas(
                 [ev for ev in schedule_events if _event_step(ev) == step],
-                [dep for dep in schedule_deps if dep.get("from") in {ev.get("event_id") for ev in schedule_events if _event_step(ev) == step} and dep.get("to") in {ev.get("event_id") for ev in schedule_events if _event_step(ev) == step}],
+                [dep for dep in schedule_deps if dep.get("from") in event_ids_per_step.get(step, set()) and dep.get("to") in event_ids_per_step.get(step, set())],
                 step=step,
             )}
           </details>

@@ -32,18 +32,22 @@ class TensorMeta:
     @classmethod
     def from_tensor(cls, t: Any) -> "TensorMeta":
         import torch
-        from torch.distributed.tensor import DTensor
 
         if not isinstance(t, torch.Tensor):
             raise TypeError(f"Expected torch.Tensor, got {type(t)}")
 
-        is_dtensor = isinstance(t, DTensor)
+        is_dtensor = False
         placements = None
-        if is_dtensor:
-            placements = [str(p) for p in t.placements]
-        shape = tuple(t.shape)
+        try:
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(t, DTensor):
+                is_dtensor = True
+                placements = [str(p) for p in t.placements]
+        except ImportError:
+            pass
         return cls(
-            shape=shape,
+            shape=tuple(t.shape),
             dtype=str(t.dtype),
             device=str(t.device),
             is_dtensor=is_dtensor,

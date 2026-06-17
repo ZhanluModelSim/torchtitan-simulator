@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import torch
@@ -469,6 +470,8 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
     first_input_dict, first_labels = microbatches[0]
 
+    sim_t0 = time.monotonic()
+
     # -- Decide if we should multi-stage trace ----------
     model_parts = getattr(trainer, "_pp_model_parts", None) or trainer.model_parts
     pp_degree = len(model_parts)
@@ -478,7 +481,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         # Move model parts back to meta device to avoid OOM with
         # large models (1T+ parameters materialized on CPU)
         for m in model_parts:
-            m.to_empty("meta")
+            m.to_empty(device="meta")
 
         from collections import Counter
 
@@ -588,6 +591,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
             len(stage_counts),
             dict(stage_counts),
         )
+        logger.info(
+            "Multi-stage tracing completed in %.2fs (%d nodes, %d edges)",
+            time.monotonic() - sim_t0,
+            len(merged_graph.nodes),
+            len(merged_graph.edges),
+        )
     else:
         # === Single-stage trace (original logic) ===
         recorder = TraceRecorder(rank=rank)
@@ -631,6 +640,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
         result.compute_graph.fix_comm_phase_labels()
         result.compute_graph.add_phase_boundary_edges()
+        logger.info(
+            "Single-stage tracing completed in %.2fs (%d nodes, %d edges)",
+            time.monotonic() - sim_t0,
+            len(result.compute_graph.nodes),
+            len(result.compute_graph.edges),
+        )
 
     attach_model_state_memory(
         result,
@@ -732,5 +747,18 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         "html",
         "text",
     ]
+    t_export = time.monotonic()
     _export_result(result, sim_opts.output_dir, output_formats)
-    logger.info("Simulation outputs written to %s", sim_opts.output_dir)
+    logger.info(
+        "Simulation outputs written to %s (export %.2fs, total %.2fs)",
+        sim_opts.output_dir,
+        time.monotonic() - t_export,
+        time.monotonic() - sim_t0,
+    )
+    result.metadata["timing"] = {
+        "tracing_s": round(t_export - sim_t0, 2),
+        "export_s": round(time.monotonic() - t_export, 2),
+        "total_s": round(time.monotonic() - sim_t0, 2),
+        "node_count": len(result.compute_graph.nodes),
+        "edge_count": len(result.compute_graph.edges),
+    }

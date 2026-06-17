@@ -31,7 +31,6 @@ which propagate into the resulting :class:`OpNode` entries.
 from __future__ import annotations
 
 import contextlib
-import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
@@ -69,50 +68,78 @@ def meta_bincount(
     return self.new_empty(out_len, dtype=torch.long)
 
 
+_DTensor: type | None = None
+_DTensor_RESOLVED = False
+
+
+def _resolve_dtensor() -> type | None:
+    global _DTensor, _DTensor_RESOLVED
+    if not _DTensor_RESOLVED:
+        try:
+            from torch.distributed.tensor import DTensor
+
+            _DTensor = DTensor
+        except ImportError:
+            _DTensor = None
+        _DTensor_RESOLVED = True
+    return _DTensor
+
+
 def _normalize_device(device_str: str) -> str:
-    """Map ``\"meta\"`` → ``\"cpu\"`` for output ``TensorMeta`` compatibility."""
     if device_str == "meta":
         return "cpu"
     return device_str
 
 
-def _collect_tensor_metas(args: Any, kwargs: Any) -> list[TensorMeta]:
-    """Extract ``TensorMeta`` from a pytree of args/kwargs, normalising device."""
+def _tensor_to_meta(t: torch.Tensor) -> TensorMeta:
+    dtensor_cls = _resolve_dtensor()
+    is_dtensor = dtensor_cls is not None and isinstance(t, dtensor_cls)
+    placements = None
+    if is_dtensor:
+        placements = [str(p) for p in t.placements]  # pyrefly: ignore [missing-attribute]
+    device = str(t.device)
+    if device == "meta":
+        device = "cpu"
+    return TensorMeta(
+        shape=tuple(t.shape),
+        dtype=str(t.dtype),
+        device=device,
+        is_dtensor=is_dtensor,
+        placements=placements,
+        requires_grad=t.requires_grad,
+    )
+
+
+def _collect_all(
+    args: Any, kwargs: Any
+) -> tuple[list[TensorMeta], list[torch.Tensor]]:
     flat, _ = pytree.tree_flatten((args, kwargs))
     metas: list[TensorMeta] = []
+    tensors: list[torch.Tensor] = []
     for item in flat:
         if isinstance(item, torch.Tensor):
+            tensors.append(item)
             try:
-                tm = TensorMeta.from_tensor(item)
-                tm.device = _normalize_device(tm.device)
-                metas.append(tm)
+                metas.append(_tensor_to_meta(item))
             except Exception:
                 pass
-    return metas
+    return metas, tensors
 
 
-def _collect_input_tensors(args: Any, kwargs: Any) -> list[torch.Tensor]:
-    flat, _ = pytree.tree_flatten((args, kwargs))
-    return [item for item in flat if isinstance(item, torch.Tensor)]
-
-
-def _collect_output_tensors(output: Any) -> list[torch.Tensor]:
-    flat, _ = pytree.tree_flatten(output)
-    return [item for item in flat if isinstance(item, torch.Tensor)]
-
-
-def _collect_output_metas(output: Any) -> list[TensorMeta]:
+def _collect_output_all(
+    output: Any,
+) -> tuple[list[TensorMeta], list[torch.Tensor]]:
     flat, _ = pytree.tree_flatten(output)
     metas: list[TensorMeta] = []
+    tensors: list[torch.Tensor] = []
     for item in flat:
         if isinstance(item, torch.Tensor):
+            tensors.append(item)
             try:
-                tm = TensorMeta.from_tensor(item)
-                tm.device = _normalize_device(tm.device)
-                metas.append(tm)
+                metas.append(_tensor_to_meta(item))
             except Exception:
                 pass
-    return metas
+    return metas, tensors
 
 
 class TraceRecorder:
@@ -130,7 +157,6 @@ class TraceRecorder:
 
     def __init__(self, rank: int = 0) -> None:
         self.rank = rank
-        self._lock = threading.Lock()
         self._counter: int = 0
         self.nodes: list[OpNode] = []
         self.edges: list[tuple[str, str, str]] = []
@@ -144,25 +170,23 @@ class TraceRecorder:
         self._pp_deps: list[dict[str, Any]] = []
 
     def _next_id(self) -> str:
-        with self._lock:
-            self._counter += 1
-            return f"ut_{self._counter:07d}"
+        self._counter += 1
+        return f"ut_{self._counter:07d}"
 
     def record(
         self,
-        func: Any,
+        func_name: str,
+        op_type: str,
+        comm_op: str | None,
         input_metas: list[TensorMeta],
         output_metas: list[TensorMeta],
         input_tensors: list[torch.Tensor],
         output_tensors: list[torch.Tensor],
         attrs: dict[str, Any] | None = None,
     ) -> OpNode:
-        """Record a dispatched op and return the corresponding :class:`OpNode`."""
-        func_name = str(func)
-        op_type, comm_op = classify_op(func_name)
-
+        node_id = self._next_id()
         node = OpNode(
-            node_id=self._next_id(),
+            node_id=node_id,
             op_name=func_name,
             op_type=op_type,
             phase=self.current_phase,
@@ -173,31 +197,28 @@ class TraceRecorder:
             microbatch_idx=self.current_microbatch,
             comm_op=comm_op,
         )
-        with self._lock:
-            input_producers = set()
-            for t in input_tensors:
-                producer = self._tensor_producer.get(id(t))
-                if producer is not None:
-                    input_producers.add(producer)
-            for producer in sorted(input_producers):
-                self.edges.append((producer, node.node_id, "data"))
-
-            self.nodes.append(node)
-            for t in output_tensors:
-                self._tensor_producer[id(t)] = node.node_id
+        seen: set[str] = set()
+        tp = self._tensor_producer
+        edges = self.edges
+        for t in input_tensors:
+            producer = tp.get(id(t))
+            if producer is not None and producer not in seen:
+                seen.add(producer)
+                edges.append((producer, node_id, "data"))
+        self.nodes.append(node)
+        for t in output_tensors:
+            tp[id(t)] = node_id
         return node
 
     def get_producer(self, tensor: torch.Tensor | None) -> str | None:
         if tensor is None:
             return None
-        with self._lock:
-            return self._tensor_producer.get(id(tensor))
+        return self._tensor_producer.get(id(tensor))
 
     def set_producer(self, tensor: torch.Tensor | None, node_id: str) -> None:
         if tensor is None:
             return
-        with self._lock:
-            self._tensor_producer[id(tensor)] = node_id
+        self._tensor_producer[id(tensor)] = node_id
 
     def build_result(
         self,
@@ -358,23 +379,27 @@ class UnifiedTraceMode(TorchDispatchMode):
 
         func_name = str(func)
 
+        if func_name in TRIVIAL_TARGETS:
+            return func(*args, **kwargs)
+
         result = func(*args, **kwargs)
 
-        if func_name in TRIVIAL_TARGETS:
-            return result
+        input_metas, input_tensors = _collect_all(args, kwargs)
+        output_metas, output_tensors = _collect_output_all(result)
 
-        input_metas = _collect_tensor_metas(args, kwargs)
-        output_metas = _collect_output_metas(result)
-        input_tensors = _collect_input_tensors(args, kwargs)
-        output_tensors = _collect_output_tensors(result)
+        op_type, comm_op = classify_op(func_name)
 
-        attrs: dict[str, Any] = {}
+        attrs: dict[str, Any] | None = None
         for i, arg in enumerate(args):
             if isinstance(arg, (int, float, bool, str)):
+                if attrs is None:
+                    attrs = {}
                 attrs[f"arg_{i}"] = arg
 
         self.recorder.record(
-            func,
+            func_name,
+            op_type,
+            comm_op,
             input_metas,
             output_metas,
             input_tensors=input_tensors,

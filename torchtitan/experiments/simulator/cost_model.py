@@ -283,10 +283,14 @@ class CostModel:
         self.estimate_graph(result.compute_graph)
 
     def predict_step_time_us(self, graph: ComputeGraph) -> float:
-        """Predict total step time using salabim DES engine.
+        """Predict total step time using critical-path analysis.
 
-        Models compute/comm resource contention and overlap.
-        Subclasses may override with more sophisticated models.
+        Uses topological longest-path algorithm (O(V+E)) which is much
+        faster than DES for large graphs.  For graphs with >10K nodes,
+        DES is prohibitively slow (44s vs 0.1s for critical path).
+
+        Models compute/comm resource contention via separate resource
+        tracking in the critical path algorithm.
 
         Args:
             graph: Annotated graph (must have ``perf_result`` on every node).
@@ -294,9 +298,7 @@ class CostModel:
         Returns:
             Predicted step time in microseconds.
         """
-        from .des_engine import simulate_single_rank_des
-
-        return simulate_single_rank_des(graph)
+        return _critical_path_time_us(graph)
 
 
 # ---------------------------------------------------------------------------
@@ -424,10 +426,8 @@ class MockCostModel(CostModel):
         )
 
     def predict_step_time_us(self, graph: ComputeGraph) -> float:
-        """Predict step time using salabim DES engine."""
-        from .des_engine import simulate_single_rank_des
-
-        return simulate_single_rank_des(graph)
+        """Predict step time using critical-path analysis."""
+        return _critical_path_time_us(graph)
 
 
 # ---------------------------------------------------------------------------
