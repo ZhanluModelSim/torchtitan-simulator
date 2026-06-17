@@ -44,6 +44,7 @@ from torch._subclasses import FakeTensorMode
 from torch.library import register_fake
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from ._recorder_registry import get_current_recorder, pop_recorder, push_recorder
 from .nodes import (
     ComputeGraph,
     DataEdge,
@@ -420,14 +421,6 @@ class UnifiedTraceMode(TorchDispatchMode):
         return result
 
 
-_RECORDER_STACK: list[TraceRecorder] = []
-
-
-def get_current_recorder() -> TraceRecorder | None:
-    """Return the innermost active :class:`TraceRecorder`, or ``None``."""
-    return _RECORDER_STACK[-1] if _RECORDER_STACK else None
-
-
 @contextmanager
 def unified_trace(
     recorder: TraceRecorder,
@@ -465,7 +458,7 @@ def unified_trace(
         The same ``recorder`` instance for convenience.
     """
     recorder.current_phase = phase
-    _RECORDER_STACK.append(recorder)
+    push_recorder(recorder)
 
     comm_recorder = None
     fsdp_recorder = None
@@ -502,4 +495,4 @@ def unified_trace(
     if capture_fsdp and fsdp_recorder is not None:
         recorder.fsdp_events = list(fsdp_recorder.events)
 
-    _RECORDER_STACK.pop()
+    pop_recorder()
