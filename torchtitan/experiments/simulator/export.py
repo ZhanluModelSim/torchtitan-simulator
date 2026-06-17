@@ -1282,10 +1282,11 @@ def export_html(
         return 'Vec';
       }}
       
-      // Build dependency graph and topological sort
+      // Build dependency graph
       const nodeMap = new Map(nodes.map(n => [n.node_id, n]));
       const inDegree = new Map(nodes.map(n => [n.node_id, 0]));
       const adjList = new Map(nodes.map(n => [n.node_id, []]));
+      const reverseAdjList = new Map(nodes.map(n => [n.node_id, []]));
       
       edges.forEach(e => {{
         if (inDegree.has(e.dst)) {{
@@ -1293,6 +1294,9 @@ def export_html(
         }}
         if (adjList.has(e.src)) {{
           adjList.get(e.src).push(e.dst);
+        }}
+        if (reverseAdjList.has(e.dst)) {{
+          reverseAdjList.get(e.dst).push(e.src);
         }}
       }});
       
@@ -1318,9 +1322,9 @@ def export_html(
         if (!sorted.includes(n.node_id)) sorted.push(n.node_id);
       }});
       
-      // Organize operators by lane and calculate cumulative time
-      const lanes = {{ 'Cube': [], 'Vec': [], 'Communication': [] }};
-      const laneTime = {{ 'Cube': 0, 'Vec': 0, 'Communication': 0 }};
+      // Calculate start times respecting dependencies
+      // Each operator starts after ALL its dependencies complete
+      const operatorTimes = new Map(); // nodeId -> {{start, end, lane, duration}}
       
       sorted.forEach(nodeId => {{
         const node = nodeMap.get(nodeId);
@@ -1328,10 +1332,21 @@ def export_html(
         
         const lane = classifyOperator(node);
         const duration = node.perf_result?.total_time_us || 0;
-        const startTime = laneTime[lane];
+        
+        // Find the maximum end time of all dependencies
+        let maxDependencyEndTime = 0;
+        const dependencies = reverseAdjList.get(nodeId) || [];
+        dependencies.forEach(depId => {{
+          const depTime = operatorTimes.get(depId);
+          if (depTime && depTime.end > maxDependencyEndTime) {{
+            maxDependencyEndTime = depTime.end;
+          }}
+        }});
+        
+        const startTime = maxDependencyEndTime;
         const endTime = startTime + duration;
         
-        lanes[lane].push({{
+        operatorTimes.set(nodeId, {{
           nodeId: node.node_id,
           opName: (node.op_name || 'unknown').replace('aten.', '').replace('.default', ''),
           opType: node.op_type,
@@ -1340,8 +1355,17 @@ def export_html(
           duration: duration,
           lane: lane
         }});
-        
-        laneTime[lane] = endTime;
+      }});
+      
+      // Organize operators by lane
+      const lanes = {{ 'Cube': [], 'Vec': [], 'Communication': [] }};
+      operatorTimes.forEach((op, nodeId) => {{
+        lanes[op.lane].push(op);
+      }});
+      
+      // Sort each lane by start time
+      Object.keys(lanes).forEach(laneName => {{
+        lanes[laneName].sort((a, b) => a.start - b.start);
       }});
       
       // Prepare ECharts data
@@ -1353,6 +1377,8 @@ def export_html(
       }};
       
       const seriesData = [];
+      let maxTime = 0;
+      
       laneNames.forEach((laneName, laneIdx) => {{
         lanes[laneName].forEach(op => {{
           seriesData.push({{
@@ -1361,10 +1387,9 @@ def export_html(
             itemStyle: {{ color: laneColors[laneName] }},
             op: op
           }});
+          if (op.end > maxTime) maxTime = op.end;
         }});
       }});
-      
-      const maxTime = Math.max(...Object.values(laneTime), 1);
       
       // Initialize ECharts
       const chart = echarts.init(container);
@@ -1373,7 +1398,9 @@ def export_html(
           trigger: 'item',
           formatter: function(params) {{
             const op = params.data.op;
-            return `<div style="padding:10px;min-width:200px;">
+            const deps = reverseAdjList.get(op.nodeId) || [];
+            const dependents = adjList.get(op.nodeId) || [];
+            return `<div style="padding:10px;min-width:220px;">
               <div style="font-weight:bold;font-size:14px;margin-bottom:8px;color:#1f2937;">${{op.opName}}</div>
               <div style="color:#6b7280;font-size:12px;line-height:1.6;">
                 <div><b>Lane:</b> ${{op.lane}}</div>
@@ -1381,6 +1408,10 @@ def export_html(
                 <div><b>Start:</b> ${{fmt(op.start)}}</div>
                 <div><b>Duration:</b> ${{fmt(op.duration)}}</div>
                 <div><b>End:</b> ${{fmt(op.end)}}</div>
+                <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;">
+                  <b>Dependencies:</b> ${{deps.length}} ops<br/>
+                  <b>Dependents:</b> ${{dependents.length}} ops
+                </div>
                 <div style="margin-top:4px;font-family:monospace;font-size:11px;color:#9ca3af;">ID: ${{op.nodeId}}</div>
               </div>
             </div>`;
@@ -1469,21 +1500,38 @@ def export_html(
       
       // Add statistics panel
       const statsDiv = document.createElement('div');
-      statsDiv.style.cssText = 'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);padding:12px 16px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.1);font-size:12px;color:#374151;min-width:180px;';
+      statsDiv.style.cssText = 'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);padding:12px 16px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.1);font-size:12px;color:#374151;min-width:200px;';
       
       const cubeOps = lanes['Cube'].length;
       const vecOps = lanes['Vec'].length;
       const commOps = lanes['Communication'].length;
       const totalOps = cubeOps + vecOps + commOps;
       
+      // Calculate total compute time (sum of all operator durations)
+      let totalComputeTime = 0;
+      operatorTimes.forEach(op => {{
+        totalComputeTime += op.duration;
+      }});
+      
+      // Calculate parallelism efficiency
+      const parallelismEfficiency = maxTime > 0 ? (totalComputeTime / maxTime).toFixed(2) : '0';
+      
       statsDiv.innerHTML = `
-        <div style="font-weight:bold;margin-bottom:8px;font-size:13px;">Operator Statistics</div>
+        <div style="font-weight:bold;margin-bottom:8px;font-size:13px;">Execution Statistics</div>
         <div style="line-height:1.8;">
           <div><span style="color:${{laneColors.Cube}};">●</span> Cube: <b>${{cubeOps}}</b> (${{(cubeOps/totalOps*100).toFixed(1)}}%)</div>
           <div><span style="color:${{laneColors.Vec}};">●</span> Vec: <b>${{vecOps}}</b> (${{(vecOps/totalOps*100).toFixed(1)}}%)</div>
           <div><span style="color:${{laneColors.Communication}};">●</span> Comm: <b>${{commOps}}</b> (${{(commOps/totalOps*100).toFixed(1)}}%)</div>
-          <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;"><b>Total:</b> ${{totalOps}} ops</div>
-          <div style="margin-top:4px;color:#6b7280;font-size:11px;">Total time: ${{fmt(maxTime)}}</div>
+          <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;">
+            <b>Total:</b> ${{totalOps}} ops<br/>
+            <b>Critical path:</b> ${{fmt(maxTime)}}<br/>
+            <b>Total compute:</b> ${{fmt(totalComputeTime)}}<br/>
+            <b>Parallelism:</b> ${{parallelismEfficiency}}x
+          </div>
+          <div style="margin-top:6px;color:#6b7280;font-size:10px;line-height:1.4;">
+            Operators respect data dependencies.<br/>
+            Start time = max(dependency end times).
+          </div>
         </div>
       `;
       container.style.position = 'relative';
