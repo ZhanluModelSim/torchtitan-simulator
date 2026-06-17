@@ -52,6 +52,84 @@ from .nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
 
 logger = logging.getLogger(__name__)
 
+
+def replicate_events_to_ranks(
+    schedule: TrainingSchedule,
+    group_size: int,
+    strategies: set[str],
+    per_rank_prev: dict[Any, str],
+    next_id_fn: Any,
+    rank_clock: dict[int, int] | None = None,
+) -> None:
+    """Replicate schedule events across sibling ranks in the same PP group.
+
+    Events whose ``metadata["strategy"]`` is in *strategies* are copied from
+    the base rank of each PP group to every other rank in that group.
+    Dependencies between replicated events are remapped accordingly.
+
+    Args:
+        schedule: The training schedule to mutate in-place.
+        group_size: Number of ranks per PP group (``tp_degree * dp_degree``).
+        strategies: Set of strategy strings to filter events for replication.
+        per_rank_prev: Mutable mapping tracking the last event ID per rank
+            for control-dependency chaining.
+        next_id_fn: Callable accepting an event-type string and returning a
+            unique event ID string.
+        rank_clock: Optional per-rank logical clock.  When provided, each
+            replicated event receives an incrementing clock value; when
+            ``None``, the original event's ``logical_clock`` is copied.
+    """
+    if group_size <= 1:
+        return
+
+    original_events = [
+        e for e in schedule.events if e.metadata.get("strategy") in strategies
+    ]
+    original_deps = list(schedule.deps)
+
+    eid_remap: dict[str, dict[int, str]] = {}
+    for ev in original_events:
+        base_rank = ev.rank
+        pp_group_base = (base_rank // group_size) * group_size
+        for r in range(pp_group_base, pp_group_base + group_size):
+            if r == base_rank:
+                continue
+            new_eid = next_id_fn(ev.event_type)
+            if rank_clock is not None:
+                clock = rank_clock.get(r, 0)
+                rank_clock[r] = clock + 1
+            else:
+                clock = ev.logical_clock
+            new_ev = ScheduleEvent(
+                event_id=new_eid,
+                event_type=ev.event_type,
+                rank=r,
+                pp_rank=ev.pp_rank,
+                pp_stage=ev.pp_stage,
+                microbatch_idx=ev.microbatch_idx,
+                logical_clock=clock,
+                metadata=dict(ev.metadata),
+            )
+            schedule.add_event(new_ev)
+
+            if ev.event_id not in eid_remap:
+                eid_remap[ev.event_id] = {}
+            eid_remap[ev.event_id][r] = new_eid
+
+            if r in per_rank_prev:
+                schedule.add_dep(ScheduleDep(per_rank_prev[r], new_eid, "control"))
+            per_rank_prev[r] = new_eid
+
+    for dep in original_deps:
+        from_eid = dep.from_event_id
+        to_eid = dep.to_event_id
+        remap_from = eid_remap.get(from_eid, {})
+        remap_to = eid_remap.get(to_eid, {})
+        for r, to_copy in remap_to.items():
+            from_copy = remap_from.get(r)
+            if from_copy:
+                schedule.add_dep(ScheduleDep(from_copy, to_copy, dep.dep_type))
+
 # ---------------------------------------------------------------------------
 # _ComputationType → event_type mapping
 # ---------------------------------------------------------------------------
@@ -398,51 +476,10 @@ def _convert_pipeline_order_to_training_schedule(
                     ts.add_dep(ScheduleDep(ev.event_id, recv_ev.event_id, "pp_comm"))
 
     # ── Replicate PP-group events across TP and DP ranks ─────────────
-    # PP events are generated per PP rank.  Replicate them to sibling
-    # ranks in the same PP group so the swimlane shows balanced work.
-
     group_size = tp_degree * dp_degree
-    if group_size > 1:
-        original_events = [e for e in ts.events if e.metadata.get("strategy") == "pp"]
-        original_deps = list(ts.deps)
-
-        eid_remap: dict[str, dict[int, str]] = {}
-        for ev in original_events:
-            base_rank = ev.rank
-            dp_tp_offset = base_rank % group_size
-            pp_group_base = (base_rank // group_size) * group_size
-            for r_offset in range(1, group_size):
-                r = pp_group_base + r_offset
-                new_eid = _next_id(ev.event_type)
-                new_ev = ScheduleEvent(
-                    event_id=new_eid,
-                    event_type=ev.event_type,
-                    rank=r,
-                    pp_rank=ev.pp_rank,
-                    pp_stage=ev.pp_stage,
-                    microbatch_idx=ev.microbatch_idx,
-                    logical_clock=ev.logical_clock,
-                    metadata=dict(ev.metadata),
-                )
-                ts.add_event(new_ev)
-
-                if ev.event_id not in eid_remap:
-                    eid_remap[ev.event_id] = {}
-                eid_remap[ev.event_id][r_offset] = new_eid
-
-                if r in per_rank_prev:
-                    ts.add_dep(ScheduleDep(per_rank_prev[r], new_eid, "control"))
-                per_rank_prev[r] = new_eid
-
-        for dep in original_deps:
-            from_eid = dep.from_event_id
-            to_eid = dep.to_event_id
-            remap_from = eid_remap.get(from_eid, {})
-            remap_to = eid_remap.get(to_eid, {})
-            for r_offset, to_copy in remap_to.items():
-                from_copy = remap_from.get(r_offset)
-                if from_copy:
-                    ts.add_dep(ScheduleDep(from_copy, to_copy, dep.dep_type))
+    replicate_events_to_ranks(
+        ts, group_size, {"pp"}, per_rank_prev, _next_id,
+    )
 
     # ── Add optimizer step per rank ───────────────────────────────────
     # After REDUCE_GRAD (or last backward if no REDUCE_GRAD), add optimizer step.

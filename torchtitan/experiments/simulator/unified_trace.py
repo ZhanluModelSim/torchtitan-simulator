@@ -55,6 +55,7 @@ from .nodes import (
     TensorMeta,
     TrainingSchedule,
 )
+from .graph_assembler import comm_event_to_op_node
 from .op_classification import classify_op, TRIVIAL_TARGETS
 
 
@@ -272,48 +273,17 @@ class TraceRecorder:
 
         # Merge comm events as OpNode entries
         for ev in self.comm_events:
+            # Normalize device from "meta" to "cpu" in event dict
+            if "tensor_shapes" in ev and ev["tensor_shapes"]:
+                for entry in ev["tensor_shapes"]:
+                    if entry and entry.get("device") == "meta":
+                        entry["device"] = "cpu"
+            if "tensor_meta" in ev and ev["tensor_meta"]:
+                if ev["tensor_meta"].get("device") == "meta":
+                    ev["tensor_meta"]["device"] = "cpu"
+
             node_id = ev.get("event_id", f"comm_{len(graph.nodes)+1:07d}")
-            op_name = ev.get("op", "collective_unknown")
-            phase = ev.get("phase", "unknown")
-            input_metas: list[TensorMeta] = []
-            output_metas: list[TensorMeta] = []
-            shape_entries = ev.get("tensor_shapes") or []
-            if not shape_entries:
-                tm = ev.get("tensor_meta")
-                if tm:
-                    shape_entries = [tm]
-            for entry in shape_entries:
-                if entry is None:
-                    continue
-                meta = TensorMeta(
-                    shape=tuple(entry.get("shape", [])),
-                    dtype=entry.get("dtype", "unknown"),
-                    device=_normalize_device(entry.get("device", "cpu")),
-                    is_dtensor=entry.get("is_dtensor", False),
-                    placements=entry.get("placements"),
-                )
-                input_metas.append(meta)
-                output_metas.append(meta)
-            op_type = ev.get("op_type", "comm_collective")
-            comm_node = OpNode(
-                node_id=node_id,
-                op_name=op_name,
-                op_type=op_type,
-                phase=phase,
-                inputs=input_metas,
-                outputs=output_metas,
-                comm_op=op_name,
-                comm_group_size=ev.get("group_size"),
-                pp_stage=ev.get("pp_stage"),
-                microbatch_idx=ev.get("microbatch"),
-                attrs={
-                    "group": str(ev.get("group", "")),
-                    "tag": str(ev.get("tag", "")),
-                    "src_rank": ev.get("src_rank"),
-                    "dst_rank": ev.get("dst_rank"),
-                    "rank": ev.get("rank"),
-                },
-            )
+            comm_node = comm_event_to_op_node(ev, node_id)
             graph.add_node(comm_node)
             for src_id in ev.get("source_node_ids", []):
                 if src_id in graph.nodes:
