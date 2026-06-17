@@ -267,6 +267,7 @@ def _inject_synthetic_comm_events(
         full_layer_numel = per_layer_numel * ds
 
         for stage_idx in range(pp):
+            pp_rank = stage_idx % pp  # Calculate pp_rank from stage_idx
             fwd_anchor = _find_last_compute_node_id("forward", stage_idx)
             bwd_anchor = _find_last_compute_node_id("backward", stage_idx)
 
@@ -277,6 +278,7 @@ def _inject_synthetic_comm_events(
                     op_type="comm_collective",
                     phase="forward",
                     pp_stage=stage_idx,
+                    pp_rank=pp_rank,
                     inputs=[
                         TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
                     ],
@@ -297,6 +299,7 @@ def _inject_synthetic_comm_events(
                         "group_size": ds,
                         "phase": "forward",
                         "pp_stage": stage_idx,
+                        "pp_rank": pp_rank,
                         "tensor_meta": {
                             "shape": [per_layer_numel],
                             "dtype": dtype_str,
@@ -314,6 +317,7 @@ def _inject_synthetic_comm_events(
                     op_type="comm_collective",
                     phase="backward",
                     pp_stage=stage_idx,
+                    pp_rank=pp_rank,
                     inputs=[
                         TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
                     ],
@@ -334,6 +338,7 @@ def _inject_synthetic_comm_events(
                         "group_size": ds,
                         "phase": "backward",
                         "pp_stage": stage_idx,
+                        "pp_rank": pp_rank,
                         "tensor_meta": {
                             "shape": [full_layer_numel],
                             "dtype": dtype_str,
@@ -354,6 +359,7 @@ def _inject_synthetic_comm_events(
         tp_allreduce_count = num_layers * 2
 
         for stage_idx in range(pp):
+            pp_rank = stage_idx % pp  # Calculate pp_rank from stage_idx
             fwd_anchor = _find_last_compute_node_id("forward", stage_idx)
             bwd_anchor = _find_last_compute_node_id("backward", stage_idx)
 
@@ -364,6 +370,7 @@ def _inject_synthetic_comm_events(
                     op_type="comm_collective",
                     phase="forward",
                     pp_stage=stage_idx,
+                    pp_rank=pp_rank,
                     inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
                     outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
                     comm_op="all_reduce",
@@ -380,6 +387,7 @@ def _inject_synthetic_comm_events(
                         "group_size": tp,
                         "phase": "forward",
                         "pp_stage": stage_idx,
+                        "pp_rank": pp_rank,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
                             "dtype": dtype_str,
@@ -396,6 +404,7 @@ def _inject_synthetic_comm_events(
                     op_type="comm_collective",
                     phase="backward",
                     pp_stage=stage_idx,
+                    pp_rank=pp_rank,
                     inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
                     outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
                     comm_op="all_reduce",
@@ -412,6 +421,7 @@ def _inject_synthetic_comm_events(
                         "group_size": tp,
                         "phase": "backward",
                         "pp_stage": stage_idx,
+                        "pp_rank": pp_rank,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
                             "dtype": dtype_str,
@@ -435,12 +445,16 @@ def _inject_synthetic_comm_events(
         for mb_idx in range(num_microbatches):
             for stage_idx in range(pp - 1):
                 # Forward: send activation from stage_idx to stage_idx+1
+                send_pp_rank = stage_idx % pp
+                recv_pp_rank = (stage_idx + 1) % pp
+                
                 send_node = OpNode(
                     node_id=_next_id(),
                     op_name="pp_send_activation",
                     op_type="comm_p2p",
                     phase="forward",
                     pp_stage=stage_idx,
+                    pp_rank=send_pp_rank,
                     microbatch_idx=mb_idx,
                     inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
                     outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
@@ -456,6 +470,7 @@ def _inject_synthetic_comm_events(
                     op_type="comm_p2p",
                     phase="forward",
                     pp_stage=stage_idx + 1,
+                    pp_rank=recv_pp_rank,
                     microbatch_idx=mb_idx,
                     inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
                     outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
@@ -475,6 +490,7 @@ def _inject_synthetic_comm_events(
                         "group_size": 2,
                         "phase": "forward",
                         "pp_stage": stage_idx,
+                        "pp_rank": send_pp_rank,
                         "microbatch": mb_idx,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
@@ -492,6 +508,7 @@ def _inject_synthetic_comm_events(
                         "group_size": 2,
                         "phase": "forward",
                         "pp_stage": stage_idx + 1,
+                        "pp_rank": recv_pp_rank,
                         "microbatch": mb_idx,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
@@ -505,12 +522,16 @@ def _inject_synthetic_comm_events(
 
             # Backward: send gradient from stage_idx+1 to stage_idx
             for stage_idx in range(pp - 1, 0, -1):
+                send_pp_rank = stage_idx % pp
+                recv_pp_rank = (stage_idx - 1) % pp
+                
                 send_node = OpNode(
                     node_id=_next_id(),
                     op_name="pp_send_gradient",
                     op_type="comm_p2p",
                     phase="backward",
                     pp_stage=stage_idx,
+                    pp_rank=send_pp_rank,
                     microbatch_idx=mb_idx,
                     inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
                     outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
@@ -526,6 +547,7 @@ def _inject_synthetic_comm_events(
                     op_type="comm_p2p",
                     phase="backward",
                     pp_stage=stage_idx - 1,
+                    pp_rank=recv_pp_rank,
                     microbatch_idx=mb_idx,
                     inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
                     outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
@@ -545,6 +567,7 @@ def _inject_synthetic_comm_events(
                         "group_size": 2,
                         "phase": "backward",
                         "pp_stage": stage_idx,
+                        "pp_rank": send_pp_rank,
                         "microbatch": mb_idx,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
@@ -562,6 +585,7 @@ def _inject_synthetic_comm_events(
                         "group_size": 2,
                         "phase": "backward",
                         "pp_stage": stage_idx - 1,
+                        "pp_rank": recv_pp_rank,
                         "microbatch": mb_idx,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
@@ -645,9 +669,13 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
     # -- Decide if we should multi-stage trace ----------
     model_parts = getattr(trainer, "_pp_model_parts", None) or trainer.model_parts
-    pp_degree = len(model_parts)
+    num_virtual_stages = len(model_parts)
+    pp_config_degree = int(getattr(trainer.config.parallelism, "pipeline_parallel_degree", 1) or 1)
+    
+    # Calculate VPP (virtual pipeline parallelism) factor
+    vpp = num_virtual_stages // pp_config_degree if pp_config_degree > 1 else 1
 
-    if pp_degree > 1:
+    if num_virtual_stages > 1:
         # === Multi-stage per-PP trace ===
         # Move model parts back to meta device to avoid OOM with
         # large models (1T+ parameters materialized on CPU)
@@ -662,11 +690,27 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         # Stage 0 uses real token ids; later stages use previous stage's output
         prev_stage_output = None
 
+        logger.info(
+            "Multi-stage tracing: %d virtual stages, PP=%d, VPP=%d",
+            num_virtual_stages,
+            pp_config_degree,
+            vpp,
+        )
+
         for stage_idx, model_part in enumerate(model_parts):
+            # Calculate which physical PP rank this virtual stage belongs to
+            # For Interleaved1F1B with PP=8, VPP=2:
+            #   stages 0-7 -> ranks 0-7 (first virtual stage)
+            #   stages 8-15 -> ranks 0-7 (second virtual stage)
+            pp_rank = stage_idx % pp_config_degree
+            
             logger.info(
-                "Tracing PP stage %d/%d (%d params)",
+                "Tracing virtual stage %d/%d (PP rank %d, VPP chunk %d/%d, %d params)",
                 stage_idx + 1,
-                pp_degree,
+                num_virtual_stages,
+                pp_rank,
+                (stage_idx // pp_config_degree) + 1,
+                vpp,
                 sum(p.numel() for p in model_part.parameters()),
             )
 
@@ -689,6 +733,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
                 stage_idx + 1
             ) * 100000  # avoid node_id collision (0 is default initial)
             recorder.current_pp_stage = stage_idx
+            recorder.current_pp_rank = pp_rank
 
             with unified_trace(
                 recorder,
@@ -721,8 +766,9 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
                 prev_stage_output = tensors[0].detach() if tensors else None
 
             logger.info(
-                "  Stage %d: %d nodes (%d fwd + %d bwd), %d edges",
+                "  Virtual stage %d (PP rank %d): %d nodes (%d fwd + %d bwd), %d edges",
                 stage_idx,
+                pp_rank,
                 len(recorder.nodes),
                 sum(1 for n in recorder.nodes if n.phase == "forward"),
                 sum(1 for n in recorder.nodes if n.phase == "backward"),
@@ -751,7 +797,9 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
                 "mode": "unified_trace",
                 "device_mode": "meta",
                 "rank": rank,
-                "pp_degree": pp_degree,
+                "num_virtual_stages": num_virtual_stages,
+                "pp_degree": pp_config_degree,
+                "vpp": vpp,
             },
         )
 
@@ -886,7 +934,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     # model parts are on meta device and make_fx on 1T-param models is
     # extremely slow (~minutes).  The 99998-node merged graph already
     # contains all ops.
-    if pp_degree <= 1:
+    if num_virtual_stages <= 1:
         try:
             result.metadata["fx_forward_graph"] = capture_forward_fx(
                 trainer.model_parts[0],

@@ -163,6 +163,7 @@ class TraceRecorder:
         self._tensor_producer: dict[int, str] = {}
         self.current_phase: str = "forward"
         self.current_pp_stage: int | None = None
+        self.current_pp_rank: int | None = None
         self.current_microbatch: int | None = None
         self.comm_events: list[dict[str, Any]] = []
         self.fsdp_events: list[dict[str, Any]] = []
@@ -194,6 +195,7 @@ class TraceRecorder:
             outputs=output_metas,
             attrs=attrs or {},
             pp_stage=self.current_pp_stage,
+            pp_rank=self.current_pp_rank,
             microbatch_idx=self.current_microbatch,
             comm_op=comm_op,
         )
