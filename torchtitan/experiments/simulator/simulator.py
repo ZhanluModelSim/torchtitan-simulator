@@ -37,14 +37,12 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from .comm_interceptor import capture_comms, CommRecorder
-from .cpu_env import cpu_distributed_context, patch_device_type_to_cpu
+from .cpu_env import patch_device_type_to_cpu
 from .export import export_result
 from .fx_capture import capture_forward_fx, capture_joint_fx
 from .meta_env import patch_device_type_to_meta
 from .nodes import SimulationResult, TrainingSchedule
 from .pp_schedule_extractor import PPScheduleExtractor
-from .runtime_capture import RuntimeCapture
 from .unified_trace import compute_loss, TraceRecorder, unified_trace
 
 
@@ -153,9 +151,9 @@ class Simulator:
         """
         Run one training step on CPU while capturing all ops and events.
 
-        Activates :class:`OpCaptureMode`, :class:`CommRecorder`,
-        :class:`FSDPEventRecorder`, and optional PP hooks simultaneously, then
-        runs:
+        Uses :class:`TraceRecorder` + :func:`unified_trace` to intercept
+        every dispatched op, collective, and FSDP lifecycle event while
+        running:
             1. Forward pass (or ``pp_schedule.step()`` for PP)
             2. ``loss.backward()``
             3. ``optimizer.step()`` (if provided)
@@ -178,38 +176,36 @@ class Simulator:
         """
         self._log("Starting runtime capture …")
         patch_device_type_to_cpu()
-
-        capture = RuntimeCapture(rank=self.rank)
-
-        with capture.activate(
-            model_parts,
+        recorder = TraceRecorder(rank=self.rank)
+        with unified_trace(
+            recorder,
+            model_parts[0],
+            example_inputs,
+            use_fake_mode=False,
             phase="forward",
-            pp_schedule=pp_schedule,
-            pp_stages=pp_stages,
+            capture_comm=True,
+            capture_fsdp=True,
+            model_parts=model_parts,
         ):
             if pp_schedule is not None:
                 self._log("  running PP schedule step …")
-                capture.set_phase("forward")
                 pp_schedule.step(*example_inputs)
             else:
                 model = model_parts[0]
                 self._log("  running forward pass …")
-                capture.set_phase("forward")
                 output = model(*example_inputs)
-                loss = compute_loss(output, loss_fn, example_labels)
-
+                loss = compute_loss(output, loss_fn=loss_fn, labels=example_labels)
                 self._log("  running backward pass …")
-                capture.set_phase("backward")
+                recorder.current_phase = "backward"
                 loss.backward()
-
                 if optimizer is not None:
                     self._log("  running optimizer step …")
-                    capture.set_phase("optimizer")
+                    recorder.current_phase = "optimizer"
                     optimizer.step()
                     optimizer.zero_grad()
-
-        result = capture.build_result(metadata={"mode": "runtime", **(metadata or {})})
-
+        result = recorder.build_result(
+            metadata={"mode": "runtime", **(metadata or {})}
+        )
         self._log(
             f"  captured {len(result.compute_graph.nodes)} ops, "
             f"{len(result.comm_events)} comm events, "

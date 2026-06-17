@@ -55,7 +55,7 @@ from .nodes import (
     TensorMeta,
     TrainingSchedule,
 )
-from .graph_assembler import comm_event_to_op_node
+from .fx_capture import comm_event_to_op_node
 from .op_classification import classify_op, TRIVIAL_TARGETS
 
 
