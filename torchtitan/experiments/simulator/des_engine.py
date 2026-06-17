@@ -489,15 +489,22 @@ def compute_des_memory_timeline(result: SimulationResult) -> dict[str, Any]:
         for ev in result.schedule.events:
             if ev.des_start_time_us is None or ev.des_finish_time_us is None:
                 continue
-            for nid in ev.op_node_ids:
-                node_id_to_des_start[nid] = min(
-                    node_id_to_des_start.get(nid, float("inf")),
-                    ev.des_start_time_us,
-                )
-                node_id_to_des_finish[nid] = max(
-                    node_id_to_des_finish.get(nid, 0.0),
-                    ev.des_finish_time_us,
-                )
+            # Distribute time across nodes in this event
+            ev_duration = ev.des_finish_time_us - ev.des_start_time_us
+            num_nodes = len(ev.op_node_ids)
+            if num_nodes > 0:
+                time_per_node = ev_duration / num_nodes
+                for i, nid in enumerate(ev.op_node_ids):
+                    # Each node gets a time slice
+                    node_start = ev.des_start_time_us + i * time_per_node
+                    node_finish = node_start + time_per_node
+                    # Use min/max to handle nodes appearing in multiple events
+                    if nid not in node_id_to_des_start or node_start < node_id_to_des_start[nid]:
+                        node_id_to_des_start[nid] = node_start
+                    if nid not in node_id_to_des_finish or node_finish > node_id_to_des_finish[nid]:
+                        node_id_to_des_finish[nid] = node_finish
+    
+    # Build index_to_des_time AFTER distributing times
     node_des_available = any(node.des_start_time_us is not None for node in nodes_list)
     if node_des_available:
         for node in nodes_list:
@@ -527,7 +534,15 @@ def compute_des_memory_timeline(result: SimulationResult) -> dict[str, Any]:
 
     dynamic_with_times: list[dict[str, Any]] = []
     for me in dynamic_events:
-        alloc_time = index_to_des_time[me.lifetime_start]
+        # Use consistent time lookup for both alloc and free
+        alloc_node = nodes_list[me.lifetime_start]
+        if alloc_node.des_start_time_us is not None:
+            alloc_time = alloc_node.des_start_time_us
+        elif alloc_node.node_id in node_id_to_des_start:
+            alloc_time = node_id_to_des_start[alloc_node.node_id]
+        else:
+            alloc_time = index_to_des_time[me.lifetime_start]
+        
         free_node = nodes_list[me.lifetime_end]
         if free_node.des_finish_time_us is not None:
             free_time = free_node.des_finish_time_us
@@ -535,6 +550,11 @@ def compute_des_memory_timeline(result: SimulationResult) -> dict[str, Any]:
             free_time = node_id_to_des_finish[free_node.node_id]
         else:
             free_time = index_to_des_time[me.lifetime_end]
+        
+        # Ensure free_time >= alloc_time
+        if free_time < alloc_time:
+            free_time = alloc_time
+        
         dynamic_with_times.append(
             {
                 "alloc_time": alloc_time,
@@ -555,35 +575,52 @@ def compute_des_memory_timeline(result: SimulationResult) -> dict[str, Any]:
             "phase_peak": {},
         }
 
-    timestamps: set[float] = set()
+    # Build timeline using sweep line algorithm for efficiency
+    # Create events for alloc and free times
+    sweep_events: list[tuple[float, int, int, str]] = []  # (time, type, bytes, category)
+    # type: +1 for alloc, -1 for free
     for dw in dynamic_with_times:
-        timestamps.add(dw["alloc_time"])
-        timestamps.add(dw["free_time"])
-    sorted_ts = sorted(timestamps)
-
+        sweep_events.append((dw["alloc_time"], 1, dw["bytes"], dw["category"]))
+        sweep_events.append((dw["free_time"], -1, dw["bytes"], dw["category"]))
+    
+    # Sort by time, with allocs before frees at the same time
+    sweep_events.sort(key=lambda x: (x[0], -x[1]))
+    
+    # Process events to build timeline
     timeline: list[dict[str, Any]] = []
     peak_dynamic = 0
     peak_total = 0
-    for ts in sorted_ts:
-        dynamic_bytes = 0
-        by_category: dict[str, int] = {}
-        for dw in dynamic_with_times:
-            if dw["alloc_time"] <= ts <= dw["free_time"]:
-                dynamic_bytes += dw["bytes"]
-                by_category[dw["category"]] = (
-                    by_category.get(dw["category"], 0) + dw["bytes"]
-                )
-        total_bytes = static_memory_bytes + dynamic_bytes
+    current_dynamic = 0
+    current_by_category: dict[str, int] = {}
+    
+    i = 0
+    while i < len(sweep_events):
+        current_time = sweep_events[i][0]
+        
+        # Process all events at this time
+        while i < len(sweep_events) and sweep_events[i][0] == current_time:
+            _, event_type, bytes_val, category = sweep_events[i]
+            if event_type == 1:  # alloc
+                current_dynamic += bytes_val
+                current_by_category[category] = current_by_category.get(category, 0) + bytes_val
+            else:  # free
+                current_dynamic -= bytes_val
+                current_by_category[category] = current_by_category.get(category, 0) - bytes_val
+                if current_by_category[category] <= 0:
+                    del current_by_category[category]
+            i += 1
+        
+        total_bytes = static_memory_bytes + current_dynamic
         timeline.append(
             {
-                "time_us": ts,
+                "time_us": current_time,
                 "static_bytes": static_memory_bytes,
-                "dynamic_bytes": dynamic_bytes,
+                "dynamic_bytes": current_dynamic,
                 "total_bytes": total_bytes,
-                "by_category": by_category,
+                "by_category": dict(current_by_category),
             }
         )
-        peak_dynamic = max(peak_dynamic, dynamic_bytes)
+        peak_dynamic = max(peak_dynamic, current_dynamic)
         peak_total = max(peak_total, total_bytes)
 
     if not dynamic_with_times:
