@@ -906,7 +906,7 @@ def _render_swimlane_canvas(
         <span class="muted chart-note">Drag or use horizontal scrollbar to pan.</span>
       </div>
       <div class="chart-frame" id="chrome-trace-frame-step-{step}">
-        <canvas id="chrome-trace-step-{step}" class="trace-chart chrome-trace-chart" data-step="{step}"></canvas>
+        <canvas id="chrome-trace-step-{step}" class="trace-chart chrome-trace-chart" data-step="{step}" width="1200" height="400"></canvas>
       </div>
     </details>
     """
@@ -946,7 +946,7 @@ def _render_operator_dag_canvas(
       <span class="muted">Canvas DAG view for {escape(phase)}</span>
     </div>
     <div class="chart-frame" id="{escape(canvas_id)}-frame">
-      <canvas id="{escape(canvas_id)}" class="trace-chart dag-chart" data-phase="{escape(phase)}" data-max-nodes="{max_nodes}"></canvas>
+      <canvas id="{escape(canvas_id)}" class="trace-chart dag-chart" data-phase="{escape(phase)}" data-max-nodes="{max_nodes}" width="1200" height="600"></canvas>
     </div>
     """
 
@@ -972,7 +972,7 @@ def _render_memory_trace_canvas(result: SimulationResult) -> str:
       <span class="muted chart-note">{lifetimed} lifetimed events, {len(result.memory_events)} total memory events.</span>
     </div>
     <div class="chart-frame" id="memory-trace-frame">
-      <canvas id="memory-trace" class="trace-chart memory-chart"></canvas>
+      <canvas id="memory-trace" class="trace-chart memory-chart" width="1200" height="400"></canvas>
     </div>
     <div class="memory-table-wrap">
       <table class="memory-table">
@@ -2296,40 +2296,65 @@ def export_html(
     }}
 
     function redraw(canvas) {{
-      if (canvas.classList.contains('chrome-trace-chart')) drawChromeTrace(canvas);
-      else if (canvas.classList.contains('memory-chart')) drawMemoryTrace(canvas);
-      else drawDag(canvas);
+      try {{
+        if (canvas.classList.contains('chrome-trace-chart')) drawChromeTrace(canvas);
+        else if (canvas.classList.contains('memory-chart')) drawMemoryTrace(canvas);
+        else drawDag(canvas);
+      }} catch (err) {{
+        console.error('Error redrawing chart for canvas:', canvas.id, err);
+        const ctx = canvas.getContext('2d');
+        if (ctx) {{
+          ctx.fillStyle = '#fee';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#c00';
+          ctx.font = '14px monospace';
+          ctx.fillText('Error rendering chart: ' + err.message, 10, 30);
+          ctx.fillText('Check browser console for details', 10, 50);
+        }}
+      }}
     }}
 
     function installChart(canvas) {{
-      chartState.set(canvas, {{zoom: 1, rankView: 'all'}});
-      const frame = canvas.closest('.chart-frame');
-      let dragging = false;
-      let startX = 0;
-      let startScroll = 0;
-      frame.addEventListener('mousedown', (event) => {{
-        dragging = true;
-        startX = event.clientX;
-        startScroll = frame.scrollLeft;
-        frame.classList.add('dragging');
-      }});
-      window.addEventListener('mouseup', () => {{
-        dragging = false;
-        frame.classList.remove('dragging');
-      }});
-      window.addEventListener('mousemove', (event) => {{
-        if (!dragging) return;
-        frame.scrollLeft = startScroll - (event.clientX - startX);
-      }});
-      frame.addEventListener('wheel', (event) => {{
-        if (!event.ctrlKey && Math.abs(event.deltaX) < Math.abs(event.deltaY)) return;
-        event.preventDefault();
-        frame.scrollLeft += event.deltaX || event.deltaY;
-      }}, {{passive: false}});
-      if (canvas.classList.contains('chrome-trace-chart')) {{
-        // No rank tabs needed for Chrome trace view
+      try {{
+        chartState.set(canvas, {{zoom: 1, rankView: 'all'}});
+        const frame = canvas.closest('.chart-frame');
+        let dragging = false;
+        let startX = 0;
+        let startScroll = 0;
+        frame.addEventListener('mousedown', (event) => {{
+          dragging = true;
+          startX = event.clientX;
+          startScroll = frame.scrollLeft;
+          frame.classList.add('dragging');
+        }});
+        window.addEventListener('mouseup', () => {{
+          dragging = false;
+          frame.classList.remove('dragging');
+        }});
+        window.addEventListener('mousemove', (event) => {{
+          if (!dragging) return;
+          frame.scrollLeft = startScroll - (event.clientX - startX);
+        }});
+        frame.addEventListener('wheel', (event) => {{
+          if (!event.ctrlKey && Math.abs(event.deltaX) < Math.abs(event.deltaY)) return;
+          event.preventDefault();
+          frame.scrollLeft += event.deltaX || event.deltaY;
+        }}, {{passive: false}});
+        if (canvas.classList.contains('chrome-trace-chart')) {{
+          // No rank tabs needed for Chrome trace view
+        }}
+        redraw(canvas);
+      }} catch (err) {{
+        console.error('Error installing chart for canvas:', canvas.id, err);
+        const ctx = canvas.getContext('2d');
+        if (ctx) {{
+          ctx.fillStyle = '#fee';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#c00';
+          ctx.font = '14px monospace';
+          ctx.fillText('Error rendering chart: ' + err.message, 10, 30);
+        }}
       }}
-      redraw(canvas);
     }}
 
     document.querySelectorAll('canvas.trace-chart').forEach(installChart);
