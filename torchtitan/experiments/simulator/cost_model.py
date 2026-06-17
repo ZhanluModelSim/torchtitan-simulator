@@ -525,6 +525,10 @@ def link_schedule_to_graph(result: SimulationResult) -> None:
     phase_map = {
         "pp_forward": "forward",
         "pp_backward": "backward",
+        "pp_send_activation": "forward",
+        "pp_recv_activation": "forward",
+        "pp_send_gradient": "backward",
+        "pp_recv_gradient": "backward",
         "fsdp2_all_gather": "forward",
         "fsdp2_reduce_scatter": "backward",
         "dp_gradient_sync": "backward",

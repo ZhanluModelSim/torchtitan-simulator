@@ -185,16 +185,10 @@ def _inject_synthetic_comm_events(
 
     When running with fake_backend (no real distributed communication),
     this function creates :class:`OpNode` entries for the FSDP all-gather,
-    FSDP reduce-scatter, TP all-reduce, and other collectives that
+    FSDP reduce-scatter, TP all-reduce, PP send/recv, and other collectives that
     *would* be triggered by real parallelism.  Shapes and group sizes are
     derived from the model's parameter structure and the parallelism config.
     """
-    if getattr(sim_opts, "comm_backend", "") == "gloo":
-        import torch.distributed as dist
-
-        if dist.is_initialized() and dist.get_backend() == dist.Backend.GLOO:
-            return  # Real comm already captured via gloo; skip synthetic injection
-
     graph = result.compute_graph
     parallelism = trainer.config.parallelism
     model_parts = trainer.model_parts
@@ -203,8 +197,16 @@ def _inject_synthetic_comm_events(
     tp = int(getattr(parallelism, "tensor_parallel_degree", 1) or 1)
     ds = int(getattr(parallelism, "data_parallel_shard_degree", 1) or 1)
     pp = int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1)
+    ep = int(getattr(parallelism, "expert_parallel_degree", 1) or 1)
+    cp = int(getattr(parallelism, "context_parallel_degree", 1) or 1)
+    dr = int(getattr(parallelism, "data_parallel_replicate_degree", 1) or 1)
 
-    if not (tp > 1 or ds > 1):
+    # Resolve ds=-1 (auto-inferred) to actual value
+    if ds < 0:
+        world_size = pp * tp * cp * dr
+        ds = max(1, world_size // (pp * tp * cp * dr))
+
+    if not (tp > 1 or ds > 1 or pp > 1):
         return  # No parallelism → no synthetic comm needed
 
     # ── Compute model parameter numel ─────────────────────────────────
@@ -231,106 +233,116 @@ def _inject_synthetic_comm_events(
     )
 
     logger.info(
-        "Injecting synthetic comm events: tp=%d ds=%d dtype=%s total_param_numel=%d",
+        "Injecting synthetic comm events: tp=%d ds=%d pp=%d ep=%d dtype=%s total_param_numel=%d",
         tp,
         ds,
+        pp,
+        ep,
         dtype_str,
         total_param_numel,
     )
 
     shard_numel = total_param_numel // ds if ds > 1 else total_param_numel
 
-    # ── FSDP2 all_gather events ───────────────────────────────────────
+    # ── Helper functions ──────────────────────────────────────────────
     counter = [len(graph.nodes)]
 
     def _next_id() -> str:
         counter[0] += 1
         return f"comm_syn_{counter[0]:07d}"
 
-    def _find_last_compute_node_id(phase: str) -> str | None:
+    def _find_last_compute_node_id(phase: str, pp_stage: int | None = None) -> str | None:
         for nid in reversed(list(graph.nodes.keys())):
             n = graph.nodes[nid]
             if n.phase == phase and n.op_type == "compute":
-                return nid
+                # If pp_stage is specified, match it or accept None
+                if pp_stage is None or n.pp_stage is None or n.pp_stage == pp_stage:
+                    return nid
         return None
 
+    # ── FSDP2 all_gather + reduce_scatter events ──────────────────────
     if ds > 1:
         num_layers = _infer_num_layers(model_parts)
         per_layer_numel = shard_numel // max(num_layers, 1)
         full_layer_numel = per_layer_numel * ds
 
-        fwd_anchor = _find_last_compute_node_id("forward")
-        bwd_anchor = _find_last_compute_node_id("backward")
+        for stage_idx in range(pp):
+            fwd_anchor = _find_last_compute_node_id("forward", stage_idx)
+            bwd_anchor = _find_last_compute_node_id("backward", stage_idx)
 
-        for i in range(num_layers):
-            node = OpNode(
-                node_id=_next_id(),
-                op_name="all_gather",
-                op_type="comm_collective",
-                phase="forward",
-                inputs=[
-                    TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
-                ],
-                outputs=[
-                    TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
-                ],
-                comm_op="all_gather",
-                comm_group_size=ds,
-                attrs={"synthetic": True},
-            )
-            graph.add_node(node)
-            if fwd_anchor:
-                graph.add_edge(DataEdge(fwd_anchor, node.node_id, "sequential"))
-            result.comm_events.append(
-                {
-                    "event_id": node.node_id,
-                    "op": "all_gather",
-                    "group_size": ds,
-                    "phase": "forward",
-                    "tensor_meta": {
-                        "shape": [per_layer_numel],
-                        "dtype": dtype_str,
-                        "device": "cpu",
-                    },
-                    "source_node_ids": [fwd_anchor] if fwd_anchor else [],
-                    "synthetic": True,
-                }
-            )
+            for i in range(num_layers):
+                node = OpNode(
+                    node_id=_next_id(),
+                    op_name="all_gather",
+                    op_type="comm_collective",
+                    phase="forward",
+                    pp_stage=stage_idx,
+                    inputs=[
+                        TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
+                    ],
+                    outputs=[
+                        TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
+                    ],
+                    comm_op="all_gather",
+                    comm_group_size=ds,
+                    attrs={"synthetic": True, "fsdp2": True},
+                )
+                graph.add_node(node)
+                if fwd_anchor:
+                    graph.add_edge(DataEdge(fwd_anchor, node.node_id, "sequential"))
+                result.comm_events.append(
+                    {
+                        "event_id": node.node_id,
+                        "op": "all_gather",
+                        "group_size": ds,
+                        "phase": "forward",
+                        "pp_stage": stage_idx,
+                        "tensor_meta": {
+                            "shape": [per_layer_numel],
+                            "dtype": dtype_str,
+                            "device": "cpu",
+                        },
+                        "source_node_ids": [fwd_anchor] if fwd_anchor else [],
+                        "synthetic": True,
+                    }
+                )
 
-        for i in range(num_layers):
-            node = OpNode(
-                node_id=_next_id(),
-                op_name="reduce_scatter",
-                op_type="comm_collective",
-                phase="backward",
-                inputs=[
-                    TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
-                ],
-                outputs=[
-                    TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
-                ],
-                comm_op="reduce_scatter",
-                comm_group_size=ds,
-                attrs={"synthetic": True},
-            )
-            graph.add_node(node)
-            if bwd_anchor:
-                graph.add_edge(DataEdge(bwd_anchor, node.node_id, "sequential"))
-            result.comm_events.append(
-                {
-                    "event_id": node.node_id,
-                    "op": "reduce_scatter",
-                    "group_size": ds,
-                    "phase": "backward",
-                    "tensor_meta": {
-                        "shape": [full_layer_numel],
-                        "dtype": dtype_str,
-                        "device": "cpu",
-                    },
-                    "source_node_ids": [bwd_anchor] if bwd_anchor else [],
-                    "synthetic": True,
-                }
-            )
+            for i in range(num_layers):
+                node = OpNode(
+                    node_id=_next_id(),
+                    op_name="reduce_scatter",
+                    op_type="comm_collective",
+                    phase="backward",
+                    pp_stage=stage_idx,
+                    inputs=[
+                        TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
+                    ],
+                    outputs=[
+                        TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
+                    ],
+                    comm_op="reduce_scatter",
+                    comm_group_size=ds,
+                    attrs={"synthetic": True, "fsdp2": True},
+                )
+                graph.add_node(node)
+                if bwd_anchor:
+                    graph.add_edge(DataEdge(bwd_anchor, node.node_id, "sequential"))
+                result.comm_events.append(
+                    {
+                        "event_id": node.node_id,
+                        "op": "reduce_scatter",
+                        "group_size": ds,
+                        "phase": "backward",
+                        "pp_stage": stage_idx,
+                        "tensor_meta": {
+                            "shape": [full_layer_numel],
+                            "dtype": dtype_str,
+                            "device": "cpu",
+                        },
+                        "source_node_ids": [bwd_anchor] if bwd_anchor else [],
+                        "synthetic": True,
+                    }
+                )
 
     # ── TP all_reduce events ──────────────────────────────────────────
     if tp > 1:
@@ -341,69 +353,225 @@ def _inject_synthetic_comm_events(
         num_layers = _infer_num_layers(model_parts)
         tp_allreduce_count = num_layers * 2
 
-        fwd_anchor = _find_last_compute_node_id("forward")
-        bwd_anchor = _find_last_compute_node_id("backward")
+        for stage_idx in range(pp):
+            fwd_anchor = _find_last_compute_node_id("forward", stage_idx)
+            bwd_anchor = _find_last_compute_node_id("backward", stage_idx)
 
-        for _ in range(tp_allreduce_count):
-            node = OpNode(
-                node_id=_next_id(),
-                op_name="all_reduce",
-                op_type="comm_collective",
-                phase="forward",
-                inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
-                outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
-                comm_op="all_reduce",
-                comm_group_size=tp,
-                attrs={"synthetic": True},
-            )
-            graph.add_node(node)
-            if fwd_anchor:
-                graph.add_edge(DataEdge(fwd_anchor, node.node_id, "sequential"))
-            result.comm_events.append(
-                {
-                    "event_id": node.node_id,
-                    "op": "all_reduce",
-                    "group_size": tp,
-                    "phase": "forward",
-                    "tensor_meta": {
-                        "shape": [batch_size, seq_len, hidden],
-                        "dtype": dtype_str,
-                        "device": "cpu",
-                    },
-                    "source_node_ids": [fwd_anchor] if fwd_anchor else [],
-                    "synthetic": True,
-                }
-            )
+            for _ in range(tp_allreduce_count):
+                node = OpNode(
+                    node_id=_next_id(),
+                    op_name="all_reduce",
+                    op_type="comm_collective",
+                    phase="forward",
+                    pp_stage=stage_idx,
+                    inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
+                    comm_op="all_reduce",
+                    comm_group_size=tp,
+                    attrs={"synthetic": True, "tp": True},
+                )
+                graph.add_node(node)
+                if fwd_anchor:
+                    graph.add_edge(DataEdge(fwd_anchor, node.node_id, "sequential"))
+                result.comm_events.append(
+                    {
+                        "event_id": node.node_id,
+                        "op": "all_reduce",
+                        "group_size": tp,
+                        "phase": "forward",
+                        "pp_stage": stage_idx,
+                        "tensor_meta": {
+                            "shape": [batch_size, seq_len, hidden],
+                            "dtype": dtype_str,
+                            "device": "cpu",
+                        },
+                        "source_node_ids": [fwd_anchor] if fwd_anchor else [],
+                        "synthetic": True,
+                    }
+                )
 
-            node = OpNode(
-                node_id=_next_id(),
-                op_name="all_reduce",
-                op_type="comm_collective",
-                phase="backward",
-                inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
-                outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
-                comm_op="all_reduce",
-                comm_group_size=tp,
-                attrs={"synthetic": True},
-            )
-            graph.add_node(node)
-            if bwd_anchor:
-                graph.add_edge(DataEdge(bwd_anchor, node.node_id, "sequential"))
-            result.comm_events.append(
-                {
-                    "event_id": node.node_id,
-                    "op": "all_reduce",
-                    "group_size": tp,
-                    "phase": "backward",
-                    "tensor_meta": {
-                        "shape": [batch_size, seq_len, hidden],
-                        "dtype": dtype_str,
-                        "device": "cpu",
-                    },
-                    "source_node_ids": [bwd_anchor] if bwd_anchor else [],
-                    "synthetic": True,
-                }
-            )
+                node = OpNode(
+                    node_id=_next_id(),
+                    op_name="all_reduce",
+                    op_type="comm_collective",
+                    phase="backward",
+                    pp_stage=stage_idx,
+                    inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
+                    comm_op="all_reduce",
+                    comm_group_size=tp,
+                    attrs={"synthetic": True, "tp": True},
+                )
+                graph.add_node(node)
+                if bwd_anchor:
+                    graph.add_edge(DataEdge(bwd_anchor, node.node_id, "sequential"))
+                result.comm_events.append(
+                    {
+                        "event_id": node.node_id,
+                        "op": "all_reduce",
+                        "group_size": tp,
+                        "phase": "backward",
+                        "pp_stage": stage_idx,
+                        "tensor_meta": {
+                            "shape": [batch_size, seq_len, hidden],
+                            "dtype": dtype_str,
+                            "device": "cpu",
+                        },
+                        "source_node_ids": [bwd_anchor] if bwd_anchor else [],
+                        "synthetic": True,
+                    }
+                )
+
+    # ── PP send/recv events ───────────────────────────────────────────
+    if pp > 1:
+        seq_len = trainer.config.training.seq_len
+        batch_size = trainer.config.training.local_batch_size
+        hidden = _guess_hidden_dim(model_parts[0])
+        activation_numel = batch_size * seq_len * hidden
+
+        # Create send/recv pairs for each microbatch
+        num_microbatches = int(getattr(parallelism, "pipeline_parallel_microbatch_size", 8) or 8)
+
+        for mb_idx in range(num_microbatches):
+            for stage_idx in range(pp - 1):
+                # Forward: send activation from stage_idx to stage_idx+1
+                send_node = OpNode(
+                    node_id=_next_id(),
+                    op_name="pp_send_activation",
+                    op_type="comm_p2p",
+                    phase="forward",
+                    pp_stage=stage_idx,
+                    microbatch_idx=mb_idx,
+                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    comm_op="send",
+                    comm_group_size=2,
+                    attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx + 1},
+                )
+                graph.add_node(send_node)
+
+                recv_node = OpNode(
+                    node_id=_next_id(),
+                    op_name="pp_recv_activation",
+                    op_type="comm_p2p",
+                    phase="forward",
+                    pp_stage=stage_idx + 1,
+                    microbatch_idx=mb_idx,
+                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    comm_op="recv",
+                    comm_group_size=2,
+                    attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
+                )
+                graph.add_node(recv_node)
+
+                # Add edge: send -> recv
+                graph.add_edge(DataEdge(send_node.node_id, recv_node.node_id, "pp_p2p"))
+
+                result.comm_events.append(
+                    {
+                        "event_id": send_node.node_id,
+                        "op": "send",
+                        "group_size": 2,
+                        "phase": "forward",
+                        "pp_stage": stage_idx,
+                        "microbatch": mb_idx,
+                        "tensor_meta": {
+                            "shape": [batch_size, seq_len, hidden],
+                            "dtype": dtype_str,
+                            "device": "cpu",
+                        },
+                        "source_node_ids": [],
+                        "synthetic": True,
+                    }
+                )
+                result.comm_events.append(
+                    {
+                        "event_id": recv_node.node_id,
+                        "op": "recv",
+                        "group_size": 2,
+                        "phase": "forward",
+                        "pp_stage": stage_idx + 1,
+                        "microbatch": mb_idx,
+                        "tensor_meta": {
+                            "shape": [batch_size, seq_len, hidden],
+                            "dtype": dtype_str,
+                            "device": "cpu",
+                        },
+                        "source_node_ids": [send_node.node_id],
+                        "synthetic": True,
+                    }
+                )
+
+            # Backward: send gradient from stage_idx+1 to stage_idx
+            for stage_idx in range(pp - 1, 0, -1):
+                send_node = OpNode(
+                    node_id=_next_id(),
+                    op_name="pp_send_gradient",
+                    op_type="comm_p2p",
+                    phase="backward",
+                    pp_stage=stage_idx,
+                    microbatch_idx=mb_idx,
+                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    comm_op="send",
+                    comm_group_size=2,
+                    attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx - 1},
+                )
+                graph.add_node(send_node)
+
+                recv_node = OpNode(
+                    node_id=_next_id(),
+                    op_name="pp_recv_gradient",
+                    op_type="comm_p2p",
+                    phase="backward",
+                    pp_stage=stage_idx - 1,
+                    microbatch_idx=mb_idx,
+                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    comm_op="recv",
+                    comm_group_size=2,
+                    attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
+                )
+                graph.add_node(recv_node)
+
+                # Add edge: send -> recv
+                graph.add_edge(DataEdge(send_node.node_id, recv_node.node_id, "pp_p2p"))
+
+                result.comm_events.append(
+                    {
+                        "event_id": send_node.node_id,
+                        "op": "send",
+                        "group_size": 2,
+                        "phase": "backward",
+                        "pp_stage": stage_idx,
+                        "microbatch": mb_idx,
+                        "tensor_meta": {
+                            "shape": [batch_size, seq_len, hidden],
+                            "dtype": dtype_str,
+                            "device": "cpu",
+                        },
+                        "source_node_ids": [],
+                        "synthetic": True,
+                    }
+                )
+                result.comm_events.append(
+                    {
+                        "event_id": recv_node.node_id,
+                        "op": "recv",
+                        "group_size": 2,
+                        "phase": "backward",
+                        "pp_stage": stage_idx - 1,
+                        "microbatch": mb_idx,
+                        "tensor_meta": {
+                            "shape": [batch_size, seq_len, hidden],
+                            "dtype": dtype_str,
+                            "device": "cpu",
+                        },
+                        "source_node_ids": [send_node.node_id],
+                        "synthetic": True,
+                    }
+                )
 
 
 def _infer_num_layers(model_parts: list[Any]) -> int:
@@ -454,6 +622,9 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     """Run one simulated training step using an already-built Trainer instance."""
     rank = int(os.environ.get("RANK", "0"))
     comm_backend = getattr(sim_opts, "comm_backend", "") or ""
+    actual_comm_mode = getattr(trainer.config.comm, "mode", "") or ""
+    if actual_comm_mode == "fake_backend":
+        comm_backend = ""
 
     data_iterator = trainer.batch_generator(trainer.dataloader)
     trainer.optimizers.zero_grad()
@@ -676,8 +847,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     if comm_backend != "gloo":
         try:
             _inject_synthetic_comm_events(result, trainer, sim_opts)
+            synth_comm = [n for n in result.compute_graph.nodes.values() if n.attrs.get("synthetic")]
+            logger.info("Synthetic comm events injected: %d", len(synth_comm))
         except Exception as exc:
+            import traceback
             logger.warning("Failed to inject synthetic comm events: %s", exc)
+            traceback.print_exc()
 
     # ── Semantic schedule (must precede CostModel) ────────────────────
     if sim_opts.semantic_schedule:
