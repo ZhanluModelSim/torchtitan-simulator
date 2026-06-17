@@ -31,6 +31,8 @@ from .cost_estimators import (
     _estimate_bytes,
     _estimate_comm_bytes,
     _estimate_flops,
+    _numel,
+    _tensor_bytes,
 )
 from .nodes import ComputeGraph, OpNode, PerfResult, SimulationResult
 from .schedule_analysis import (
@@ -47,6 +49,8 @@ __all__ = [
     "NoOverlap",
     "OverlapStrategy",
     "_critical_path_time_us",
+    "_numel",
+    "_tensor_bytes",
     "link_schedule_to_graph",
     "predict_multi_rank_step_time_us",
 ]
