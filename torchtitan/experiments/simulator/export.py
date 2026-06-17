@@ -1258,12 +1258,14 @@ def export_html(
         return;
       }}
       
-      // Classify operators into Cube/Vec/Communication
+      // Classify operators into Compute (Cube/Vec) or Communication
+      // Cube and Vec share the same compute engine — they CANNOT run in parallel.
+      // Only Communication can overlap with Compute when no data dependency exists.
       function classifyOperator(node) {{
         const opName = (node.op_name || '').toLowerCase();
         const opType = node.op_type || '';
         
-        // Communication operations
+        // Communication operations — runs on dedicated comm engine
         if (opType === 'comm_collective' || opType === 'comm_p2p' || 
             opName.includes('all_reduce') || opName.includes('all_gather') || 
             opName.includes('reduce_scatter') || opName.includes('broadcast') ||
@@ -1271,14 +1273,19 @@ def export_html(
           return 'Communication';
         }}
         
-        // Cube operations (matrix/tensor operations)
+        // Everything else runs on the shared compute engine
+        // (Cube: mm/matmul/conv; Vec: add/mul/relu/norm; memory; data_move)
+        return 'Compute';
+      }}
+      
+      // Sub-classify for display color only (does NOT affect scheduling)
+      function subClassify(node) {{
+        const opName = (node.op_name || '').toLowerCase();
         if (opName.includes('mm') || opName.includes('matmul') || opName.includes('bmm') ||
             opName.includes('addmm') || opName.includes('linear') || opName.includes('conv') ||
             opName.includes('gemm') || opName.includes('dot')) {{
           return 'Cube';
         }}
-        
-        // Vec operations (element-wise, activation, normalization)
         return 'Vec';
       }}
       
@@ -1322,9 +1329,17 @@ def export_html(
         if (!sorted.includes(n.node_id)) sorted.push(n.node_id);
       }});
       
-      // Calculate start times respecting dependencies
-      // Each operator starts after ALL its dependencies complete
-      const operatorTimes = new Map(); // nodeId -> {{start, end, lane, duration}}
+      // ── Two-resource DES scheduling ──────────────────────────────
+      // Compute engine: shared by Cube + Vec (serialized, no overlap)
+      // Comm engine:    dedicated to Communication (can overlap with Compute)
+      //
+      // For each operator in topological order:
+      //   1. depEndTime = max(end time of all data-dependency predecessors)
+      //   2. If Compute: start = max(depEndTime, computeLaneEndTime)
+      //      If Comm:    start = max(depEndTime, commLaneEndTime)
+      let computeLaneEndTime = 0;
+      let commLaneEndTime = 0;
+      const operatorTimes = new Map();
       
       sorted.forEach(nodeId => {{
         const node = nodeMap.get(nodeId);
@@ -1332,24 +1347,35 @@ def export_html(
         
         const lane = classifyOperator(node);
         const duration = node.perf_result?.total_time_us || 0;
+        const subType = lane === 'Compute' ? subClassify(node) : 'Communication';
         
-        // Find the maximum end time of all dependencies
-        let maxDependencyEndTime = 0;
+        // Max end time of all data-dependency predecessors
+        let depEndTime = 0;
         const dependencies = reverseAdjList.get(nodeId) || [];
         dependencies.forEach(depId => {{
           const depTime = operatorTimes.get(depId);
-          if (depTime && depTime.end > maxDependencyEndTime) {{
-            maxDependencyEndTime = depTime.end;
+          if (depTime && depTime.end > depEndTime) {{
+            depEndTime = depTime.end;
           }}
         }});
         
-        const startTime = maxDependencyEndTime;
+        let startTime;
+        if (lane === 'Compute') {{
+          // Compute engine is shared — must wait for both deps AND previous compute op
+          startTime = Math.max(depEndTime, computeLaneEndTime);
+          computeLaneEndTime = startTime + duration;
+        }} else {{
+          // Comm engine is independent — must wait for deps AND previous comm op
+          startTime = Math.max(depEndTime, commLaneEndTime);
+          commLaneEndTime = startTime + duration;
+        }}
         const endTime = startTime + duration;
         
         operatorTimes.set(nodeId, {{
           nodeId: node.node_id,
           opName: (node.op_name || 'unknown').replace('aten.', '').replace('.default', ''),
           opType: node.op_type,
+          subType: subType,
           start: startTime,
           end: endTime,
           duration: duration,
@@ -1357,18 +1383,20 @@ def export_html(
         }});
       }});
       
-      // Organize operators by lane
-      const lanes = {{ 'Cube': [], 'Vec': [], 'Communication': [] }};
-      operatorTimes.forEach((op, nodeId) => {{
-        lanes[op.lane].push(op);
+      // Organize operators by display lane (Cube, Vec, Communication)
+      const displayLanes = {{ 'Cube': [], 'Vec': [], 'Communication': [] }};
+      operatorTimes.forEach((op) => {{
+        displayLanes[op.subType].push(op);
       }});
       
       // Sort each lane by start time
-      Object.keys(lanes).forEach(laneName => {{
-        lanes[laneName].sort((a, b) => a.start - b.start);
+      Object.keys(displayLanes).forEach(laneName => {{
+        displayLanes[laneName].sort((a, b) => a.start - b.start);
       }});
       
       // Prepare ECharts data
+      // Display lanes: Cube, Vec, Communication (for visual separation only)
+      // Scheduling: Cube+Vec share Compute engine, Comm is independent
       const laneNames = ['Cube', 'Vec', 'Communication'];
       const laneColors = {{
         'Cube': '#3b82f6',
@@ -1380,7 +1408,7 @@ def export_html(
       let maxTime = 0;
       
       laneNames.forEach((laneName, laneIdx) => {{
-        lanes[laneName].forEach(op => {{
+        displayLanes[laneName].forEach(op => {{
           seriesData.push({{
             name: op.opName,
             value: [laneIdx, op.start, op.end, op.duration],
@@ -1400,10 +1428,11 @@ def export_html(
             const op = params.data.op;
             const deps = reverseAdjList.get(op.nodeId) || [];
             const dependents = adjList.get(op.nodeId) || [];
+            const engine = op.lane === 'Compute' ? 'Compute Engine' : 'Comm Engine';
             return `<div style="padding:10px;min-width:220px;">
               <div style="font-weight:bold;font-size:14px;margin-bottom:8px;color:#1f2937;">${{op.opName}}</div>
               <div style="color:#6b7280;font-size:12px;line-height:1.6;">
-                <div><b>Lane:</b> ${{op.lane}}</div>
+                <div><b>Category:</b> ${{op.subType}} (${{engine}})</div>
                 <div><b>Type:</b> ${{op.opType}}</div>
                 <div><b>Start:</b> ${{fmt(op.start)}}</div>
                 <div><b>Duration:</b> ${{fmt(op.duration)}}</div>
@@ -1500,21 +1529,20 @@ def export_html(
       
       // Add statistics panel
       const statsDiv = document.createElement('div');
-      statsDiv.style.cssText = 'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);padding:12px 16px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.1);font-size:12px;color:#374151;min-width:200px;';
+      statsDiv.style.cssText = 'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);padding:12px 16px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.1);font-size:12px;color:#374151;min-width:220px;';
       
-      const cubeOps = lanes['Cube'].length;
-      const vecOps = lanes['Vec'].length;
-      const commOps = lanes['Communication'].length;
+      const cubeOps = displayLanes['Cube'].length;
+      const vecOps = displayLanes['Vec'].length;
+      const commOps = displayLanes['Communication'].length;
       const totalOps = cubeOps + vecOps + commOps;
       
-      // Calculate total compute time (sum of all operator durations)
-      let totalComputeTime = 0;
+      // Calculate total compute time per engine
+      let computeTotalTime = 0;
+      let commTotalTime = 0;
       operatorTimes.forEach(op => {{
-        totalComputeTime += op.duration;
+        if (op.lane === 'Compute') computeTotalTime += op.duration;
+        else commTotalTime += op.duration;
       }});
-      
-      // Calculate parallelism efficiency
-      const parallelismEfficiency = maxTime > 0 ? (totalComputeTime / maxTime).toFixed(2) : '0';
       
       statsDiv.innerHTML = `
         <div style="font-weight:bold;margin-bottom:8px;font-size:13px;">Execution Statistics</div>
@@ -1525,12 +1553,13 @@ def export_html(
           <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;">
             <b>Total:</b> ${{totalOps}} ops<br/>
             <b>Critical path:</b> ${{fmt(maxTime)}}<br/>
-            <b>Total compute:</b> ${{fmt(totalComputeTime)}}<br/>
-            <b>Parallelism:</b> ${{parallelismEfficiency}}x
+            <b>Compute engine:</b> ${{fmt(computeTotalTime)}}<br/>
+            <b>Comm engine:</b> ${{fmt(commTotalTime)}}
           </div>
           <div style="margin-top:6px;color:#6b7280;font-size:10px;line-height:1.4;">
-            Operators respect data dependencies.<br/>
-            Start time = max(dependency end times).
+            Cube+Vec share the <b>Compute Engine</b> (serialized).<br/>
+            Communication runs on a separate <b>Comm Engine</b>.<br/>
+            Compute↔Comm overlap only when no data dependency.
           </div>
         </div>
       `;
