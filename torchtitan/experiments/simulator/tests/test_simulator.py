@@ -905,13 +905,15 @@ class TestExport(unittest.TestCase):
 
 class TestExportResultGatedToRankZero(unittest.TestCase):
     def test_export_result_gated_to_rank_zero(self):
+        from torchtitan.experiments.simulator.export import (
+            export_result as _export_result,
+        )
         from torchtitan.experiments.simulator.nodes import (
             ComputeGraph,
             OpNode,
             PerfResult,
             SimulationResult,
         )
-        from torchtitan.experiments.simulator.trainer_runner import _export_result
 
         g = ComputeGraph()
         g.add_node(
@@ -1379,8 +1381,8 @@ class TestSyntheticCommInjection(unittest.TestCase):
             SimulationResult,
             TensorMeta,
         )
-        from torchtitan.experiments.simulator.trainer_runner import (
-            _inject_synthetic_comm_events,
+        from torchtitan.experiments.simulator.synthetic_comm import (
+            inject_synthetic_comm_events as _inject_synthetic_comm_events,
         )
 
         graph = ComputeGraph()
@@ -1720,7 +1722,9 @@ class TestOverlapStrategy(unittest.TestCase):
 
 class TestInferNumLayers(unittest.TestCase):
     def test_from_config_n_layers(self):
-        from torchtitan.experiments.simulator.trainer_runner import _infer_num_layers
+        from torchtitan.experiments.simulator.synthetic_comm import (
+            infer_num_layers as _infer_num_layers,
+        )
 
         class MockConfig:
             n_layers = 8
@@ -1735,7 +1739,9 @@ class TestInferNumLayers(unittest.TestCase):
         assert _infer_num_layers([MockModel()]) == 8
 
     def test_from_layers_attr(self):
-        from torchtitan.experiments.simulator.trainer_runner import _infer_num_layers
+        from torchtitan.experiments.simulator.synthetic_comm import (
+            infer_num_layers as _infer_num_layers,
+        )
 
         class MockModel(nn.Module):
             layers = nn.ModuleList([nn.Linear(4, 4) for _ in range(4)])
@@ -1743,7 +1749,9 @@ class TestInferNumLayers(unittest.TestCase):
         assert _infer_num_layers([MockModel()]) == 4
 
     def test_fallback_prefix_count(self):
-        from torchtitan.experiments.simulator.trainer_runner import _infer_num_layers
+        from torchtitan.experiments.simulator.synthetic_comm import (
+            infer_num_layers as _infer_num_layers,
+        )
 
         model = nn.Linear(16, 4)
         result = _infer_num_layers([model])

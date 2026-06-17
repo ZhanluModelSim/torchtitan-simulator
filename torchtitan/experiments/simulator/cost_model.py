@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
+from .memory_estimator import dtype_size as _dtype_size
 from .nodes import ComputeGraph, OpNode, PerfResult, SimulationResult
 
 # ---------------------------------------------------------------------------
@@ -212,25 +213,10 @@ def _tensor_bytes(
     shape: tuple[int, ...], dtype: str, default_seq_len: int = 4096
 ) -> int:
     """Bytes for a tensor of given shape and dtype string."""
-    dtype_bytes = {
-        "torch.float32": 4,
-        "torch.float": 4,
-        "torch.float16": 2,
-        "torch.half": 2,
-        "torch.bfloat16": 2,
-        "torch.float8_e4m3fn": 1,
-        "torch.float8_e5m2": 1,
-        "torch.int64": 8,
-        "torch.long": 8,
-        "torch.int32": 4,
-        "torch.int": 4,
-        "torch.int16": 2,
-        "torch.short": 2,
-        "torch.int8": 1,
-        "torch.uint8": 1,
-        "torch.bool": 1,
-    }
-    return _numel(shape, default_seq_len) * dtype_bytes.get(dtype, 2)
+    nbytes = _dtype_size(dtype)
+    if nbytes == 0:
+        nbytes = 2
+    return _numel(shape, default_seq_len) * nbytes
 
 
 # ---------------------------------------------------------------------------
