@@ -946,8 +946,8 @@ def export_html(
         return "\n".join(
             f"""
             <details open>
-              <summary>{escape(phase)} operator dependency DAG</summary>
-              <div id="dag-{step}-{escape(phase)}" style="width:100%;height:900px;background:#fafafa;border-radius:8px;border:1px solid #e5e7eb;"></div>
+              <summary>{escape(phase)} operator swimlane (Cube / Vec / Communication)</summary>
+              <div id="swimlane-{step}-{escape(phase)}" style="width:100%;height:700px;background:#f8fafc;border-radius:8px;border:1px solid #e5e7eb;"></div>
             </details>
             """
             for phase in step_phases
@@ -978,7 +978,6 @@ def export_html(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)}</title>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
-  <script src="https://unpkg.com/@antv/g6@4.8.24/dist/g6.min.js"></script>
   <style>
     :root {{ --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#94a3b8; --border:#334155; }}
     body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }}
@@ -1239,10 +1238,10 @@ def export_html(
     }})();
     ''' for step in steps)}
 
-    // Initialize AntV G6 for DAG visualization
+    // Initialize ECharts for operator swimlane visualization (Cube/Vec/Communication)
     {chr(10).join(f'''
     (function() {{
-      const containerId = 'dag-{step}-{phase}';
+      const containerId = 'swimlane-{step}-{phase}';
       const container = document.getElementById(containerId);
       if (!container) return;
       
@@ -1255,170 +1254,243 @@ def export_html(
       }});
       
       if (nodes.length === 0) {{
-        container.innerHTML = '<div style="padding:40px;text-align:center;color:#666;font-size:16px;">No nodes in this phase</div>';
+        container.innerHTML = '<div style="padding:40px;text-align:center;color:#666;font-size:16px;">No operators in this phase</div>';
         return;
       }}
       
-      // Limit nodes for performance (increased from 220 to 500)
-      const maxNodes = 500;
-      const limitedNodes = nodes.slice(0, maxNodes);
-      const nodeIds = new Set(limitedNodes.map(n => n.node_id));
-      const limitedEdges = edges.filter(e => nodeIds.has(e.src) && nodeIds.has(e.dst));
+      // Classify operators into Cube/Vec/Communication
+      function classifyOperator(node) {{
+        const opName = (node.op_name || '').toLowerCase();
+        const opType = node.op_type || '';
+        
+        // Communication operations
+        if (opType === 'comm_collective' || opType === 'comm_p2p' || 
+            opName.includes('all_reduce') || opName.includes('all_gather') || 
+            opName.includes('reduce_scatter') || opName.includes('broadcast') ||
+            opName.includes('send') || opName.includes('recv')) {{
+          return 'Communication';
+        }}
+        
+        // Cube operations (matrix/tensor operations)
+        if (opName.includes('mm') || opName.includes('matmul') || opName.includes('bmm') ||
+            opName.includes('addmm') || opName.includes('linear') || opName.includes('conv') ||
+            opName.includes('gemm') || opName.includes('dot')) {{
+          return 'Cube';
+        }}
+        
+        // Vec operations (element-wise, activation, normalization)
+        return 'Vec';
+      }}
       
-      // Enhanced color scheme with gradients
-      const colorScheme = {{
-        compute: {{ fill: '#dbeafe', stroke: '#3b82f6', text: '#1e40af' }},
-        comm_collective: {{ fill: '#fef3c7', stroke: '#f59e0b', text: '#92400e' }},
-        comm_p2p: {{ fill: '#fed7aa', stroke: '#f97316', text: '#9a3412' }},
-        data_move: {{ fill: '#d1fae5', stroke: '#10b981', text: '#065f46' }},
-        memory: {{ fill: '#e9d5ff', stroke: '#a855f7', text: '#6b21a8' }},
-        unknown: {{ fill: '#f3f4f6', stroke: '#6b7280', text: '#374151' }}
+      // Build dependency graph and topological sort
+      const nodeMap = new Map(nodes.map(n => [n.node_id, n]));
+      const inDegree = new Map(nodes.map(n => [n.node_id, 0]));
+      const adjList = new Map(nodes.map(n => [n.node_id, []]));
+      
+      edges.forEach(e => {{
+        if (inDegree.has(e.dst)) {{
+          inDegree.set(e.dst, inDegree.get(e.dst) + 1);
+        }}
+        if (adjList.has(e.src)) {{
+          adjList.get(e.src).push(e.dst);
+        }}
+      }});
+      
+      // Kahn's algorithm for topological sort
+      const queue = [];
+      inDegree.forEach((deg, nodeId) => {{
+        if (deg === 0) queue.push(nodeId);
+      }});
+      
+      const sorted = [];
+      while (queue.length > 0) {{
+        const nodeId = queue.shift();
+        sorted.push(nodeId);
+        (adjList.get(nodeId) || []).forEach(nextId => {{
+          const newDeg = inDegree.get(nextId) - 1;
+          inDegree.set(nextId, newDeg);
+          if (newDeg === 0) queue.push(nextId);
+        }});
+      }}
+      
+      // Add any remaining nodes (cycles or disconnected)
+      nodes.forEach(n => {{
+        if (!sorted.includes(n.node_id)) sorted.push(n.node_id);
+      }});
+      
+      // Organize operators by lane and calculate cumulative time
+      const lanes = {{ 'Cube': [], 'Vec': [], 'Communication': [] }};
+      const laneTime = {{ 'Cube': 0, 'Vec': 0, 'Communication': 0 }};
+      
+      sorted.forEach(nodeId => {{
+        const node = nodeMap.get(nodeId);
+        if (!node) return;
+        
+        const lane = classifyOperator(node);
+        const duration = node.perf_result?.total_time_us || 0;
+        const startTime = laneTime[lane];
+        const endTime = startTime + duration;
+        
+        lanes[lane].push({{
+          nodeId: node.node_id,
+          opName: (node.op_name || 'unknown').replace('aten.', '').replace('.default', ''),
+          opType: node.op_type,
+          start: startTime,
+          end: endTime,
+          duration: duration,
+          lane: lane
+        }});
+        
+        laneTime[lane] = endTime;
+      }});
+      
+      // Prepare ECharts data
+      const laneNames = ['Cube', 'Vec', 'Communication'];
+      const laneColors = {{
+        'Cube': '#3b82f6',
+        'Vec': '#10b981',
+        'Communication': '#f59e0b'
       }};
       
-      const g6Nodes = limitedNodes.map(n => {{
-        const colors = colorScheme[n.op_type] || colorScheme.unknown;
-        const duration = n.perf_result?.total_time_us || 0;
-        const label = (n.op_name || 'unknown').replace('aten.', '').replace('.default', '');
-        
-        return {{
-          id: n.node_id,
-          label: label.length > 25 ? label.substring(0, 22) + '...' : label,
-          op_type: n.op_type,
-          duration: duration,
-          style: {{
-            fill: colors.fill,
-            stroke: colors.stroke,
-            lineWidth: 2,
-            shadowColor: 'rgba(0,0,0,0.1)',
-            shadowBlur: 8,
-            shadowOffsetX: 2,
-            shadowOffsetY: 2,
-            cursor: 'pointer'
-          }},
-          labelCfg: {{
-            style: {{
-              fill: colors.text,
-              fontSize: 11,
-              fontWeight: 'bold'
-            }},
-            position: 'center',
-            offset: 0
-          }}
-        }};
+      const seriesData = [];
+      laneNames.forEach((laneName, laneIdx) => {{
+        lanes[laneName].forEach(op => {{
+          seriesData.push({{
+            name: op.opName,
+            value: [laneIdx, op.start, op.end, op.duration],
+            itemStyle: {{ color: laneColors[laneName] }},
+            op: op
+          }});
+        }});
       }});
       
-      const g6Edges = limitedEdges.map(e => ({{
-        source: e.src,
-        target: e.dst,
-        style: {{
-          stroke: e.type === 'data' ? '#3b82f6' : '#9ca3af',
-          lineWidth: e.type === 'data' ? 2 : 1.5,
-          lineDash: e.type !== 'data' ? [5, 5] : [],
-          endArrow: {{
-            path: 'M 0,0 L 10,5 L 10,-5 Z',
-            fill: e.type === 'data' ? '#3b82f6' : '#9ca3af',
-            stroke: e.type === 'data' ? '#3b82f6' : '#9ca3af'
-          }},
-          opacity: 0.7
-        }}
-      }}));
+      const maxTime = Math.max(...Object.values(laneTime), 1);
       
-      const graph = new G6.Graph({{
-        container: containerId,
-        width: container.clientWidth,
-        height: 900,
-        fitView: true,
-        fitViewPadding: [40, 40, 40, 40],
-        modes: {{
-          default: [
-            'drag-canvas',
-            'zoom-canvas',
-            'drag-node',
-            {{
-              type: 'tooltip',
-              formatText: function(model) {{
-                const duration = model.duration || 0;
-                const durationStr = duration > 0 ? fmt(duration) : 'N/A';
-                return `<div style="padding:10px;background:white;border:1px solid #ddd;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.15);">
-                  <div style="font-weight:bold;font-size:14px;margin-bottom:6px;color:#1f2937;">${{model.label}}</div>
-                  <div style="color:#6b7280;font-size:12px;">
-                    <div>Type: <span style="color:#374151;">${{model.op_type}}</span></div>
-                    <div>Duration: <span style="color:#374151;">${{durationStr}}</span></div>
-                    <div>ID: <span style="color:#374151;font-family:monospace;">${{model.id}}</span></div>
-                  </div>
-                </div>`;
+      // Initialize ECharts
+      const chart = echarts.init(container);
+      chart.setOption({{
+        tooltip: {{
+          trigger: 'item',
+          formatter: function(params) {{
+            const op = params.data.op;
+            return `<div style="padding:10px;min-width:200px;">
+              <div style="font-weight:bold;font-size:14px;margin-bottom:8px;color:#1f2937;">${{op.opName}}</div>
+              <div style="color:#6b7280;font-size:12px;line-height:1.6;">
+                <div><b>Lane:</b> ${{op.lane}}</div>
+                <div><b>Type:</b> ${{op.opType}}</div>
+                <div><b>Start:</b> ${{fmt(op.start)}}</div>
+                <div><b>Duration:</b> ${{fmt(op.duration)}}</div>
+                <div><b>End:</b> ${{fmt(op.end)}}</div>
+                <div style="margin-top:4px;font-family:monospace;font-size:11px;color:#9ca3af;">ID: ${{op.nodeId}}</div>
+              </div>
+            </div>`;
+          }}
+        }},
+        legend: {{
+          data: laneNames,
+          top: 10,
+          textStyle: {{ color: '#333', fontSize: 13 }},
+          itemWidth: 20,
+          itemHeight: 14
+        }},
+        grid: {{
+          left: '12%',
+          right: '8%',
+          top: '15%',
+          bottom: '18%'
+        }},
+        xAxis: {{
+          type: 'value',
+          name: 'Cumulative Time',
+          nameLocation: 'middle',
+          nameGap: 35,
+          nameTextStyle: {{ fontSize: 13, fontWeight: 'bold' }},
+          axisLabel: {{
+            formatter: (val) => fmt(val),
+            fontSize: 11
+          }},
+          splitLine: {{
+            lineStyle: {{ color: '#e5e7eb', type: 'dashed' }}
+          }},
+          max: maxTime
+        }},
+        yAxis: {{
+          type: 'category',
+          data: laneNames,
+          inverse: true,
+          axisLabel: {{
+            fontSize: 14,
+            fontWeight: 'bold',
+            color: '#1f2937'
+          }},
+          axisTick: {{ show: false }},
+          splitLine: {{
+            show: true,
+            lineStyle: {{ color: '#f3f4f6', width: 2 }}
+          }}
+        }},
+        series: [{{
+          type: 'custom',
+          renderItem: function(params, api) {{
+            const laneIdx = api.value(0);
+            const start = api.coord([api.value(1), laneIdx]);
+            const end = api.coord([api.value(2), laneIdx]);
+            const height = api.size([0, 1])[1] * 0.75;
+            const width = Math.max(2, end[0] - start[0]);
+            
+            return {{
+              type: 'rect',
+              shape: {{
+                x: start[0],
+                y: start[1] - height / 2,
+                width: width,
+                height: height,
+                r: 4
               }},
-              offset: 10
-            }}
-          ]
-        }},
-        layout: {{
-          type: 'dagre',
-          rankdir: 'TB',
-          nodesep: 30,
-          ranksep: 60,
-          controlPoints: true,
-          align: 'UL'
-        }},
-        defaultNode: {{
-          type: 'rect',
-          size: [140, 50],
-          style: {{
-            radius: 8
-          }}
-        }},
-        defaultEdge: {{
-          type: 'cubic-horizontal',
-          style: {{
-            radius: 20,
-            offset: 20
-          }}
-        }},
-        nodeStateStyles: {{
-          hover: {{
-            shadowBlur: 15,
-            shadowColor: 'rgba(0,0,0,0.3)'
+              style: api.style(),
+              emphasis: {{
+                style: {{
+                  shadowBlur: 12,
+                  shadowColor: 'rgba(0,0,0,0.3)',
+                  stroke: '#1f2937',
+                  lineWidth: 2
+                }}
+              }}
+            }};
           }},
-          active: {{
-            stroke: '#ef4444',
-            lineWidth: 3
-          }}
-        }},
-        edgeStateStyles: {{
-          hover: {{
-            stroke: '#ef4444',
-            lineWidth: 3
-          }}
-        }}
+          encode: {{ x: [1, 2], y: 0 }},
+          data: seriesData
+        }}],
+        dataZoom: [
+          {{ type: 'inside', xAxisIndex: 0, start: 0, end: 100 }},
+          {{ type: 'slider', xAxisIndex: 0, start: 0, end: 100, height: 25, bottom: 10 }}
+        ]
       }});
       
-      // Add node hover effects
-      graph.on('node:mouseenter', (evt) => {{
-        const node = evt.item;
-        graph.setItemState(node, 'hover', true);
-      }});
+      // Add statistics panel
+      const statsDiv = document.createElement('div');
+      statsDiv.style.cssText = 'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);padding:12px 16px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.1);font-size:12px;color:#374151;min-width:180px;';
       
-      graph.on('node:mouseleave', (evt) => {{
-        const node = evt.item;
-        graph.setItemState(node, 'hover', false);
-      }});
+      const cubeOps = lanes['Cube'].length;
+      const vecOps = lanes['Vec'].length;
+      const commOps = lanes['Communication'].length;
+      const totalOps = cubeOps + vecOps + commOps;
       
-      graph.data({{ nodes: g6Nodes, edges: g6Edges }});
-      graph.render();
-      
-      // Add info text
-      const infoDiv = document.createElement('div');
-      infoDiv.style.cssText = 'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);padding:10px 15px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.1);font-size:12px;color:#374151;';
-      infoDiv.innerHTML = `
-        <div style="font-weight:bold;margin-bottom:4px;">Graph Info</div>
-        <div>Nodes: ${{limitedNodes.length}} / ${{nodes.length}}</div>
-        <div>Edges: ${{limitedEdges.length}} / ${{edges.length}}</div>
-        <div style="margin-top:6px;color:#6b7280;font-size:11px;">
-          Scroll to zoom • Drag to pan
+      statsDiv.innerHTML = `
+        <div style="font-weight:bold;margin-bottom:8px;font-size:13px;">Operator Statistics</div>
+        <div style="line-height:1.8;">
+          <div><span style="color:${{laneColors.Cube}};">●</span> Cube: <b>${{cubeOps}}</b> (${{(cubeOps/totalOps*100).toFixed(1)}}%)</div>
+          <div><span style="color:${{laneColors.Vec}};">●</span> Vec: <b>${{vecOps}}</b> (${{(vecOps/totalOps*100).toFixed(1)}}%)</div>
+          <div><span style="color:${{laneColors.Communication}};">●</span> Comm: <b>${{commOps}}</b> (${{(commOps/totalOps*100).toFixed(1)}}%)</div>
+          <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;"><b>Total:</b> ${{totalOps}} ops</div>
+          <div style="margin-top:4px;color:#6b7280;font-size:11px;">Total time: ${{fmt(maxTime)}}</div>
         </div>
       `;
       container.style.position = 'relative';
-      container.appendChild(infoDiv);
+      container.appendChild(statsDiv);
+      
+      // Handle resize
+      window.addEventListener('resize', () => chart.resize());
     }})();
     ''' for step in steps for phase in phases)}
 
@@ -1426,6 +1498,7 @@ def export_html(
     window.addEventListener('resize', function() {{
       memoryChart.resize();
       {chr(10).join(f'echarts.getInstanceByDom(document.getElementById("timeline-{step}"))?.resize();' for step in steps)}
+      {chr(10).join(f'echarts.getInstanceByDom(document.getElementById("swimlane-{step}-{phase}"))?.resize();' for step in steps for phase in phases)}
     }});
   </script>
 </body>

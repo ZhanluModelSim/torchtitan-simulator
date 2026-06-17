@@ -742,14 +742,17 @@ class TestExport(unittest.TestCase):
             with open(path) as f:
                 content = f.read()
             assert "TorchTitan Simulation Trace" in content
-            assert "operator dependency DAG" in content
-            # Check for ECharts and AntV G6 libraries
+            assert "operator swimlane" in content
+            # Check for ECharts library
             assert "echarts" in content
-            assert "G6" in content
             # Check for new visualization containers
             assert "memory-timeline" in content
             assert "timeline-" in content
-            assert "dag-" in content
+            assert "swimlane-" in content
+            # Check for swimlane categories
+            assert "Cube" in content
+            assert "Vec" in content
+            assert "Communication" in content
             # Check for summary cards
             assert "Estimated live memory peak" in content
             assert "Memory estimate summary" in content
