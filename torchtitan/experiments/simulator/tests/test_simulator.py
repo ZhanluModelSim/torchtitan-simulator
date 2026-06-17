@@ -743,20 +743,17 @@ class TestExport(unittest.TestCase):
                 content = f.read()
             assert "TorchTitan Simulation Trace" in content
             assert "operator dependency DAG" in content
-            assert "Chrome Trace Timeline" in content
-            assert "canvas" in content
-            assert "drawChromeTrace" in content
-            assert "drawDag" in content
-            assert "Zoom in" in content
-            assert "rank-tabs" in content
-            assert "Global rank" in content
-            assert "PP rank" in content
+            # Check for ECharts and AntV G6 libraries
+            assert "echarts" in content
+            assert "G6" in content
+            # Check for new visualization containers
+            assert "memory-timeline" in content
+            assert "timeline-" in content
+            assert "dag-" in content
+            # Check for summary cards
             assert "Estimated live memory peak" in content
             assert "Memory estimate summary" in content
-            assert "Memory trace timeline and event breakdown" in content
-            assert "memory-chart" in content
-            assert "drawMemoryTrace" in content
-            assert "memory-events-body" in content
+            assert "Memory trace timeline" in content
 
     def test_chrome_trace_schedule_events_have_des_timing(self):
         from torchtitan.experiments.simulator.des_engine import simulate_multi_rank_des
