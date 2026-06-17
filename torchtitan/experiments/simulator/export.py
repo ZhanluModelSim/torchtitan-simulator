@@ -552,11 +552,128 @@ def _populate_des_metadata(result: SimulationResult) -> None:
     }
 
 
+def _compress_graph_by_stage_similarity(result: SimulationResult) -> dict[str, Any]:
+    """Compress compute graph by detecting and merging similar PP stages.
+    
+    For PP models with VPP, many stages have identical operation patterns.
+    This function detects repeated stage groups and represents them as a
+    single representative with a multiplier.
+    
+    Returns a dict with:
+    - nodes: compressed node list with stage ranges
+    - edges: edges between compressed nodes
+    - stage_groups: metadata about which stages were merged
+    """
+    from collections import defaultdict, Counter
+    
+    # Group nodes by (phase, pp_stage)
+    groups = defaultdict(list)
+    for node in result.compute_graph.nodes.values():
+        key = (node.phase, node.pp_stage)
+        groups[key].append(node)
+    
+    # Analyze each group's signature (operation distribution)
+    group_signatures = {}
+    for key, nodes in groups.items():
+        phase, stage = key
+        if stage is None:
+            continue  # Skip phase boundary nodes
+        
+        # Create signature: sorted list of (op_name, count)
+        op_counts = Counter(n.op_name for n in nodes)
+        signature = tuple(sorted(op_counts.items()))
+        group_signatures[key] = {
+            "signature": signature,
+            "node_count": len(nodes),
+            "nodes": nodes,
+        }
+    
+    # Detect repeated stage groups
+    # Group stages by (phase, signature)
+    phase_stage_groups = defaultdict(list)
+    for (phase, stage), info in group_signatures.items():
+        phase_stage_groups[(phase, info["signature"])].append(stage)
+    
+    # Build compressed representation
+    compressed_nodes = []
+    stage_groups = []
+    kept_stages = set()
+    
+    for (phase, signature), stages in phase_stage_groups.items():
+        stages = sorted(stages)
+        
+        # Find consecutive runs
+        runs = []
+        current_run = [stages[0]]
+        for i in range(1, len(stages)):
+            if stages[i] == stages[i-1] + 1:
+                current_run.append(stages[i])
+            else:
+                runs.append(current_run)
+                current_run = [stages[i]]
+        runs.append(current_run)
+        
+        # For each run, keep only the first stage as representative
+        for run in runs:
+            if len(run) == 1:
+                # Single stage, keep as-is
+                stage = run[0]
+                kept_stages.add((phase, stage))
+                stage_groups.append({
+                    "phase": phase,
+                    "stages": [stage],
+                    "count": 1,
+                    "representative": stage,
+                })
+            else:
+                # Multiple consecutive stages, keep first as representative
+                representative = run[0]
+                kept_stages.add((phase, representative))
+                stage_groups.append({
+                    "phase": phase,
+                    "stages": run,
+                    "count": len(run),
+                    "representative": representative,
+                })
+    
+    # Also keep phase boundary nodes (stage=None)
+    for key, nodes in groups.items():
+        phase, stage = key
+        if stage is None:
+            kept_stages.add(key)
+    
+    # Build compressed node list
+    node_id_map = {}  # old_id -> new_id
+    for (phase, stage) in kept_stages:
+        nodes = groups[(phase, stage)]
+        for node in nodes:
+            node_dict = node.to_dict()
+            node_id_map[node.node_id] = node.node_id
+            compressed_nodes.append(node_dict)
+    
+    # Build compressed edge list
+    compressed_edges = []
+    for edge in result.compute_graph.edges:
+        if edge.src_node_id in node_id_map and edge.dst_node_id in node_id_map:
+            compressed_edges.append(edge.to_dict())
+    
+    return {
+        "nodes": compressed_nodes,
+        "edges": compressed_edges,
+        "stage_groups": stage_groups,
+        "compressed": True,
+        "total_nodes": len(result.compute_graph.nodes),
+        "total_edges": len(result.compute_graph.edges),
+        "kept_stages": len(kept_stages),
+        "total_stages": len(group_signatures),
+    }
+
+
 def _json_script_payload(result: SimulationResult) -> str:
     node_count = len(result.compute_graph.nodes)
     _populate_des_metadata(result)
     if node_count > 10000:
-        # For large graphs, embed a sampled subset for visualization
+        # For large graphs, compress by merging similar PP stages
         schedule_data = None
         if result.schedule is not None:
             schedule_data = result.schedule.to_dict()
@@ -568,39 +685,14 @@ def _json_script_payload(result: SimulationResult) -> str:
             {"schedule": schedule_data} if schedule_data else {}, result
         )
         
-        # Sample nodes: first 500 per (phase, pp_stage) group
-        from collections import defaultdict
-        sampled_nodes = []
-        groups = defaultdict(list)
-        for node in result.compute_graph.nodes.values():
-            key = (node.phase, node.pp_stage)
-            groups[key].append(node)
-        
-        sampled_node_ids = set()
-        for key, nodes_in_group in groups.items():
-            # Take first 500 nodes from each group
-            for node in nodes_in_group[:500]:
-                sampled_nodes.append(node.to_dict())
-                sampled_node_ids.add(node.node_id)
-        
-        # Include edges between sampled nodes
-        sampled_edges = [
-            edge.to_dict()
-            for edge in result.compute_graph.edges
-            if edge.src_node_id in sampled_node_ids and edge.dst_node_id in sampled_node_ids
-        ]
+        # Compress graph by stage similarity
+        compressed_graph = _compress_graph_by_stage_similarity(result)
         
         compact: dict[str, Any] = {
             "metadata": result.metadata,
             "schedule": schedule_data,
-            "compute_graph": {
-                "nodes": sampled_nodes,
-                "edges": sampled_edges,
-                "sampled": True,
-                "total_nodes": node_count,
-                "total_edges": len(result.compute_graph.edges),
-            },
-            "memory_events": [e.to_dict() for e in result.memory_events[:1000]],  # Limit memory events
+            "compute_graph": compressed_graph,
+            "memory_events": [e.to_dict() for e in result.memory_events[:1000]],
         }
         return escape(json.dumps(compact, default=str), quote=False)
     data = result.to_dict()
@@ -1604,8 +1696,31 @@ def export_html(
       chartState.set(canvas, state);
       const phase = canvas.dataset.phase || 'unknown';
       const maxNodes = Number.parseInt(canvas.dataset.maxNodes || '220', 10);
+      
+      const isCompressed = TRACE.compute_graph?.compressed || false;
       const allNodes = TRACE.compute_graph?.nodes || [];
-      const phaseNodes = allNodes.filter((node) => (node.phase || 'unknown') === phase).slice(0, maxNodes);
+      const stageGroups = TRACE.compute_graph?.stage_groups || [];
+      
+      // Filter nodes by phase
+      let phaseNodes = allNodes.filter((node) => (node.phase || 'unknown') === phase);
+      
+      // If compressed, add stage group info to the canvas
+      if (isCompressed) {{
+        const phaseGroups = stageGroups.filter(g => g.phase === phase);
+        const groupInfo = phaseGroups.map(g => {{
+          if (g.count > 1) {{
+            return `Stages ${{g.stages[0]}}-${{g.stages[g.stages.length-1]}} (×${{g.count}})`;
+          }} else {{
+            return `Stage ${{g.stages[0]}}`;
+          }}
+        }}).join(', ');
+        
+        // Store group info for display
+        canvas.dataset.stageGroups = groupInfo;
+        canvas.dataset.isCompressed = 'true';
+      }}
+      
+      phaseNodes = phaseNodes.slice(0, maxNodes);
       const nodeIds = new Set(phaseNodes.map((node) => node.node_id));
       const edges = (TRACE.compute_graph?.edges || []).filter((edge) => nodeIds.has(edge.src) && nodeIds.has(edge.dst));
 
@@ -1632,17 +1747,42 @@ def export_html(
       const computeRowY = 50;
       const commRowY = 110;
       const nodeH = 36;
+      
+      // Add extra space for stage group info if compressed
+      const isCompressed = canvas.dataset.isCompressed === 'true';
+      const stageGroupInfoY = isCompressed ? 35 : 20;
+      const topOffset = isCompressed ? 15 : 0;
+      
       const width = Math.max(1100, labelW + 40 + timeRange * pixelsPerUnit + 100);
       const memoryMarkerY = commRowY + 50;
       const height = Math.max(200, memoryMarkerY + 30);
       const ctx = resizeCanvas(canvas, width, height);
       ctx.clearRect(0, 0, width, height);
 
+      // Draw stage group info if compressed
+      if (isCompressed && canvas.dataset.stageGroups) {{
+        ctx.fillStyle = '#2563eb';
+        ctx.font = 'bold 11px ui-sans-serif, system-ui, sans-serif';
+        ctx.fillText('📦 Compressed: ' + canvas.dataset.stageGroups, labelW, stageGroupInfoY);
+        
+        // Add tooltip for stage groups
+        const totalStages = TRACE.compute_graph?.total_stages || 0;
+        const keptStages = TRACE.compute_graph?.kept_stages || 0;
+        _barRegistry.push({{
+          x: labelW, y: stageGroupInfoY - 12, w: 300, h: 16,
+          tip: '<b>Graph Compression</b><br>' +
+               'Original stages: ' + totalStages + '<br>' +
+               'Kept stages: ' + keptStages + '<br>' +
+               'Compression: ' + (totalStages / keptStages).toFixed(1) + 'x<br>' +
+               'Groups: ' + canvas.dataset.stageGroups
+        }});
+      }}
+
       ctx.strokeStyle = '#94a3b8';
       ctx.lineWidth = 1;
       ctx.beginPath();
-      ctx.moveTo(labelW, 20);
-      ctx.lineTo(width - 30, 20);
+      ctx.moveTo(labelW, stageGroupInfoY + 5);
+      ctx.lineTo(width - 30, stageGroupInfoY + 5);
       ctx.stroke();
       const numTicks = Math.min(10, Math.ceil(timeRange / 50));
       const tickInterval = Math.max(1, timeRange / numTicks);
@@ -1651,17 +1791,17 @@ def export_html(
         ctx.fillStyle = '#64748b';
         ctx.font = '9px ui-sans-serif, system-ui, sans-serif';
         const label = t >= 1000 ? (t / 1000).toFixed(1) + 'ms' : Math.round(t) + 'µs';
-        ctx.fillText(label, x, 12);
+        ctx.fillText(label, x, stageGroupInfoY - 3);
         ctx.beginPath();
-        ctx.moveTo(x, 18);
-        ctx.lineTo(x, 22);
+        ctx.moveTo(x, stageGroupInfoY + 3);
+        ctx.lineTo(x, stageGroupInfoY + 7);
         ctx.stroke();
       }}
 
       ctx.fillStyle = '#1e293b';
       ctx.font = 'bold 10px ui-sans-serif, system-ui, sans-serif';
-      ctx.fillText('Compute Engine', 6, computeRowY);
-      ctx.fillText('Comm Engine', 6, commRowY);
+      ctx.fillText('Compute Engine', 6, computeRowY + topOffset);
+      ctx.fillText('Comm Engine', 6, commRowY + topOffset);
 
       const positions = new Map();
       for (const node of computeNodes) {{
@@ -1669,31 +1809,33 @@ def export_html(
         const finish = node.des_finish_time_us || start;
         const x = labelW + (start - minTime) * pixelsPerUnit;
         const w = Math.max(4, (finish - start) * pixelsPerUnit);
-        positions.set(node.node_id, {{x, y: computeRowY - nodeH / 2, w, endX: labelW + (finish - minTime) * pixelsPerUnit}});
+        positions.set(node.node_id, {{x, y: computeRowY + topOffset - nodeH / 2, w, endX: labelW + (finish - minTime) * pixelsPerUnit}});
         const fill = palette[node.op_type] || palette.unknown;
         const isContended = finish - start > (node.perf_result?.total_time_us || 0) + 0.1;
-        roundedRect(ctx, x, computeRowY - nodeH / 2, w, nodeH, 4);
+        roundedRect(ctx, x, computeRowY + topOffset - nodeH / 2, w, nodeH, 4);
         ctx.fillStyle = fill;
         ctx.fill();
         ctx.strokeStyle = isContended ? '#dc2626' : '#334155';
         ctx.lineWidth = isContended ? 2 : 0.5;
         ctx.stroke();
         _barRegistry.push({{
-          x: x, y: computeRowY - nodeH / 2, w: w, h: nodeH,
+          x: x, y: computeRowY + topOffset - nodeH / 2, w: w, h: nodeH,
           tip: '<b>' + shortName(node.op_name) + '</b><br>' +
                'Type: ' + node.op_type + '<br>' +
                'Phase: ' + node.phase + '<br>' +
+               (node.pp_stage !== null && node.pp_stage !== undefined ? 'PP Stage: ' + node.pp_stage + '<br>' : '') +
+               (node.pp_rank !== null && node.pp_rank !== undefined ? 'PP Rank: ' + node.pp_rank + '<br>' : '') +
                (node.des_start_time_us ? 'DES start: ' + fmt(node.des_start_time_us) + '<br>' : '') +
                (node.des_finish_time_us ? 'DES finish: ' + fmt(node.des_finish_time_us) + '<br>' : '') +
                (node.perf_result ? 'Duration: ' + fmt(node.perf_result.total_time_us) + '<br>' : '')
         }});
         ctx.fillStyle = '#0f172a';
         ctx.font = '700 9px ui-sans-serif, system-ui, sans-serif';
-        if (w > 30) ctx.fillText(shortName(node.op_name, 12), x + 3, computeRowY - 6);
+        if (w > 30) ctx.fillText(shortName(node.op_name, 12), x + 3, computeRowY + topOffset - 6);
         if (w > 60) {{
           ctx.font = 'italic 8px ui-sans-serif, system-ui, sans-serif';
           const dur = finish - start;
-          ctx.fillText(dur >= 1000 ? (dur / 1000).toFixed(1) + 'ms' : dur.toFixed(0) + 'µs', x + 3, computeRowY + 8);
+          ctx.fillText(dur >= 1000 ? (dur / 1000).toFixed(1) + 'ms' : dur.toFixed(0) + 'µs', x + 3, computeRowY + topOffset + 8);
         }}
       }}
 
@@ -1702,31 +1844,33 @@ def export_html(
         const finish = node.des_finish_time_us || start;
         const x = labelW + (start - minTime) * pixelsPerUnit;
         const w = Math.max(4, (finish - start) * pixelsPerUnit);
-        positions.set(node.node_id, {{x, y: commRowY - nodeH / 2, w, endX: labelW + (finish - minTime) * pixelsPerUnit}});
+        positions.set(node.node_id, {{x, y: commRowY + topOffset - nodeH / 2, w, endX: labelW + (finish - minTime) * pixelsPerUnit}});
         const fill = palette[node.op_type] || palette.unknown;
         const isContended = finish - start > (node.perf_result?.total_time_us || 0) + 0.1;
-        roundedRect(ctx, x, commRowY - nodeH / 2, w, nodeH, 4);
+        roundedRect(ctx, x, commRowY + topOffset - nodeH / 2, w, nodeH, 4);
         ctx.fillStyle = fill;
         ctx.fill();
         ctx.strokeStyle = isContended ? '#dc2626' : '#334155';
         ctx.lineWidth = isContended ? 2 : 0.5;
         ctx.stroke();
         _barRegistry.push({{
-          x: x, y: commRowY - nodeH / 2, w: w, h: nodeH,
+          x: x, y: commRowY + topOffset - nodeH / 2, w: w, h: nodeH,
           tip: '<b>' + shortName(node.op_name) + '</b><br>' +
                'Type: ' + node.op_type + '<br>' +
                'Phase: ' + node.phase + '<br>' +
+               (node.pp_stage !== null && node.pp_stage !== undefined ? 'PP Stage: ' + node.pp_stage + '<br>' : '') +
+               (node.pp_rank !== null && node.pp_rank !== undefined ? 'PP Rank: ' + node.pp_rank + '<br>' : '') +
                (node.des_start_time_us ? 'DES start: ' + fmt(node.des_start_time_us) + '<br>' : '') +
                (node.des_finish_time_us ? 'DES finish: ' + fmt(node.des_finish_time_us) + '<br>' : '') +
                (node.perf_result ? 'Duration: ' + fmt(node.perf_result.total_time_us) + '<br>' : '')
         }});
         ctx.fillStyle = '#0f172a';
         ctx.font = '700 9px ui-sans-serif, system-ui, sans-serif';
-        if (w > 30) ctx.fillText(shortName(node.op_name, 12), x + 3, commRowY - 6);
+        if (w > 30) ctx.fillText(shortName(node.op_name, 12), x + 3, commRowY + topOffset - 6);
         if (w > 60) {{
           ctx.font = 'italic 8px ui-sans-serif, system-ui, sans-serif';
           const dur = finish - start;
-          ctx.fillText(dur >= 1000 ? (dur / 1000).toFixed(1) + 'ms' : dur.toFixed(0) + 'µs', x + 3, commRowY + 8);
+          ctx.fillText(dur >= 1000 ? (dur / 1000).toFixed(1) + 'ms' : dur.toFixed(0) + 'µs', x + 3, commRowY + topOffset + 8);
         }}
       }}
 
@@ -1742,6 +1886,7 @@ def export_html(
         const memoryPaletteMap = {{activation: '#60a5fa', gradient: '#fb7185', comm_buffer: '#f59e0b', optimizer_state: '#a78bfa', parameter: '#22c55e'}};
         const peakMem = desMemory.peak_total_bytes || 1;
         const memBarH = 12;
+        const adjustedMemoryMarkerY = memoryMarkerY + topOffset;
         for (const sample of desMemory.timeline) {{
           const xStart = labelW + (sample.time_us - minTime) * pixelsPerUnit;
           const w = Math.max(2, (sample.duration_us || 0) * pixelsPerUnit);
@@ -1749,7 +1894,7 @@ def export_html(
           const dynRatio = (sample.dynamic_bytes || 0) / peakMem;
           ctx.fillStyle = '#60a5fa';
           ctx.globalAlpha = 0.25;
-          ctx.fillRect(xStart, memoryMarkerY - memBarH / 2, w, memBarH * dynRatio);
+          ctx.fillRect(xStart, adjustedMemoryMarkerY - memBarH / 2, w, memBarH * dynRatio);
           ctx.globalAlpha = 1.0;
         }}
       }}
