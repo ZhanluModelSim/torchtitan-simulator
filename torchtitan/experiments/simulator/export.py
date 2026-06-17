@@ -947,7 +947,7 @@ def export_html(
             f"""
             <details open>
               <summary>{escape(phase)} operator dependency DAG</summary>
-              <div id="dag-{step}-{escape(phase)}" style="width:100%;height:800px;background:#f8fafc;border-radius:8px;"></div>
+              <div id="dag-{step}-{escape(phase)}" style="width:100%;height:900px;background:#fafafa;border-radius:8px;border:1px solid #e5e7eb;"></div>
             </details>
             """
             for phase in step_phases
@@ -1090,7 +1090,16 @@ def export_html(
     {chr(10).join(f'''
     (function() {{
       const chart = echarts.init(document.getElementById('timeline-{step}'));
-      const events = (TRACE.schedule?.events || []).filter(e => e.step === {step});
+      const allEvents = TRACE.schedule?.events || [];
+      const events = allEvents.filter(e => {{
+        const evStep = e.metadata?.step ?? e.step ?? 0;
+        return parseInt(evStep) === {step};
+      }});
+      
+      if (events.length === 0) {{
+        document.getElementById('timeline-{step}').innerHTML = '<div style="padding:40px;text-align:center;color:#666;">No schedule events for this step</div>';
+        return;
+      }}
       
       // Group events by rank
       const rankMap = {{}};
@@ -1103,40 +1112,93 @@ def export_html(
       const ranks = Object.keys(rankMap).sort((a, b) => parseInt(a) - parseInt(b));
       const seriesData = [];
       
+      // Color mapping for event types
+      const colorMap = {{
+        'forward': '#3b82f6',
+        'backward': '#ef4444',
+        'optimizer': '#10b981',
+        'comm': '#f59e0b',
+        'pp_send': '#8b5cf6',
+        'pp_recv': '#a855f7',
+        'fsdp': '#06b6d4',
+        'default': '#6b7280'
+      }};
+      
+      function getEventColor(eventType) {{
+        const type = (eventType || '').toLowerCase();
+        if (type.includes('forward') || type.includes('fwd')) return colorMap.forward;
+        if (type.includes('backward') || type.includes('bwd')) return colorMap.backward;
+        if (type.includes('optimizer') || type.includes('optim')) return colorMap.optimizer;
+        if (type.includes('pp_send') || type.includes('send')) return colorMap.pp_send;
+        if (type.includes('pp_recv') || type.includes('recv')) return colorMap.pp_recv;
+        if (type.includes('fsdp')) return colorMap.fsdp;
+        if (type.includes('comm') || type.includes('all_') || type.includes('reduce')) return colorMap.comm;
+        return colorMap.default;
+      }}
+      
       ranks.forEach((rank, rankIdx) => {{
         rankMap[rank].forEach(ev => {{
           const start = ev.perf_cumulative_start_us || 0;
           const duration = ev.perf_total_time_us || 0;
+          const end = start + duration;
+          
           seriesData.push({{
             name: ev.event_type,
-            value: [rankIdx, start, start + duration, duration],
+            value: [rankIdx, start, end, duration],
             itemStyle: {{
-              color: ev.event_type.includes('forward') ? '#93c5fd' :
-                     ev.event_type.includes('backward') ? '#fca5a5' : '#86efac'
-            }}
+              color: getEventColor(ev.event_type)
+            }},
+            event: ev
           }});
         }});
       }});
       
       chart.setOption({{
         tooltip: {{
+          trigger: 'item',
           formatter: function(params) {{
-            const ev = events.find(e => e.event_type === params.name);
-            return `<b>${{params.name}}</b><br/>
-                    Rank: ${{ev?.rank || 0}}<br/>
-                    Start: ${{fmt(ev?.perf_cumulative_start_us)}}<br/>
-                    Duration: ${{fmt(ev?.perf_total_time_us)}}`;
+            const ev = params.data.event;
+            const duration = ev.perf_total_time_us || 0;
+            const start = ev.perf_cumulative_start_us || 0;
+            return `<div style="padding:8px;">
+              <b style="font-size:14px;">${{ev.event_type}}</b><br/>
+              <span style="color:#666;">Rank:</span> ${{ev.rank || 0}}<br/>
+              <span style="color:#666;">Start:</span> ${{fmt(start)}}<br/>
+              <span style="color:#666;">Duration:</span> ${{fmt(duration)}}<br/>
+              <span style="color:#666;">End:</span> ${{fmt(start + duration)}}
+            </div>`;
           }}
+        }},
+        legend: {{
+          data: ['forward', 'backward', 'optimizer', 'comm', 'pp_send', 'pp_recv', 'fsdp'],
+          top: 10,
+          textStyle: {{ color: '#333' }}
         }},
         xAxis: {{
           type: 'value',
-          name: 'Time (µs)',
-          axisLabel: {{ formatter: (val) => fmt(val) }}
+          name: 'Time',
+          nameLocation: 'middle',
+          nameGap: 30,
+          axisLabel: {{ 
+            formatter: (val) => fmt(val),
+            color: '#666'
+          }},
+          splitLine: {{
+            lineStyle: {{ color: '#e5e7eb' }}
+          }}
         }},
         yAxis: {{
           type: 'category',
           data: ranks.map(r => 'Rank ' + r),
-          inverse: true
+          inverse: true,
+          axisLabel: {{ 
+            color: '#333',
+            fontWeight: 'bold'
+          }},
+          splitLine: {{
+            show: true,
+            lineStyle: {{ color: '#f3f4f6' }}
+          }}
         }},
         series: [{{
           type: 'custom',
@@ -1144,16 +1206,25 @@ def export_html(
             const rankIdx = api.value(0);
             const start = api.coord([api.value(1), rankIdx]);
             const end = api.coord([api.value(2), rankIdx]);
-            const height = api.size([0, 1])[1] * 0.6;
+            const height = api.size([0, 1])[1] * 0.7;
+            const width = Math.max(2, end[0] - start[0]);
+            
             return {{
               type: 'rect',
               shape: {{
                 x: start[0],
                 y: start[1] - height / 2,
-                width: end[0] - start[0],
-                height: height
+                width: width,
+                height: height,
+                r: 3
               }},
-              style: api.style()
+              style: api.style(),
+              emphasis: {{
+                style: {{
+                  shadowBlur: 10,
+                  shadowColor: 'rgba(0,0,0,0.3)'
+                }}
+              }}
             }};
           }},
           encode: {{ x: [1, 2], y: 0 }},
@@ -1161,9 +1232,9 @@ def export_html(
         }}],
         dataZoom: [
           {{ type: 'inside', xAxisIndex: 0, start: 0, end: 100 }},
-          {{ type: 'slider', xAxisIndex: 0, start: 0, end: 100 }}
+          {{ type: 'slider', xAxisIndex: 0, start: 0, end: 100, height: 20, bottom: 10 }}
         ],
-        grid: {{ left: '10%', right: '5%', bottom: '15%', top: '5%' }}
+        grid: {{ left: '8%', right: '5%', bottom: '18%', top: '12%' }}
       }});
     }})();
     ''' for step in steps)}
@@ -1184,83 +1255,170 @@ def export_html(
       }});
       
       if (nodes.length === 0) {{
-        container.innerHTML = '<div style="padding:20px;color:#666;">No nodes in this phase</div>';
+        container.innerHTML = '<div style="padding:40px;text-align:center;color:#666;font-size:16px;">No nodes in this phase</div>';
         return;
       }}
       
-      // Limit nodes for performance
-      const limitedNodes = nodes.slice(0, {max_dag_nodes_per_phase});
+      // Limit nodes for performance (increased from 220 to 500)
+      const maxNodes = 500;
+      const limitedNodes = nodes.slice(0, maxNodes);
       const nodeIds = new Set(limitedNodes.map(n => n.node_id));
       const limitedEdges = edges.filter(e => nodeIds.has(e.src) && nodeIds.has(e.dst));
       
-      const g6Nodes = limitedNodes.map(n => ({{
-        id: n.node_id,
-        label: (n.op_name || '').substring(0, 20),
-        op_type: n.op_type,
-        size: 40,
-        style: {{
-          fill: n.op_type === 'compute' ? '#AED6F1' :
-                n.op_type === 'comm_collective' ? '#F9E79F' :
-                n.op_type === 'comm_p2p' ? '#FAD7A0' :
-                n.op_type === 'data_move' ? '#A9DFBF' :
-                n.op_type === 'memory' ? '#D7BDE2' : '#D5D8DC',
-          stroke: '#334155',
-          lineWidth: 1
-        }}
-      }}));
+      // Enhanced color scheme with gradients
+      const colorScheme = {{
+        compute: {{ fill: '#dbeafe', stroke: '#3b82f6', text: '#1e40af' }},
+        comm_collective: {{ fill: '#fef3c7', stroke: '#f59e0b', text: '#92400e' }},
+        comm_p2p: {{ fill: '#fed7aa', stroke: '#f97316', text: '#9a3412' }},
+        data_move: {{ fill: '#d1fae5', stroke: '#10b981', text: '#065f46' }},
+        memory: {{ fill: '#e9d5ff', stroke: '#a855f7', text: '#6b21a8' }},
+        unknown: {{ fill: '#f3f4f6', stroke: '#6b7280', text: '#374151' }}
+      }};
+      
+      const g6Nodes = limitedNodes.map(n => {{
+        const colors = colorScheme[n.op_type] || colorScheme.unknown;
+        const duration = n.perf_result?.total_time_us || 0;
+        const label = (n.op_name || 'unknown').replace('aten.', '').replace('.default', '');
+        
+        return {{
+          id: n.node_id,
+          label: label.length > 25 ? label.substring(0, 22) + '...' : label,
+          op_type: n.op_type,
+          duration: duration,
+          style: {{
+            fill: colors.fill,
+            stroke: colors.stroke,
+            lineWidth: 2,
+            shadowColor: 'rgba(0,0,0,0.1)',
+            shadowBlur: 8,
+            shadowOffsetX: 2,
+            shadowOffsetY: 2,
+            cursor: 'pointer'
+          }},
+          labelCfg: {{
+            style: {{
+              fill: colors.text,
+              fontSize: 11,
+              fontWeight: 'bold'
+            }},
+            position: 'center',
+            offset: 0
+          }}
+        }};
+      }});
       
       const g6Edges = limitedEdges.map(e => ({{
         source: e.src,
         target: e.dst,
         style: {{
-          stroke: e.type === 'data' ? '#2563eb' : '#64748b',
-          lineDash: e.type !== 'data' ? [4, 4] : [],
+          stroke: e.type === 'data' ? '#3b82f6' : '#9ca3af',
+          lineWidth: e.type === 'data' ? 2 : 1.5,
+          lineDash: e.type !== 'data' ? [5, 5] : [],
           endArrow: {{
-            path: 'M 0,0 L 8,4 L 8,-4 Z',
-            fill: e.type === 'data' ? '#2563eb' : '#64748b'
-          }}
+            path: 'M 0,0 L 10,5 L 10,-5 Z',
+            fill: e.type === 'data' ? '#3b82f6' : '#9ca3af',
+            stroke: e.type === 'data' ? '#3b82f6' : '#9ca3af'
+          }},
+          opacity: 0.7
         }}
       }}));
       
       const graph = new G6.Graph({{
         container: containerId,
         width: container.clientWidth,
-        height: 800,
+        height: 900,
         fitView: true,
-        fitViewPadding: 20,
+        fitViewPadding: [40, 40, 40, 40],
         modes: {{
-          default: ['drag-canvas', 'zoom-canvas', 'drag-node']
+          default: [
+            'drag-canvas',
+            'zoom-canvas',
+            'drag-node',
+            {{
+              type: 'tooltip',
+              formatText: function(model) {{
+                const duration = model.duration || 0;
+                const durationStr = duration > 0 ? fmt(duration) : 'N/A';
+                return `<div style="padding:10px;background:white;border:1px solid #ddd;border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.15);">
+                  <div style="font-weight:bold;font-size:14px;margin-bottom:6px;color:#1f2937;">${{model.label}}</div>
+                  <div style="color:#6b7280;font-size:12px;">
+                    <div>Type: <span style="color:#374151;">${{model.op_type}}</span></div>
+                    <div>Duration: <span style="color:#374151;">${{durationStr}}</span></div>
+                    <div>ID: <span style="color:#374151;font-family:monospace;">${{model.id}}</span></div>
+                  </div>
+                </div>`;
+              }},
+              offset: 10
+            }}
+          ]
         }},
         layout: {{
           type: 'dagre',
-          rankdir: 'LR',
-          nodesep: 20,
-          ranksep: 50
+          rankdir: 'TB',
+          nodesep: 30,
+          ranksep: 60,
+          controlPoints: true,
+          align: 'UL'
         }},
         defaultNode: {{
           type: 'rect',
-          size: [80, 40],
+          size: [140, 50],
           style: {{
-            radius: 4
-          }},
-          labelCfg: {{
-            style: {{
-              fontSize: 10,
-              fill: '#0f172a'
-            }}
+            radius: 8
           }}
         }},
         defaultEdge: {{
-          type: 'polyline',
+          type: 'cubic-horizontal',
           style: {{
-            radius: 10,
-            offset: 15
+            radius: 20,
+            offset: 20
+          }}
+        }},
+        nodeStateStyles: {{
+          hover: {{
+            shadowBlur: 15,
+            shadowColor: 'rgba(0,0,0,0.3)'
+          }},
+          active: {{
+            stroke: '#ef4444',
+            lineWidth: 3
+          }}
+        }},
+        edgeStateStyles: {{
+          hover: {{
+            stroke: '#ef4444',
+            lineWidth: 3
           }}
         }}
       }});
       
+      // Add node hover effects
+      graph.on('node:mouseenter', (evt) => {{
+        const node = evt.item;
+        graph.setItemState(node, 'hover', true);
+      }});
+      
+      graph.on('node:mouseleave', (evt) => {{
+        const node = evt.item;
+        graph.setItemState(node, 'hover', false);
+      }});
+      
       graph.data({{ nodes: g6Nodes, edges: g6Edges }});
       graph.render();
+      
+      // Add info text
+      const infoDiv = document.createElement('div');
+      infoDiv.style.cssText = 'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);padding:10px 15px;border-radius:6px;box-shadow:0 2px 8px rgba(0,0,0,0.1);font-size:12px;color:#374151;';
+      infoDiv.innerHTML = `
+        <div style="font-weight:bold;margin-bottom:4px;">Graph Info</div>
+        <div>Nodes: ${{limitedNodes.length}} / ${{nodes.length}}</div>
+        <div>Edges: ${{limitedEdges.length}} / ${{edges.length}}</div>
+        <div style="margin-top:6px;color:#6b7280;font-size:11px;">
+          Scroll to zoom • Drag to pan
+        </div>
+      `;
+      container.style.position = 'relative';
+      container.appendChild(infoDiv);
     }})();
     ''' for step in steps for phase in phases)}
 
