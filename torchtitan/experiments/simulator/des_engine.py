@@ -226,6 +226,17 @@ def simulate_multi_rank_des(result: SimulationResult) -> float:
 
     event_durations: dict[str, float] = {}
     duration_key_cache: dict[tuple[str, int | None, int | None], float] = {}
+
+    # Pre-count events per (event_type, rank, pp_stage) for proportional splitting.
+    # link_schedule_to_graph assigns ALL nodes at a pp_stage to EVERY event at
+    # that stage, so summing op_node_ids gives the full stage duration.
+    # We must divide by the number of events sharing the same key to get
+    # per-microbatch duration.
+    events_per_key: dict[tuple[str, int | None, int | None], int] = {}
+    for event in result.schedule.events:
+        key = (event.event_type, event.rank, event.pp_stage)
+        events_per_key[key] = events_per_key.get(key, 0) + 1
+
     for event in result.schedule.events:
         key = (event.event_type, event.rank, event.pp_stage)
         if key in duration_key_cache:
@@ -237,8 +248,11 @@ def simulate_multi_rank_des(result: SimulationResult) -> float:
                     node = result.compute_graph.nodes.get(nid)
                     if node and node.perf_result:
                         total += node.perf_result.total_time_us
-                event_durations[event.event_id] = total
-                duration_key_cache[key] = total
+                # Divide by number of events sharing this key
+                n_events = events_per_key.get(key, 1)
+                per_event = total / max(n_events, 1)
+                event_durations[event.event_id] = per_event
+                duration_key_cache[key] = per_event
             else:
                 phase = event_phase_map.get(event.event_type, "unknown")
                 phase_total = phase_duration.get(phase, 0.0)
