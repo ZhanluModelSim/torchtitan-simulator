@@ -754,7 +754,9 @@ class TestExport(unittest.TestCase):
             assert "Vec" in content
             assert "Communication" in content
             # Check for summary cards
-            assert "Estimated live memory peak" in content
+            assert "Per-GPU model state" in content
+            assert "Whole-model state" in content
+            assert "Activation peak" in content
             assert "Memory estimate summary" in content
             assert "Memory trace timeline" in content
 

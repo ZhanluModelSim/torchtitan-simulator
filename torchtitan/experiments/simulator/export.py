@@ -911,6 +911,12 @@ def export_html(
     peak_memory = memory_summary.get(
         "peak_live_bytes", memory_summary.get("graph_peak_live_bytes", 0)
     )
+    # Extract per-GPU and whole-model memory values
+    per_gpu_model_state = memory_summary.get("per_gpu_model_state_bytes", 0)
+    whole_model_state = memory_summary.get("model_state_total_bytes", 0)
+    tp_degree = memory_summary.get("tp_degree", 1)
+    fsdp_degree = memory_summary.get("fsdp_degree", 1)
+    shard_factor = memory_summary.get("shard_factor", 1)
     cost_summary = result.metadata.get("cost_model", {}) or {}
     perf_grand_total_us = cost_summary.get("e2e_step_time_us", 0)
     data_payload = _json_script_payload(result)
@@ -1004,11 +1010,16 @@ def export_html(
       <div class="card"><div class="num">{len(result.compute_graph.edges)}</div><div>Graph edges</div></div>
       <div class="card"><div class="num">{len(schedule_events)}</div><div>Schedule events</div></div>
       <div class="card"><div class="num">{len(result.comm_events)}</div><div>Communication events</div></div>
-      <div class="card"><div class="num">{escape(_format_bytes(peak_memory))}</div><div>Estimated live memory peak</div></div>
+      <div class="card"><div class="num">{escape(_format_bytes(per_gpu_model_state))}</div><div>Per-GPU model state</div></div>
+      <div class="card"><div class="num">{escape(_format_bytes(whole_model_state))}</div><div>Whole-model state</div></div>
+      <div class="card"><div class="num">{escape(_format_bytes(peak_memory))}</div><div>Activation peak</div></div>
       <div class="card"><div class="num">{len(result.memory_events)}</div><div>Memory events</div></div>
       <div class="card"><div class="num">{_format_time_us(perf_grand_total_us)}</div><div>Predicted step time</div></div>
       {des_cards}
     </section>
+    <div class="muted" style="margin:-8px 0 16px 0;">
+      Parallelism: TP={tp_degree}, FSDP={fsdp_degree}, shard_factor={shard_factor}
+    </div>
     <details open>
       <summary>Memory trace timeline</summary>
       <div id="memory-timeline" style="width:100%;height:500px;background:#f8fafc;border-radius:8px;"></div>
@@ -1046,10 +1057,19 @@ def export_html(
     const memoryChart = echarts.init(document.getElementById('memory-timeline'));
     const desMemory = TRACE.metadata?.des_memory || {{}};
     const memoryTimeline = desMemory.timeline || [];
+    const memoryMeta = TRACE.metadata?.memory || {{}};
+    
+    // Extract parallelism info
+    const tpDegree = memoryMeta.tp_degree || 1;
+    const fsdpDegree = memoryMeta.fsdp_degree || 1;
+    const shardFactor = memoryMeta.shard_factor || 1;
     
     // Use DES timeline data: [time_us, total_bytes]
     const memoryData = memoryTimeline.map(s => [s.time_us, s.total_bytes]);
     const staticMemory = desMemory.static_memory_bytes || 0;
+    
+    // Calculate whole-model static memory for reference
+    const wholeModelStatic = staticMemory * shardFactor;
     
     memoryChart.setOption({{
       tooltip: {{
@@ -1060,14 +1080,19 @@ def export_html(
           const sample = memoryTimeline[params[0].dataIndex];
           const dynamic = sample ? sample.dynamic_bytes : 0;
           const staticBytes = sample ? sample.static_bytes : 0;
+          const wholeModelTotal = total * shardFactor;
           return `<b>Time:</b> ${{fmt(time)}}<br/>
-                  <b>Total:</b> ${{formatBytes(total)}}<br/>
-                  <b>Static:</b> ${{formatBytes(staticBytes)}}<br/>
-                  <b>Dynamic:</b> ${{formatBytes(dynamic)}}`;
+                  <b>Per-GPU Memory:</b><br/>
+                  &nbsp;&nbsp;Total: ${{formatBytes(total)}}<br/>
+                  &nbsp;&nbsp;Static: ${{formatBytes(staticBytes)}}<br/>
+                  &nbsp;&nbsp;Dynamic: ${{formatBytes(dynamic)}}<br/>
+                  <b>Whole Model (×${{shardFactor}}):</b><br/>
+                  &nbsp;&nbsp;Total: ${{formatBytes(wholeModelTotal)}}<br/>
+                  &nbsp;&nbsp;Static: ${{formatBytes(wholeModelStatic)}}`;
         }}
       }},
       legend: {{
-        data: ['Total Memory', 'Static Baseline'],
+        data: ['Per-GPU Total', 'Per-GPU Static', 'Whole-Model Static'],
         top: 10
       }},
       xAxis: {{
@@ -1094,7 +1119,7 @@ def export_html(
       }},
       series: [
         {{
-          name: 'Total Memory',
+          name: 'Per-GPU Total',
           type: 'line',
           data: memoryData,
           smooth: false,
@@ -1104,11 +1129,20 @@ def export_html(
           showSymbol: false
         }},
         {{
-          name: 'Static Baseline',
+          name: 'Per-GPU Static',
           type: 'line',
           data: memoryData.length > 0 ? [[memoryData[0][0], staticMemory], [memoryData[memoryData.length-1][0], staticMemory]] : [],
           lineStyle: {{ width: 2, color: '#ef4444', type: 'dashed' }},
           itemStyle: {{ color: '#ef4444' }},
+          showSymbol: false,
+          z: 1
+        }},
+        {{
+          name: 'Whole-Model Static',
+          type: 'line',
+          data: memoryData.length > 0 ? [[memoryData[0][0], wholeModelStatic], [memoryData[memoryData.length-1][0], wholeModelStatic]] : [],
+          lineStyle: {{ width: 2, color: '#f59e0b', type: 'dotted' }},
+          itemStyle: {{ color: '#f59e0b' }},
           showSymbol: false,
           z: 1
         }}

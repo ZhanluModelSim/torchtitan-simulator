@@ -133,10 +133,20 @@ def attach_model_state_memory(
     model_parts: list[Any],
     *,
     optimizer_name: str | None = None,
+    parallelism_config: Any | None = None,
 ) -> dict[str, Any]:
+    """Attach model state memory events to result.
+    
+    Args:
+        result: SimulationResult to attach memory events to
+        model_parts: List of model parts
+        optimizer_name: Optimizer name (currently unused)
+        parallelism_config: ParallelismConfig with PP/TP/FSDP/EP degrees
+    """
     model_memory_events, model_memory_summary = estimate_model_state_memory(
         model_parts,
         optimizer_name=optimizer_name,
+        parallelism_config=parallelism_config,
     )
     result.memory_events.extend(model_memory_events)
     result.metadata["memory"] = finalize_memory_summary(
@@ -240,12 +250,43 @@ def estimate_model_state_memory(
     model_parts: list[Any],
     *,
     optimizer_name: str | None = None,
+    parallelism_config: Any | None = None,
 ) -> tuple[list[MemoryEvent], dict[str, Any]]:
+    """Estimate model state memory (parameters, gradients, optimizer states).
+    
+    Args:
+        model_parts: List of model parts (for PP, this is the local stage's layers)
+        optimizer_name: Optimizer name (currently unused, assumes Adam-style)
+        parallelism_config: ParallelismConfig with PP/TP/FSDP/EP degrees
+    
+    Returns:
+        Tuple of (memory_events, summary_dict)
+        
+    Memory estimation accounts for parallelism sharding:
+    - PP: Each GPU holds 1/PP of layers (already reflected in model_parts)
+    - TP: Each GPU holds 1/TP of sharded weights
+    - FSDP: Parameters sharded across dp_shard GPUs
+    - EP: MoE experts distributed across EP GPUs (not modeled here)
+    
+    The memory events contain per-GPU bytes (after sharding), while the summary
+    contains both whole-model and per-GPU values for reference.
+    """
     import torch
 
     del optimizer_name
     next_id = _event_counter("mem_model")
     events: list[MemoryEvent] = []
+
+    # Extract parallelism degrees
+    tp_degree = 1
+    fsdp_degree = 1
+    if parallelism_config is not None:
+        tp_degree = getattr(parallelism_config, "tensor_parallel_degree", 1) or 1
+        dp_shard = getattr(parallelism_config, "data_parallel_shard_degree", 1) or 1
+        fsdp_degree = max(1, dp_shard)
+
+    # Sharding factor for parameters/gradients/optimizer states
+    shard_factor = max(1, tp_degree * fsdp_degree)
 
     param_bytes = 0
     grad_bytes = 0
@@ -262,27 +303,43 @@ def estimate_model_state_memory(
                 # steady-state training estimate; lazy state creation may occur
                 # after the first optimizer step.
                 optimizer_state_bytes += nbytes * 2
+            # Create per-GPU memory event (sharded)
+            per_gpu_nbytes = nbytes // shard_factor
             events.append(
                 MemoryEvent(
                     event_id=next_id(),
                     category="parameter",
-                    bytes=nbytes,
+                    bytes=per_gpu_nbytes,
                     phase="model_state",
                     device=str(param.device),
                     dtype=str(param.dtype),
                     shape=tuple(param.shape),
-                    metadata={"part_idx": part_idx, "name": name},
+                    metadata={
+                        "part_idx": part_idx,
+                        "name": name,
+                        "whole_model_bytes": nbytes,
+                        "shard_factor": shard_factor,
+                    },
                 )
             )
+
+    # Calculate per-GPU memory after parallelism sharding
+    per_gpu_param_bytes = param_bytes // shard_factor
+    per_gpu_grad_bytes = grad_bytes // shard_factor
+    per_gpu_optimizer_bytes = optimizer_state_bytes // shard_factor
 
     if grad_bytes:
         events.append(
             MemoryEvent(
                 event_id=next_id(),
                 category="gradient",
-                bytes=grad_bytes,
+                bytes=per_gpu_grad_bytes,
                 phase="backward",
-                metadata={"estimate": "one gradient tensor per trainable parameter"},
+                metadata={
+                    "estimate": "one gradient tensor per trainable parameter",
+                    "whole_model_bytes": grad_bytes,
+                    "shard_factor": shard_factor,
+                },
             )
         )
     if optimizer_state_bytes:
@@ -290,17 +347,31 @@ def estimate_model_state_memory(
             MemoryEvent(
                 event_id=next_id(),
                 category="optimizer_state",
-                bytes=optimizer_state_bytes,
+                bytes=per_gpu_optimizer_bytes,
                 phase="optimizer",
-                metadata={"estimate": "Adam/AdamW exp_avg + exp_avg_sq"},
+                metadata={
+                    "estimate": "Adam/AdamW exp_avg + exp_avg_sq",
+                    "whole_model_bytes": optimizer_state_bytes,
+                    "shard_factor": shard_factor,
+                },
             )
         )
 
     summary = {
+        # Whole-model memory
         "parameter_bytes": param_bytes,
         "gradient_bytes": grad_bytes,
         "optimizer_state_bytes": optimizer_state_bytes,
         "model_state_total_bytes": param_bytes + grad_bytes + optimizer_state_bytes,
+        # Per-GPU memory after parallelism sharding
+        "per_gpu_parameter_bytes": per_gpu_param_bytes,
+        "per_gpu_gradient_bytes": per_gpu_grad_bytes,
+        "per_gpu_optimizer_state_bytes": per_gpu_optimizer_bytes,
+        "per_gpu_model_state_bytes": per_gpu_param_bytes + per_gpu_grad_bytes + per_gpu_optimizer_bytes,
+        # Parallelism info for reference
+        "tp_degree": tp_degree,
+        "fsdp_degree": fsdp_degree,
+        "shard_factor": shard_factor,
     }
     return events, summary
 

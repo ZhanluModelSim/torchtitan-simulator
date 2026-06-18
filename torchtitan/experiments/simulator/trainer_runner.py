@@ -870,6 +870,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         result,
         trainer.model_parts,
         optimizer_name=getattr(trainer.config.optimizer, "name", None),
+        parallelism_config=getattr(trainer.config, "parallelism", None),
     )
 
     graph_mem_events, graph_mem_summary = estimate_graph_memory(result.compute_graph)
