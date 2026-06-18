@@ -1044,45 +1044,80 @@ def export_html(
 
     // Initialize ECharts for memory timeline
     const memoryChart = echarts.init(document.getElementById('memory-timeline'));
-    const memoryEvents = TRACE.memory_events || [];
-    const memoryData = memoryEvents.map((e, i) => [i, e.bytes || 0]);
+    const desMemory = TRACE.metadata?.des_memory || {{}};
+    const memoryTimeline = desMemory.timeline || [];
+    
+    // Use DES timeline data: [time_us, total_bytes]
+    const memoryData = memoryTimeline.map(s => [s.time_us, s.total_bytes]);
+    const staticMemory = desMemory.static_memory_bytes || 0;
     
     memoryChart.setOption({{
       tooltip: {{
         trigger: 'axis',
         formatter: function(params) {{
-          const idx = params[0].dataIndex;
-          const ev = memoryEvents[idx];
-          return `<b>${{ev.event_id}}</b><br/>
-                  Category: ${{ev.category}}<br/>
-                  Bytes: ${{formatBytes(ev.bytes)}}<br/>
-                  Phase: ${{ev.phase}}`;
+          const time = params[0].value[0];
+          const total = params[0].value[1];
+          const sample = memoryTimeline[params[0].dataIndex];
+          const dynamic = sample ? sample.dynamic_bytes : 0;
+          const staticBytes = sample ? sample.static_bytes : 0;
+          return `<b>Time:</b> ${{fmt(time)}}<br/>
+                  <b>Total:</b> ${{formatBytes(total)}}<br/>
+                  <b>Static:</b> ${{formatBytes(staticBytes)}}<br/>
+                  <b>Dynamic:</b> ${{formatBytes(dynamic)}}`;
         }}
       }},
+      legend: {{
+        data: ['Total Memory', 'Static Baseline'],
+        top: 10
+      }},
       xAxis: {{
-        type: 'category',
-        name: 'Event Index',
-        data: memoryData.map(d => d[0])
+        type: 'value',
+        name: 'Time',
+        nameLocation: 'middle',
+        nameGap: 30,
+        axisLabel: {{
+          formatter: (val) => fmt(val)
+        }},
+        splitLine: {{
+          lineStyle: {{ color: '#e5e7eb', type: 'dashed' }}
+        }}
       }},
       yAxis: {{
         type: 'value',
-        name: 'Bytes',
+        name: 'Memory',
         axisLabel: {{
           formatter: (val) => formatBytes(val)
+        }},
+        splitLine: {{
+          lineStyle: {{ color: '#f3f4f6' }}
         }}
       }},
-      series: [{{
-        type: 'line',
-        data: memoryData.map(d => d[1]),
-        smooth: true,
-        areaStyle: {{ opacity: 0.3 }},
-        lineStyle: {{ width: 2 }}
-      }}],
-      dataZoom: [
-        {{ type: 'inside', start: 0, end: 100 }},
-        {{ type: 'slider', start: 0, end: 100 }}
+      series: [
+        {{
+          name: 'Total Memory',
+          type: 'line',
+          data: memoryData,
+          smooth: false,
+          areaStyle: {{ opacity: 0.2, color: '#3b82f6' }},
+          lineStyle: {{ width: 2, color: '#3b82f6' }},
+          itemStyle: {{ color: '#3b82f6' }},
+          showSymbol: false
+        }},
+        {{
+          name: 'Static Baseline',
+          type: 'line',
+          data: memoryData.length > 0 ? [[memoryData[0][0], staticMemory], [memoryData[memoryData.length-1][0], staticMemory]] : [],
+          lineStyle: {{ width: 2, color: '#ef4444', type: 'dashed' }},
+          itemStyle: {{ color: '#ef4444' }},
+          showSymbol: false,
+          z: 1
+        }}
       ],
-      grid: {{ left: '10%', right: '5%', bottom: '15%', top: '10%' }}
+      dataZoom: [
+        {{ type: 'inside', xAxisIndex: 0, start: 0, end: 100 }},
+        {{ type: 'slider', xAxisIndex: 0, start: 0, end: 100, height: 20, bottom: 10 }}
+      ],
+      grid: {{ left: '10%', right: '5%', bottom: '18%', top: '12%' }}
     }});
 
     // Initialize ECharts for timeline swimlanes
