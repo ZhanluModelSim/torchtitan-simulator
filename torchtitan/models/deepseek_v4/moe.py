@@ -24,6 +24,8 @@ from torchtitan.protocols.module import Module
 GroupedExperts = common_moe.GroupedExperts
 
 
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+
 class TokenReorderer(Module):
     """Minimal CPU-compatible token reorderer (NPU patching removed).
 
@@ -263,9 +265,10 @@ class MoE(Module):
             dim=dim,
             hidden_dim=hidden_dim,
             num_experts=num_experts,
-            token_dispatcher=common_moe.LocalTokenDispatcher.Config(
+            token_dispatcher=AllToAllTokenDispatcher.Config(
                 num_experts=num_experts,
                 top_k=moe_args.top_k,
+                score_before_experts=moe_args.score_before_experts,
             ),
         ).build()
 

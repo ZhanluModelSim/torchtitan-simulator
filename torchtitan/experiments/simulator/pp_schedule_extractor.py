@@ -346,16 +346,16 @@ class PPScheduleExtractor:
           steady   (alternating 1F1B)
           cool-down (remaining backward passes)
         """
-        n_mb = self.n_microbatches
-        n_ranks = self.world_size
+        num_mb = self.n_microbatches
+        num_ranks = self.world_size
         counter = [0]
 
-        ranks = list(range(n_ranks)) if self.pp_rank == -1 else [self.pp_rank]
+        ranks = list(range(num_ranks)) if self.pp_rank == -1 else [self.pp_rank]
 
         for rank in ranks:
             clock = 0
             # Warm-up: rank fills its pipeline
-            for mb in range(min(rank + 1, n_mb)):
+            for mb in range(min(rank + 1, num_mb)):
                 ts.add_event(
                     ScheduleEvent(
                         event_id=_make_event_id("pp", counter),
@@ -370,8 +370,8 @@ class PPScheduleExtractor:
             # Steady-state 1F1B
             fwd_mb = rank + 1
             bwd_mb = 0
-            while fwd_mb < n_mb or bwd_mb < rank + 1:
-                if fwd_mb < n_mb:
+            while fwd_mb < num_mb or bwd_mb < rank + 1:
+                if fwd_mb < num_mb:
                     ts.add_event(
                         ScheduleEvent(
                             event_id=_make_event_id("pp", counter),
@@ -398,7 +398,7 @@ class PPScheduleExtractor:
                     bwd_mb += 1
                     clock += 1
             # Cool-down
-            while bwd_mb < n_mb:
+            while bwd_mb < num_mb:
                 ts.add_event(
                     ScheduleEvent(
                         event_id=_make_event_id("pp", counter),

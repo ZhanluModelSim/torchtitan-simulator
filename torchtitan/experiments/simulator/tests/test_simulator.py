@@ -776,7 +776,7 @@ class TestExport(unittest.TestCase):
         graph = ComputeGraph()
         graph.add_node(
             OpNode(
-                "n_fwd",
+                "num_fwd",
                 "aten.mm.default",
                 "compute",
                 "forward",
@@ -787,7 +787,7 @@ class TestExport(unittest.TestCase):
         )
         graph.add_node(
             OpNode(
-                "n_bwd",
+                "num_bwd",
                 "aten.mm.default",
                 "compute",
                 "backward",
@@ -1421,7 +1421,7 @@ class TestSyntheticCommInjection(unittest.TestCase):
             training = MockTraining()
 
         class MockModelPart(nn.Module):
-            n_layers = 2
+            num_layers = 2
 
             def __init__(self):
                 super().__init__()
@@ -1458,7 +1458,7 @@ class TestSyntheticCommInjection(unittest.TestCase):
 
 
 class TestPPScheduleExtractor(unittest.TestCase):
-    def _make_mock_schedule(self, n_stages: int = 2, n_microbatches: int = 4):
+    def _make_mock_schedule(self, num_stages: int = 2, n_microbatches: int = 4):
         """Create a minimal mock PP schedule."""
 
         class MockAction:
@@ -1475,10 +1475,10 @@ class TestPPScheduleExtractor(unittest.TestCase):
                 # Build a simple 1F1B-like action list
                 self._actions = []
                 for mb in range(n_microbatches):
-                    for s in range(n_stages):
+                    for s in range(num_stages):
                         self._actions.append(MockAction(s, "F", mb))
                 for mb in range(n_microbatches - 1, -1, -1):
-                    for s in range(n_stages - 1, -1, -1):
+                    for s in range(num_stages - 1, -1, -1):
                         self._actions.append(MockAction(s, "B", mb))
 
         return MockSchedule()
@@ -1488,7 +1488,7 @@ class TestPPScheduleExtractor(unittest.TestCase):
             PPScheduleExtractor,
         )
 
-        schedule_obj = self._make_mock_schedule(n_stages=2, n_microbatches=2)
+        schedule_obj = self._make_mock_schedule(num_stages=2, n_microbatches=2)
         extractor = PPScheduleExtractor(schedule=schedule_obj, pp_rank=-1)
         sched = extractor.extract()
 
@@ -1502,7 +1502,7 @@ class TestPPScheduleExtractor(unittest.TestCase):
             PPScheduleExtractor,
         )
 
-        schedule_obj = self._make_mock_schedule(n_stages=2, n_microbatches=2)
+        schedule_obj = self._make_mock_schedule(num_stages=2, n_microbatches=2)
         extractor = PPScheduleExtractor(schedule=schedule_obj, pp_rank=-1)
         sched = extractor.extract()
 
@@ -2525,7 +2525,7 @@ class TestDESEngine(unittest.TestCase):
 
         graph = ComputeGraph()
         fwd_node = OpNode(
-            "n_fwd",
+            "num_fwd",
             "aten.mm.default",
             "compute",
             "forward",
@@ -2534,7 +2534,7 @@ class TestDESEngine(unittest.TestCase):
             perf_result=PerfResult(total_time_us=50.0),
         )
         bwd_node = OpNode(
-            "n_bwd",
+            "num_bwd",
             "aten.mm.default",
             "compute",
             "backward",
@@ -2663,7 +2663,7 @@ class TestDESEngine(unittest.TestCase):
         for stage in range(2):
             graph.add_node(
                 OpNode(
-                    f"n_fwd_{stage}",
+                    f"num_fwd_{stage}",
                     "aten.mm.default",
                     "compute",
                     "forward",
@@ -2674,7 +2674,7 @@ class TestDESEngine(unittest.TestCase):
             )
             graph.add_node(
                 OpNode(
-                    f"n_bwd_{stage}",
+                    f"num_bwd_{stage}",
                     "aten.mm.default",
                     "compute",
                     "backward",

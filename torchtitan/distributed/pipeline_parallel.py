@@ -160,8 +160,12 @@ def _get_pipeline_metadata(
     layers_per_stage = parallelism.pipeline_parallel_layers_per_stage
     if hasattr(model_config, "layers"):
         num_layers = len(model_config.layers)
+    elif hasattr(model_config, "n_layers"):
+        num_layers = model_config.n_layers
+    elif hasattr(model_config, "num_layers"):
+        num_layers = model_config.num_layers
     else:
-        raise ValueError("Model does not have n_layers attribute.")
+        raise ValueError("Model config does not have layers, n_layers, or num_layers attribute.")
 
     # You can adjust these weights based on the computational cost of embeddings and output layers
     # Higher weights mean these modules are treated as "heavier" in the distribution

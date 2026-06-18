@@ -297,9 +297,9 @@ def capture_joint_fx(
         )
 
     def _loss_with_params(*param_values_and_inputs):
-        n_params = len(trainable_names)
-        param_values = param_values_and_inputs[:n_params]
-        inputs = param_values_and_inputs[n_params:]
+        num_params = len(trainable_names)
+        param_values = param_values_and_inputs[:num_params]
+        inputs = param_values_and_inputs[num_params:]
         param_dict = dict(zip(trainable_names, param_values))
         merged_state = {**buffers, **param_dict}
         out = functional_call(model, merged_state, inputs, kwargs=example_kwargs)

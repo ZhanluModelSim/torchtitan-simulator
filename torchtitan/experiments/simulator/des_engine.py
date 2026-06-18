@@ -249,8 +249,8 @@ def simulate_multi_rank_des(result: SimulationResult) -> float:
                     if node and node.perf_result:
                         total += node.perf_result.total_time_us
                 # Divide by number of events sharing this key
-                n_events = events_per_key.get(key, 1)
-                per_event = total / max(n_events, 1)
+                num_events = events_per_key.get(key, 1)
+                per_event = total / max(num_events, 1)
                 event_durations[event.event_id] = per_event
                 duration_key_cache[key] = per_event
             else:

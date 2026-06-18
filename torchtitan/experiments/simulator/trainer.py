@@ -27,6 +27,9 @@ class SimulationConfig:
     output_formats: list[str] = field(
         default_factory=lambda: ["json", "dot", "chrome_trace", "html", "text"]
     )
+    mode: str = "all"
+    max_seq_len: int = 128
+    batch_size: int = 2
     capture_joint_fx: bool = False
     semantic_schedule: bool = False
     cost_model: bool = False
@@ -170,17 +173,17 @@ def _cpu_pp_module_split(model: Any, config: Any, model_config: Any) -> list[Any
     vpp = 1 if is_single else 2
     num_virtual_stages = pp_degree * vpp
 
-    n_layers = getattr(model_config, "n_layers", 0)
-    if not n_layers:
+    num_layers = getattr(model_config, "num_layers", 0)
+    if not num_layers:
         # Fallback: count from model.layers (ModuleDict or ModuleList)
         layers_attr = getattr(model, "layers", None)
         if layers_attr is not None:
-            n_layers = len(layers_attr)
+            num_layers = len(layers_attr)
         else:
-            n_layers = 0
+            num_layers = 0
 
     module_names = _generate_llm_fqn_per_model_part(
-        num_virtual_stages, n_layers, input_weight=1, output_weight=1
+        num_virtual_stages, num_layers, input_weight=1, output_weight=1
     )
 
     model_parts = []
@@ -227,7 +230,15 @@ def _cpu_semantic_pipeline(
         part.to_empty(device="meta")
     model_parts_holder.clear()
     model_parts_holder.extend(model_parts)
-    return None, model_parts, True, True
+
+    class MockSchedule:
+        def step(self, *args, **kwargs):
+            if "losses" in kwargs and isinstance(kwargs["losses"], list):
+                kwargs["losses"].append(torch.tensor(0.0, device="meta"))
+            return torch.tensor(0.0, device="meta")
+
+    return MockSchedule(), model_parts, True, True
+
 
 
 def _set_fake_world_size(config: Any) -> None:
@@ -285,6 +296,7 @@ class SimulationTrainer(Trainer):
         actual_comm_mode = getattr(config.comm, "mode", "") or ""
         if actual_comm_mode == "fake_backend":
             comm_backend = ""
+        sim_opts.comm_backend = comm_backend
 
         # Determine device_mode AFTER comm_backend finalization so that
         # sim_opts.comm_backend="gloo" with --comm.mode=fake_backend correctly
@@ -326,18 +338,9 @@ class SimulationTrainer(Trainer):
             config.model_spec.pipelining_fn = _cpu_noop_pipeline
 
         super().__init__(config)
-
-        self.parallel_dims.pp = 0
-        self.parallel_dims.tp = 1
-        self.parallel_dims.dp_shard = 1
-        self.parallel_dims.dp_replicate = 1
-
-        # Replace self.model_parts with PP-split parts if PP semantic pipeline ran
+        
         if self._pp_model_parts:
             self.model_parts = self._pp_model_parts
-            logger.info(
-                "PP-semantic pipeline: model split into %d parts", len(self.model_parts)
-            )
 
         # Apply FSDP1 wrapping after model is fully initialised on CPU.
         # Must happen after super().__init__() because the Trainer builds

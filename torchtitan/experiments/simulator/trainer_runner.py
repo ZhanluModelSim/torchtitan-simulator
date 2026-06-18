@@ -643,346 +643,101 @@ def _guess_hidden_dim(model: Any) -> int:
 
 
 def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
-    """Run one simulated training step using an already-built Trainer instance."""
-    rank = int(os.environ.get("RANK", "0"))
-    comm_backend = getattr(sim_opts, "comm_backend", "") or ""
-    actual_comm_mode = getattr(trainer.config.comm, "mode", "") or ""
-    if actual_comm_mode == "fake_backend":
-        comm_backend = ""
-
-    data_iterator = trainer.batch_generator(trainer.dataloader)
-    trainer.optimizers.zero_grad()
-
-    microbatches: list[tuple[dict[str, torch.Tensor], torch.Tensor]] = []
-    local_valid_tokens = torch.tensor(0, dtype=torch.int64)
-    for _ in range(trainer.gradient_accumulation_steps):
-        input_dict, labels = next(data_iterator)
-        local_valid_tokens += (labels != IGNORE_INDEX).sum()
-        microbatches.append((input_dict, labels))
-
-    use_fake = comm_backend != "gloo"
-    capture_comm = comm_backend == "gloo"
-
-    first_input_dict, first_labels = microbatches[0]
-
-    sim_t0 = time.monotonic()
-
-    # -- Decide if we should multi-stage trace ----------
-    model_parts = getattr(trainer, "_pp_model_parts", None) or trainer.model_parts
-    num_virtual_stages = len(model_parts)
-    pp_config_degree = int(getattr(trainer.config.parallelism, "pipeline_parallel_degree", 1) or 1)
+    """Run one simulated training step seamlessly utilizing the native Trainer."""
+    from torchtitan.trainer import Trainer
+    import torchtitan.observability.structured_logger as sl
+    import torchtitan.distributed.utils as dist_utils
+    import torch._subclasses.fake_impls
     
-    # Calculate VPP (virtual pipeline parallelism) factor
-    vpp = num_virtual_stages // pp_config_degree if pp_config_degree > 1 else 1
+    # 1. Patch meta vs meta:0 issues by enforcing clean meta device
+    trainer.device = torch.device("meta")
+    
+    # 2. Patch FakeTensor conversions that crash native train_step
+    def _mock_local_scalar_dense(fake_mode, func, *args, **kwargs):
+        return 0
+    torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default] = _mock_local_scalar_dense
+    
+    from torch._subclasses.fake_tensor import FakeTensor
+    orig_format = FakeTensor.__format__
+    FakeTensor.__format__ = lambda self, format_spec: "0.0"
+    
+    # 3. Patch distributed and optimizer operations that expect real tensors
+    orig_clip_grad_norm = dist_utils.clip_grad_norm_
+    orig_dist_sum = dist_utils.dist_sum
+    orig_dist_max = dist_utils.dist_max
+    
+    dist_utils.clip_grad_norm_ = lambda *args, **kwargs: torch.tensor(0.0, device="meta")
+    dist_utils.dist_sum = lambda t, *args, **kwargs: t
+    dist_utils.dist_max = lambda t, *args, **kwargs: t
+    
+    orig_get_mesh = trainer.parallel_dims.get_optional_mesh
+    orig_get_strict_mesh = trainer.parallel_dims.get_mesh
+    trainer.parallel_dims.get_optional_mesh = lambda *args, **kwargs: None
+    trainer.parallel_dims.get_mesh = lambda *args, **kwargs: None
 
-    if num_virtual_stages > 1:
-        # === Multi-stage per-PP trace ===
-        # Move model parts back to meta device to avoid OOM with
-        # large models (1T+ parameters materialized on CPU)
-        for m in model_parts:
-            m.to_empty(device="meta")
+    orig_optim_step = trainer.optimizers.step
+    orig_lr_step = trainer.lr_schedulers.step
+    trainer.optimizers.step = lambda *args, **kwargs: None
+    trainer.lr_schedulers.step = lambda *args, **kwargs: None
 
-        from collections import Counter
-
-        all_nodes: list[OpNode] = []
-        all_edges: list[tuple[str, str, str]] = []
-
-        # Stage 0 uses real token ids; later stages use previous stage's output
-        prev_stage_output = None
-
-        logger.info(
-            "Multi-stage tracing: %d virtual stages, PP=%d, VPP=%d",
-            num_virtual_stages,
-            pp_config_degree,
-            vpp,
-        )
-
-        for stage_idx, model_part in enumerate(model_parts):
-            # Calculate which physical PP rank this virtual stage belongs to
-            # For Interleaved1F1B with PP=8, VPP=2:
-            #   stages 0-7 -> ranks 0-7 (first virtual stage)
-            #   stages 8-15 -> ranks 0-7 (second virtual stage)
-            pp_rank = stage_idx % pp_config_degree
-            
-            logger.info(
-                "Tracing virtual stage %d/%d (PP rank %d, VPP chunk %d/%d, %d params)",
-                stage_idx + 1,
-                num_virtual_stages,
-                pp_rank,
-                (stage_idx // pp_config_degree) + 1,
-                vpp,
-                sum(p.numel() for p in model_part.parameters()),
-            )
-
-            # All model parts are on meta device (we moved them above to
-            # avoid OOM). FakeTensorMode works with meta parameters on all
-            # stages so use_fake is always True for fake_backend mode.
-            use_fake_for_stage = use_fake
-
-            if stage_idx == 0:
-                if use_fake:
-                    stage_input = (first_input_dict["input"].to("meta"),)
-                else:
-                    stage_input = (first_input_dict["input"],)
+    # Patch log_trace_scalar to avoid int() crash on meta tensors
+    orig_log = sl.log_trace_scalar
+    def safe_log(d):
+        safe_dict = {}
+        for k, v in d.items():
+            if isinstance(v, torch.Tensor):
+                safe_dict[k] = 0
             else:
-                # For later stages: use prev stage's output directly.
-                stage_input = (prev_stage_output,)
+                try:
+                    safe_dict[k] = int(v)
+                except Exception:
+                    safe_dict[k] = 0
+        orig_log(safe_dict)
+    sl.log_trace_scalar = safe_log
 
-            recorder = TraceRecorder(rank=rank)
-            recorder._counter = (
-                stage_idx + 1
-            ) * 100000  # avoid node_id collision (0 is default initial)
-            recorder.current_pp_stage = stage_idx
-            recorder.current_pp_rank = pp_rank
+    recorder = TraceRecorder(rank=int(os.environ.get("RANK", "0")))
+    
+    data_iterator = trainer.batch_generator(trainer.dataloader)
+    
+    # Pre-fetch batches outside of FakeTensorMode to avoid dataloader internal crashes
+    batches = []
+    for _ in range(trainer.gradient_accumulation_steps):
+        batches.append(next(data_iterator))
+        
+    def mock_data_iterator():
+        for batch in batches:
+            yield batch
+    
+    use_fake = (getattr(sim_opts, "comm_backend", "") or "") != "gloo"
 
-            with unified_trace(
-                recorder,
-                model_part,
-                stage_input,
-                use_fake_mode=use_fake_for_stage,
-                phase="forward",
-                capture_comm=capture_comm,
-                capture_fsdp=True,
-                model_parts=model_parts,
-            ):
-                output = model_part(*stage_input)
+    try:
+        with unified_trace(recorder, use_fake_mode=use_fake, capture_comm=not use_fake, capture_fsdp=not use_fake):
+            Trainer.train_step(trainer, mock_data_iterator())
+    finally:
+        # Restore patched methods
+        dist_utils.clip_grad_norm_ = orig_clip_grad_norm
+        dist_utils.dist_sum = orig_dist_sum
+        dist_utils.dist_max = orig_dist_max
+        trainer.parallel_dims.get_optional_mesh = orig_get_mesh
+        trainer.parallel_dims.get_mesh = orig_get_strict_mesh
+        trainer.optimizers.step = orig_optim_step
+        trainer.lr_schedulers.step = orig_lr_step
+        sl.log_trace_scalar = orig_log
+        FakeTensor.__format__ = orig_format
 
-                if isinstance(output, torch.Tensor):
-                    loss = output.sum()
-                else:
-                    import torch.utils._pytree as pytree
+    result = recorder.build_result()
 
-                    flat, _ = pytree.tree_flatten(output)
-                    loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
-
-                recorder.current_phase = "backward"
-                loss.backward()
-
-            # Save output for next stage input
-            if isinstance(output, torch.Tensor):
-                prev_stage_output = output.detach()
-            elif isinstance(output, (list, tuple)):
-                tensors = [t for t in output if isinstance(t, torch.Tensor)]
-                prev_stage_output = tensors[0].detach() if tensors else None
-
-            logger.info(
-                "  Virtual stage %d (PP rank %d): %d nodes (%d fwd + %d bwd), %d edges",
-                stage_idx,
-                pp_rank,
-                len(recorder.nodes),
-                sum(1 for n in recorder.nodes if n.phase == "forward"),
-                sum(1 for n in recorder.nodes if n.phase == "backward"),
-                len(recorder.edges),
-            )
-
-            all_nodes.extend(recorder.nodes)
-            all_edges.extend(recorder.edges)
-
-        # -- Merge per-stage ComputeGraphs -------------------
-        merged_graph = ComputeGraph()
-        for n in all_nodes:
-            merged_graph.add_node(n)
-        for src, dst, etype in all_edges:
-            merged_graph.add_edge(
-                DataEdge(src_node_id=src, dst_node_id=dst, edge_type=etype)
-            )
-
-        merged_graph.fix_comm_phase_labels()
-        merged_graph.add_phase_boundary_edges()
-
-        result = SimulationResult(
-            compute_graph=merged_graph,
-            comm_events=[],  # multi-stage doesn't capture comm events yet
-            metadata={
-                "mode": "unified_trace",
-                "device_mode": "meta",
-                "rank": rank,
-                "num_virtual_stages": num_virtual_stages,
-                "pp_degree": pp_config_degree,
-                "vpp": vpp,
-            },
-        )
-
-        stage_counts = Counter(n.pp_stage for n in merged_graph.nodes.values())
-        logger.info(
-            "Merged graph: %d nodes across %d stages: %s",
-            len(merged_graph.nodes),
-            len(stage_counts),
-            dict(stage_counts),
-        )
-        logger.info(
-            "Multi-stage tracing completed in %.2fs (%d nodes, %d edges)",
-            time.monotonic() - sim_t0,
-            len(merged_graph.nodes),
-            len(merged_graph.edges),
-        )
-    else:
-        # === Single-stage trace (original logic) ===
-        recorder = TraceRecorder(rank=rank)
-        model_part = model_parts[0]
-
-        if use_fake:
-            example_inputs = (first_input_dict["input"].to("meta"),)
-        else:
-            example_inputs = (first_input_dict["input"],)
-
-        with unified_trace(
-            recorder,
-            model_part,
-            example_inputs,
-            use_fake_mode=use_fake,
-            phase="forward",
-            capture_comm=capture_comm,
-            capture_fsdp=True,
-            model_parts=trainer.model_parts,
-        ):
-            output = model_part(*example_inputs)
-
-            if isinstance(output, torch.Tensor):
-                loss = output.sum()
-            else:
-                import torch.utils._pytree as pytree
-
-                flat, _ = pytree.tree_flatten(output)
-                loss = sum(t.sum() for t in flat if isinstance(t, torch.Tensor))
-
-            recorder.current_phase = "backward"
-            loss.backward()
-
-        result = recorder.build_result(
-            metadata={
-                "mode": "unified_trace",
-                "device_mode": "meta" if use_fake else "cpu",
-                "rank": rank,
-            }
-        )
-
-        result.compute_graph.fix_comm_phase_labels()
-        result.compute_graph.add_phase_boundary_edges()
-        logger.info(
-            "Single-stage tracing completed in %.2fs (%d nodes, %d edges)",
-            time.monotonic() - sim_t0,
-            len(result.compute_graph.nodes),
-            len(result.compute_graph.edges),
-        )
-
-    attach_model_state_memory(
-        result,
-        trainer.model_parts,
-        optimizer_name=getattr(trainer.config.optimizer, "name", None),
-        parallelism_config=getattr(trainer.config, "parallelism", None),
-    )
-
-    graph_mem_events, graph_mem_summary = estimate_graph_memory(result.compute_graph)
-    comm_mem_events = estimate_comm_memory(result.comm_events)
-    result.memory_events.extend(graph_mem_events)
-    result.memory_events.extend(comm_mem_events)
-    merged_summary = merge_memory_summary(
-        graph_mem_summary,
-        {
-            "total_event_bytes": sum(e.bytes for e in comm_mem_events),
-            "by_category": {"comm_event_buffer": sum(e.bytes for e in comm_mem_events)},
-        },
-    )
-    merged_summary["graph_peak_live_bytes"] = graph_mem_summary.get(
-        "peak_live_bytes", 0
-    )
-    result.metadata["memory"] = finalize_memory_summary(
-        result.memory_events,
-        merged_summary,
-        existing_metadata=result.metadata.get("memory"),
-    )
-
-    if comm_backend != "gloo":
-        try:
-            _inject_synthetic_comm_events(result, trainer, sim_opts)
-            synth_comm = [n for n in result.compute_graph.nodes.values() if n.attrs.get("synthetic")]
-            logger.info("Synthetic comm events injected: %d", len(synth_comm))
-        except Exception as exc:
-            import traceback
-            logger.warning("Failed to inject synthetic comm events: %s", exc)
-            traceback.print_exc()
-
-    # ── Semantic schedule (must precede CostModel) ────────────────────
-    if sim_opts.semantic_schedule:
+    if use_fake:
+        _inject_synthetic_comm_events(result, trainer, sim_opts)
+    if getattr(sim_opts, "semantic_schedule", False):
         _inject_semantic_schedule(result, trainer.config)
 
-    # ── CostModel ──────────────────────────────────────────────────────
-    cost_model_enabled = getattr(sim_opts, "cost_model", False)
-    if cost_model_enabled:
-        cost_model_cls = getattr(sim_opts, "cost_model_class", "") or ""
-        cost_model_kwargs = _get_cost_model_kwargs(sim_opts)
-        if cost_model_cls:
-            cost_model = _import_cost_model(cost_model_cls, cost_model_kwargs)
-        else:
-            cost_model = MockCostModel()
-        cost_summary = apply_cost_model(result, cost_model)
-        result.metadata["cost_model"] = cost_summary
-        logger.info(
-            "CostModel: e2e_step=%.1f us, single_rank_step=%.1f us, "
-            "compute=%.1f us, comm=%.1f us",
-            cost_summary["e2e_step_time_us"],
-            cost_summary["single_rank_step_time_us"],
-            cost_summary["total_compute_time_us"],
-            cost_summary["total_comm_time_us"],
+    if getattr(sim_opts, "cost_model", False):
+        cm = _import_cost_model(
+            getattr(sim_opts, "cost_model_class", "") or "torchtitan.experiments.simulator.cost_model.MockCostModel",
+            _get_cost_model_kwargs(sim_opts),
         )
+        apply_cost_model(result, cm)
 
-    if not microbatches:
-        raise RuntimeError("simulation requires at least one microbatch")
-    first_input_dict, first_labels = microbatches[0]
-    example_inputs = (first_input_dict["input"],)
-    # Skip fx_forward_graph capture for multi-stage traces - the per-stage
-    # model parts are on meta device and make_fx on 1T-param models is
-    # extremely slow (~minutes).  The 99998-node merged graph already
-    # contains all ops.
-    if num_virtual_stages <= 1:
-        try:
-            result.metadata["fx_forward_graph"] = capture_forward_fx(
-                trainer.model_parts[0],
-                example_inputs,
-            ).to_dict()
-        except Exception as exc:
-            result.metadata["fx_forward_graph_error"] = str(exc)
-    if sim_opts.capture_joint_fx:
-
-        def _trainer_loss_adapter(pred: Any, labels: torch.Tensor) -> torch.Tensor:
-            try:
-                valid_tokens = (labels != IGNORE_INDEX).sum().to(dtype=torch.float32)
-                return trainer.loss_fn(pred, labels, valid_tokens)
-            except TypeError:
-                return trainer.loss_fn(pred, labels)
-
-        try:
-            result.metadata["fx_joint_graph"] = capture_joint_fx(
-                trainer.model_parts[0],
-                example_inputs,
-                loss_fn=_trainer_loss_adapter,
-                example_labels=first_labels.to(trainer.device),
-            ).to_dict()
-        except Exception as exc:
-            result.metadata["fx_joint_graph_error"] = str(exc)
-
-    result = postprocess_extension_result(result, trainer, sim_opts)
-
-    output_formats = sim_opts.output_formats or [
-        "json",
-        "dot",
-        "chrome_trace",
-        "html",
-        "text",
-    ]
-    t_export = time.monotonic()
-    _export_result(result, sim_opts.output_dir, output_formats)
-    logger.info(
-        "Simulation outputs written to %s (export %.2fs, total %.2fs)",
-        sim_opts.output_dir,
-        time.monotonic() - t_export,
-        time.monotonic() - sim_t0,
-    )
-    result.metadata["timing"] = {
-        "tracing_s": round(t_export - sim_t0, 2),
-        "export_s": round(time.monotonic() - t_export, 2),
-        "total_s": round(time.monotonic() - sim_t0, 2),
-        "node_count": len(result.compute_graph.nodes),
-        "edge_count": len(result.compute_graph.edges),
-    }
+    postprocess_extension_result(result, trainer, sim_opts)
+    _export_result(result, sim_opts.output_dir, sim_opts.output_formats)

@@ -34,8 +34,32 @@ import types
 def _make_meta_device_module():
     """Build a namespace that quacks like ``torch.cuda`` but reports
     zero real devices (meta has no hardware backend)."""
+    class FakeStream:
+        def __init__(self, *args, **kwargs): pass
+        def wait_stream(self, *args, **kwargs): pass
+        def wait_event(self, *args, **kwargs): pass
+        def record_event(self, *args, **kwargs): pass
+        def query(self): return True
+        def synchronize(self): pass
+        def __enter__(self): pass
+        def __exit__(self, exc_type, exc_val, exc_tb): pass
+        def __eq__(self, other): return True
+        def __hash__(self): return 0
+
+    class FakeEvent:
+        def __init__(self, *args, **kwargs): pass
+        def record(self, *args, **kwargs): pass
+        def wait(self, *args, **kwargs): pass
+        def query(self): return True
+        def elapsed_time(self, *args, **kwargs): return 0.0
+        def synchronize(self): pass
+
     return types.SimpleNamespace(
+        Stream=FakeStream,
+        Event=FakeEvent,
+        current_stream=lambda: FakeStream(),
         set_device=lambda device: None,
+        is_initialized=lambda: True,
         current_device=lambda: 0,
         device_count=lambda: 0,
         device_capability=lambda device=None: (0, 0),
@@ -98,6 +122,62 @@ def patch_device_type_to_meta() -> None:
 
     import torch
     import torch.cuda
+
+    # Patch FSDP2 so it accepts meta device meshes
+    try:
+        import torch.distributed.fsdp._fully_shard._fsdp_init as fsdp_init
+        orig_get_device_from_mesh = fsdp_init._get_device_from_mesh
+        def _get_device_from_mesh_meta(mesh):
+            if mesh.device_type == "meta":
+                return torch.device("meta")
+            return orig_get_device_from_mesh(mesh)
+        fsdp_init._get_device_from_mesh = _get_device_from_mesh_meta
+        
+        # Patch fully_shard directly since it imports it
+        import torch.distributed.fsdp._fully_shard._fully_shard as fully_shard_mod
+        fully_shard_mod._get_device_from_mesh = _get_device_from_mesh_meta
+    except ImportError:
+        pass
+
+    # Patch buffer init for meta simulation
+    try:
+        from torchtitan.models.common.decoder import Decoder
+        orig_init_self_buffers = Decoder._init_self_buffers
+        def _init_self_buffers_meta(self, *, buffer_device=None):
+            if buffer_device is not None and buffer_device.type == "meta":
+                buffer_device = None
+            return orig_init_self_buffers(self, buffer_device=buffer_device)
+        Decoder._init_self_buffers = _init_self_buffers_meta
+    except ImportError:
+        pass
+
+    # Patch torch.distributed.device_mesh._get_device_handle
+    try:
+        import torch.distributed.device_mesh as device_mesh_mod
+        orig_get_device_handle = device_mesh_mod._get_device_handle
+        def _get_device_handle_meta(device_type):
+            if device_type == "meta":
+                return meta_mod
+            return orig_get_device_handle(device_type)
+        device_mesh_mod._get_device_handle = _get_device_handle_meta
+        
+        # Patch where it's imported
+        import torch.distributed.fsdp._fully_shard._fsdp_param_group as fsdp_param_group
+        fsdp_param_group._get_device_handle = _get_device_handle_meta
+        
+        import torch.distributed.fsdp._fully_shard._fsdp_init as fsdp_init_mod
+        fsdp_init_mod._get_device_handle = _get_device_handle_meta
+        
+        import torch.distributed.fsdp._fully_shard._fsdp_state as fsdp_state_mod
+        fsdp_state_mod._get_device_handle = _get_device_handle_meta
+        import torch.distributed.fsdp._fully_shard._fsdp_collectives as fsdp_collectives_mod
+        fsdp_collectives_mod._get_device_handle = _get_device_handle_meta
+        
+        # Patch FSDP parameter validation to allow meta parameters
+        import torch.distributed.fsdp._fully_shard._fsdp_param_group as param_group_mod
+        param_group_mod.FSDPParamGroup._validate_no_meta_params = lambda self: None
+    except ImportError:
+        pass
 
     torch.cuda.is_available = lambda: False
     torch.cuda._lazy_init = lambda: None

@@ -241,7 +241,7 @@ class Simulator:
         self,
         pp_schedule: Any,
         num_stages: int | None = None,
-        num_microbatches: int | None = None,
+        n_microbatches: int | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SimulationResult:
         """
@@ -254,7 +254,7 @@ class Simulator:
         Args:
             pp_schedule: A TorchTitan pipeline schedule object.
             num_stages: Override for number of stages (auto-detected if ``None``).
-            num_microbatches: Override for number of microbatches.
+            n_microbatches: Override for number of microbatches.
             metadata: Extra metadata.
 
         Returns:
@@ -265,7 +265,7 @@ class Simulator:
             schedule=pp_schedule,
             pp_rank=self.rank,
             world_size=self.world_size,
-            n_microbatches=num_microbatches,
+            n_microbatches=n_microbatches,
         )
         schedule = extractor.extract()
         self._log(
