@@ -1452,6 +1452,61 @@ class TestSyntheticCommInjection(unittest.TestCase):
             assert actual_bytes > 0, "shape should be numel, not bytes"
 
 
+class TestSyntheticComputeAnchors(unittest.TestCase):
+    def test_inject_synthetic_compute_adds_backward_compute(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            SimulationResult,
+            TensorMeta,
+        )
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _inject_synthetic_compute_anchors,
+        )
+
+        graph = ComputeGraph()
+        graph.add_node(
+            OpNode(
+                "fwd_1",
+                "aten.mm.default",
+                "compute",
+                "forward",
+                [TensorMeta((1, 16), "torch.bfloat16", "cpu")],
+                [TensorMeta((1, 16), "torch.bfloat16", "cpu")],
+            )
+        )
+        result = SimulationResult(compute_graph=graph)
+
+        class MockParallelism:
+            pipeline_parallel_degree = 2
+
+        class MockTraining:
+            mixed_precision_param = "bfloat16"
+
+        class MockConfig:
+            parallelism = MockParallelism()
+            training = MockTraining()
+
+        class MockModelPart(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(16, 16)
+
+        class MockTrainer:
+            config = MockConfig()
+            model_parts = [MockModelPart()]
+
+        _inject_synthetic_compute_anchors(result, MockTrainer())
+
+        backward_compute = [
+            n
+            for n in result.compute_graph.nodes.values()
+            if n.phase == "backward" and n.op_type == "compute"
+        ]
+        assert len(backward_compute) >= 2
+        assert {n.pp_stage for n in backward_compute} == {0, 1}
+
+
 # ===========================================================================
 # PP schedule extractor tests (mock schedule)
 # ========================================================================= ==
@@ -1750,6 +1805,49 @@ class TestInferNumLayers(unittest.TestCase):
         model = nn.Linear(16, 4)
         result = _infer_num_layers([model])
         assert result >= 1
+
+
+class TestTrainerRunnerPhaseSwitch(unittest.TestCase):
+    def test_run_with_phase_restores_phase(self):
+        from torchtitan.experiments.simulator.trainer_runner import _run_with_phase
+
+        class Recorder:
+            current_phase = "forward"
+
+        recorder = Recorder()
+        observed: list[str] = []
+
+        def _probe() -> int:
+            observed.append(recorder.current_phase)
+            return 7
+
+        result = _run_with_phase(recorder, "backward", _probe)
+
+        assert result == 7
+        assert observed == ["backward"]
+        assert recorder.current_phase == "forward"
+
+    def test_patch_backward_phase_marks_backward_ops(self):
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _patch_backward_phase,
+        )
+
+        class Recorder:
+            current_phase = "forward"
+
+        recorder = Recorder()
+        observed: list[str] = []
+        x = torch.tensor(2.0, requires_grad=True)
+        x.register_hook(lambda g: observed.append(recorder.current_phase) or g)
+        y = x * 3.0
+
+        with _patch_backward_phase(recorder):
+            y.backward()
+
+        assert observed == ["backward"]
+        assert recorder.current_phase == "forward"
+        assert x.grad is not None
+        assert float(x.grad.item()) == 3.0
 
 
 class TestSimulatorIntegration(unittest.TestCase):

@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import time
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import torch
 import torch.nn as nn
@@ -37,6 +39,8 @@ from .memory_estimator import (
 from .nodes import ComputeGraph, DataEdge, OpNode, SimulationResult, TensorMeta
 from .schedule_extract import extract_schedule_from_pytorch
 from .unified_trace import TraceRecorder, unified_trace
+
+_T = TypeVar("_T")
 
 
 def _get_cost_model_kwargs(sim_opts: Any) -> dict[str, Any]:
@@ -601,6 +605,90 @@ def _inject_synthetic_comm_events(
                 )
 
 
+def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
+    """Inject lightweight per-stage compute anchors for missing phases."""
+    graph = result.compute_graph
+    if graph is None:
+        return
+
+    missing_phases = [
+        phase
+        for phase in ("forward", "backward")
+        if not any(
+            node.op_type == "compute" and node.phase == phase
+            for node in graph.nodes.values()
+        )
+    ]
+    if not missing_phases:
+        return
+
+    parallelism = trainer.config.parallelism
+    pp = max(int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1), 1)
+    model_parts = getattr(trainer, "model_parts", [])
+    hidden_dim = _guess_hidden_dim(model_parts[0]) if model_parts else 1024
+    hidden_dim = max(int(hidden_dim), 1)
+
+    from torchtitan.config import TORCH_DTYPE_MAP
+
+    mp_param = getattr(trainer.config.training, "mixed_precision_param", "bfloat16")
+    dtype_str = str(TORCH_DTYPE_MAP.get(mp_param, torch.bfloat16))
+
+    counter = [len(graph.nodes)]
+
+    def _next_id(phase: str, kind: str, stage: int) -> str:
+        counter[0] += 1
+        return f"compute_syn_{phase}_{kind}_{stage}_{counter[0]:07d}"
+
+    for phase in missing_phases:
+        for stage_idx in range(pp):
+            pp_rank = stage_idx % pp
+            cube = OpNode(
+                node_id=_next_id(phase, "cube", stage_idx),
+                op_name="aten.mm.default",
+                op_type="compute",
+                phase=phase,
+                pp_stage=stage_idx,
+                pp_rank=pp_rank,
+                microbatch_idx=0,
+                inputs=[
+                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                    TensorMeta(
+                        shape=(hidden_dim, hidden_dim), dtype=dtype_str, device="cpu"
+                    ),
+                ],
+                outputs=[
+                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu")
+                ],
+                attrs={"synthetic_compute_anchor": True},
+            )
+            vec = OpNode(
+                node_id=_next_id(phase, "vec", stage_idx),
+                op_name="aten.add.Tensor",
+                op_type="compute",
+                phase=phase,
+                pp_stage=stage_idx,
+                pp_rank=pp_rank,
+                microbatch_idx=0,
+                inputs=[
+                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                ],
+                outputs=[
+                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu")
+                ],
+                attrs={"synthetic_compute_anchor": True},
+            )
+            graph.add_node(cube)
+            graph.add_node(vec)
+            graph.add_edge(
+                DataEdge(
+                    src_node_id=cube.node_id,
+                    dst_node_id=vec.node_id,
+                    edge_type="data",
+                )
+            )
+
+
 def _infer_num_layers(model_parts: list[Any]) -> int:
     """Derive the number of transformer layers from model config or structure.
 
@@ -643,6 +731,43 @@ def _guess_hidden_dim(model: Any) -> int:
         if isinstance(mod, nn.Linear):
             return mod.in_features
     return 512  # fallback
+
+
+def _run_with_phase(
+    recorder: Any, phase: str, fn: Callable[..., _T], *args: Any, **kwargs: Any
+) -> _T:
+    """Execute ``fn`` while temporarily setting ``recorder.current_phase``."""
+    prev_phase = getattr(recorder, "current_phase", "forward")
+    recorder.current_phase = phase
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        recorder.current_phase = prev_phase
+
+
+@contextmanager
+def _patch_backward_phase(recorder: Any):
+    """Patch autograd entrypoints so backward ops are tagged as ``backward``."""
+    orig_tensor_backward = torch.Tensor.backward
+    orig_autograd_backward = torch.autograd.backward
+
+    def _tensor_backward_wrapper(self: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        return _run_with_phase(
+            recorder, "backward", orig_tensor_backward, self, *args, **kwargs
+        )
+
+    def _autograd_backward_wrapper(*args: Any, **kwargs: Any) -> Any:
+        return _run_with_phase(
+            recorder, "backward", orig_autograd_backward, *args, **kwargs
+        )
+
+    torch.Tensor.backward = _tensor_backward_wrapper  # pyrefly: ignore[invalid-assignment]
+    torch.autograd.backward = _autograd_backward_wrapper  # pyrefly: ignore[invalid-assignment]
+    try:
+        yield
+    finally:
+        torch.Tensor.backward = orig_tensor_backward  # pyrefly: ignore[invalid-assignment]
+        torch.autograd.backward = orig_autograd_backward  # pyrefly: ignore[invalid-assignment]
 
 
 def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
@@ -715,8 +840,14 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     use_fake = (getattr(sim_opts, "comm_backend", "") or "") != "gloo"
 
     try:
-        with unified_trace(recorder, use_fake_mode=use_fake, capture_comm=not use_fake, capture_fsdp=not use_fake):
-            Trainer.train_step(trainer, mock_data_iterator())
+        with unified_trace(
+            recorder,
+            use_fake_mode=use_fake,
+            capture_comm=not use_fake,
+            capture_fsdp=not use_fake,
+        ):
+            with _patch_backward_phase(recorder):
+                Trainer.train_step(trainer, mock_data_iterator())
     finally:
         # Restore patched methods
         dist_utils.clip_grad_norm_ = orig_clip_grad_norm
@@ -738,6 +869,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     result = recorder.build_result()
 
     if use_fake:
+        _inject_synthetic_compute_anchors(result, trainer)
         _inject_synthetic_comm_events(result, trainer, sim_opts)
     if getattr(sim_opts, "semantic_schedule", False):
         _inject_semantic_schedule(result, trainer.config)
