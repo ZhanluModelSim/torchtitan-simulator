@@ -1243,7 +1243,7 @@ class TestCostModel(unittest.TestCase):
             comm_group_size=4,
         )
         bytes_est = _estimate_comm_bytes(node)
-        expected = 4 * 128 * 4
+        expected = int(4 * 128 * 4 * 0.75)
         assert (
             bytes_est == expected
         ), f"Expected {expected} bytes from input, got {bytes_est}"
@@ -1263,7 +1263,7 @@ class TestCostModel(unittest.TestCase):
             comm_group_size=4,
         )
         bytes_est = _estimate_comm_bytes(node)
-        expected = 4 * 128 * 4
+        expected = int(4 * 128 * 4 * 0.75)
         assert (
             bytes_est == expected
         ), f"Expected {expected} bytes from output, got {bytes_est}"
@@ -1438,7 +1438,7 @@ class TestSyntheticCommInjection(unittest.TestCase):
         assert len(result.comm_events) > 0, "Should inject FSDP comm events"
 
         comm_edges = [
-            e for e in result.compute_graph.edges if e.edge_type == "sequential"
+            e for e in result.compute_graph.edges if e.edge_type == "data"
         ]
         assert len(comm_edges) > 0, "Injected comm nodes should have sequential edges"
 

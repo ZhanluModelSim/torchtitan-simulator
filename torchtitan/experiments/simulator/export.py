@@ -548,6 +548,7 @@ def _populate_des_metadata(result: SimulationResult) -> None:
         "peak_dynamic_bytes": mem["peak_dynamic_bytes"],
         "peak_total_bytes": mem["peak_total_bytes"],
         "timeline": mem["timeline"],
+        "timeline_samples": mem.get("timeline_samples", 0),
         "phase_peak": mem["phase_peak"],
     }
 

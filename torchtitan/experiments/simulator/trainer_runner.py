@@ -201,9 +201,10 @@ def _inject_synthetic_comm_events(
     cp = int(getattr(parallelism, "context_parallel_degree", 1) or 1)
     dr = int(getattr(parallelism, "data_parallel_replicate_degree", 1) or 1)
 
-    # Resolve ds=-1 (auto-inferred) to actual value
+    # Resolve ds=-1 (auto-inferred) to actual value using Fake World Size
     if ds < 0:
-        world_size = pp * tp * cp * dr
+        # Use the global WORLD_SIZE set by _set_fake_world_size
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         ds = max(1, world_size // (pp * tp * cp * dr))
 
     if not (tp > 1 or ds > 1 or pp > 1):
@@ -226,6 +227,8 @@ def _inject_synthetic_comm_events(
     mp_param = getattr(trainer.config.training, "mixed_precision_param", "bfloat16")
     torch_dtype = TORCH_DTYPE_MAP.get(mp_param, torch.bfloat16)
     dtype_str = str(torch_dtype)
+    mp_reduce = getattr(trainer.config.training, "mixed_precision_reduce", "float32")
+    reduce_dtype_str = str(TORCH_DTYPE_MAP.get(mp_reduce, torch.float32))
     dtype_byte_size = (
         torch_dtype.itemsize
         if hasattr(torch_dtype, "itemsize")
@@ -291,7 +294,7 @@ def _inject_synthetic_comm_events(
                 )
                 graph.add_node(node)
                 if fwd_anchor:
-                    graph.add_edge(DataEdge(fwd_anchor, node.node_id, "sequential"))
+                    graph.add_edge(DataEdge(fwd_anchor, node.node_id, "data"))
                 result.comm_events.append(
                     {
                         "event_id": node.node_id,
@@ -319,10 +322,10 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx,
                     pp_rank=pp_rank,
                     inputs=[
-                        TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
+                        TensorMeta(shape=(full_layer_numel,), dtype=reduce_dtype_str, device="cpu")
                     ],
                     outputs=[
-                        TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
+                        TensorMeta(shape=(per_layer_numel,), dtype=reduce_dtype_str, device="cpu")
                     ],
                     comm_op="reduce_scatter",
                     comm_group_size=ds,
@@ -330,7 +333,7 @@ def _inject_synthetic_comm_events(
                 )
                 graph.add_node(node)
                 if bwd_anchor:
-                    graph.add_edge(DataEdge(bwd_anchor, node.node_id, "sequential"))
+                    graph.add_edge(DataEdge(node.node_id, bwd_anchor, "data"))
                 result.comm_events.append(
                     {
                         "event_id": node.node_id,
@@ -341,7 +344,7 @@ def _inject_synthetic_comm_events(
                         "pp_rank": pp_rank,
                         "tensor_meta": {
                             "shape": [full_layer_numel],
-                            "dtype": dtype_str,
+                            "dtype": reduce_dtype_str,
                             "device": "cpu",
                         },
                         "source_node_ids": [bwd_anchor] if bwd_anchor else [],
@@ -379,7 +382,7 @@ def _inject_synthetic_comm_events(
                 )
                 graph.add_node(node)
                 if fwd_anchor:
-                    graph.add_edge(DataEdge(fwd_anchor, node.node_id, "sequential"))
+                    graph.add_edge(DataEdge(fwd_anchor, node.node_id, "data"))
                 result.comm_events.append(
                     {
                         "event_id": node.node_id,
@@ -405,15 +408,15 @@ def _inject_synthetic_comm_events(
                     phase="backward",
                     pp_stage=stage_idx,
                     pp_rank=pp_rank,
-                    inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
+                    inputs=[TensorMeta(shape=(act_numel,), dtype=reduce_dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(act_numel,), dtype=reduce_dtype_str, device="cpu")],
                     comm_op="all_reduce",
                     comm_group_size=tp,
                     attrs={"synthetic": True, "tp": True},
                 )
                 graph.add_node(node)
                 if bwd_anchor:
-                    graph.add_edge(DataEdge(bwd_anchor, node.node_id, "sequential"))
+                    graph.add_edge(DataEdge(node.node_id, bwd_anchor, "data"))
                 result.comm_events.append(
                     {
                         "event_id": node.node_id,
@@ -424,7 +427,7 @@ def _inject_synthetic_comm_events(
                         "pp_rank": pp_rank,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
-                            "dtype": dtype_str,
+                            "dtype": reduce_dtype_str,
                             "device": "cpu",
                         },
                         "source_node_ids": [bwd_anchor] if bwd_anchor else [],
@@ -533,8 +536,8 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx,
                     pp_rank=send_pp_rank,
                     microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    inputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
                     comm_op="send",
                     comm_group_size=2,
                     attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx - 1},
@@ -549,8 +552,8 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx - 1,
                     pp_rank=recv_pp_rank,
                     microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    inputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
+                    outputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
                     comm_op="recv",
                     comm_group_size=2,
                     attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
@@ -571,7 +574,7 @@ def _inject_synthetic_comm_events(
                         "microbatch": mb_idx,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
-                            "dtype": dtype_str,
+                            "dtype": reduce_dtype_str,
                             "device": "cpu",
                         },
                         "source_node_ids": [],
@@ -589,7 +592,7 @@ def _inject_synthetic_comm_events(
                         "microbatch": mb_idx,
                         "tensor_meta": {
                             "shape": [batch_size, seq_len, hidden],
-                            "dtype": dtype_str,
+                            "dtype": reduce_dtype_str,
                             "device": "cpu",
                         },
                         "source_node_ids": [send_node.node_id],
@@ -653,6 +656,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     trainer.device = torch.device("meta")
     
     # 2. Patch FakeTensor conversions that crash native train_step
+    orig_local_scalar_dense = torch._subclasses.fake_impls.op_implementations_dict.get(torch.ops.aten._local_scalar_dense.default)
     def _mock_local_scalar_dense(fake_mode, func, *args, **kwargs):
         return 0
     torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default] = _mock_local_scalar_dense
@@ -724,6 +728,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         trainer.lr_schedulers.step = orig_lr_step
         sl.log_trace_scalar = orig_log
         FakeTensor.__format__ = orig_format
+        
+        # Restore local_scalar_dense
+        if orig_local_scalar_dense:
+            torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default] = orig_local_scalar_dense
+        else:
+            del torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default]
 
     result = recorder.build_result()
 
@@ -738,6 +748,22 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
             _get_cost_model_kwargs(sim_opts),
         )
         apply_cost_model(result, cm)
+
+    from torchtitan.experiments.simulator.memory_estimator import build_runtime_memory, attach_model_state_memory
+    memory_events, memory_summary = build_runtime_memory(
+        result.compute_graph,
+        result.comm_events,
+        existing_metadata=result.metadata,
+    )
+    result.memory_events.extend(memory_events)
+    result.metadata.update(memory_summary)
+
+    attach_model_state_memory(
+        result,
+        trainer.model_parts,
+        optimizer_name=trainer.optimizers.optimizers[0].__class__.__name__ if trainer.optimizers.optimizers else None,
+        parallelism_config=trainer.config.parallelism,
+    )
 
     postprocess_extension_result(result, trainer, sim_opts)
     _export_result(result, sim_opts.output_dir, sim_opts.output_formats)
