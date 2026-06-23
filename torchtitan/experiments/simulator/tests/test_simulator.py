@@ -1506,6 +1506,61 @@ class TestSyntheticComputeAnchors(unittest.TestCase):
         assert len(backward_compute) >= 2
         assert {n.pp_stage for n in backward_compute} == {0, 1}
 
+    def test_inject_synthetic_compute_adds_missing_cube_lane(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            SimulationResult,
+            TensorMeta,
+        )
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _inject_synthetic_compute_anchors,
+        )
+
+        graph = ComputeGraph()
+        # Forward phase has only vec-like compute; no cube-like compute.
+        graph.add_node(
+            OpNode(
+                "fwd_vec",
+                "aten.add.Tensor",
+                "compute",
+                "forward",
+                [TensorMeta((1, 16), "torch.bfloat16", "cpu")],
+                [TensorMeta((1, 16), "torch.bfloat16", "cpu")],
+            )
+        )
+        result = SimulationResult(compute_graph=graph)
+
+        class MockParallelism:
+            pipeline_parallel_degree = 2
+
+        class MockTraining:
+            mixed_precision_param = "bfloat16"
+
+        class MockConfig:
+            parallelism = MockParallelism()
+            training = MockTraining()
+
+        class MockModelPart(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(16, 16)
+
+        class MockTrainer:
+            config = MockConfig()
+            model_parts = [MockModelPart()]
+
+        _inject_synthetic_compute_anchors(result, MockTrainer())
+
+        forward_compute = [
+            n
+            for n in result.compute_graph.nodes.values()
+            if n.phase == "forward" and n.op_type == "compute"
+        ]
+        assert any("mm" in n.op_name for n in forward_compute), (
+            "forward phase should include at least one cube-like compute anchor"
+        )
+
 
 # ===========================================================================
 # PP schedule extractor tests (mock schedule)

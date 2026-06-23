@@ -606,20 +606,33 @@ def _inject_synthetic_comm_events(
 
 
 def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
-    """Inject lightweight per-stage compute anchors for missing phases."""
+    """Inject lightweight per-stage compute anchors for missing swimlane lanes."""
     graph = result.compute_graph
     if graph is None:
         return
 
-    missing_phases = [
-        phase
-        for phase in ("forward", "backward")
-        if not any(
-            node.op_type == "compute" and node.phase == phase
-            for node in graph.nodes.values()
+    def _is_cube_compute(op_name: str) -> bool:
+        name = op_name.lower()
+        return any(
+            kw in name
+            for kw in ("mm", "matmul", "bmm", "addmm", "linear", "conv", "gemm", "dot")
         )
-    ]
-    if not missing_phases:
+
+    lane_gaps: dict[str, dict[str, bool]] = {}
+    for phase in ("forward", "backward"):
+        phase_compute = [
+            node
+            for node in graph.nodes.values()
+            if node.phase == phase and node.op_type == "compute"
+        ]
+        has_cube = any(_is_cube_compute(node.op_name) for node in phase_compute)
+        has_vec = any(not _is_cube_compute(node.op_name) for node in phase_compute)
+        need_cube = not has_cube
+        need_vec = not has_vec
+        if need_cube or need_vec:
+            lane_gaps[phase] = {"cube": need_cube, "vec": need_vec}
+
+    if not lane_gaps:
         return
 
     parallelism = trainer.config.parallelism
@@ -639,54 +652,65 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
         counter[0] += 1
         return f"compute_syn_{phase}_{kind}_{stage}_{counter[0]:07d}"
 
-    for phase in missing_phases:
+    for phase, needs in lane_gaps.items():
         for stage_idx in range(pp):
             pp_rank = stage_idx % pp
-            cube = OpNode(
-                node_id=_next_id(phase, "cube", stage_idx),
-                op_name="aten.mm.default",
-                op_type="compute",
-                phase=phase,
-                pp_stage=stage_idx,
-                pp_rank=pp_rank,
-                microbatch_idx=0,
-                inputs=[
-                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
-                    TensorMeta(
-                        shape=(hidden_dim, hidden_dim), dtype=dtype_str, device="cpu"
-                    ),
-                ],
-                outputs=[
-                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu")
-                ],
-                attrs={"synthetic_compute_anchor": True},
-            )
-            vec = OpNode(
-                node_id=_next_id(phase, "vec", stage_idx),
-                op_name="aten.add.Tensor",
-                op_type="compute",
-                phase=phase,
-                pp_stage=stage_idx,
-                pp_rank=pp_rank,
-                microbatch_idx=0,
-                inputs=[
-                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
-                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
-                ],
-                outputs=[
-                    TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu")
-                ],
-                attrs={"synthetic_compute_anchor": True},
-            )
-            graph.add_node(cube)
-            graph.add_node(vec)
-            graph.add_edge(
-                DataEdge(
-                    src_node_id=cube.node_id,
-                    dst_node_id=vec.node_id,
-                    edge_type="data",
+
+            cube: OpNode | None = None
+            vec: OpNode | None = None
+
+            if needs["cube"]:
+                cube = OpNode(
+                    node_id=_next_id(phase, "cube", stage_idx),
+                    op_name="aten.mm.default",
+                    op_type="compute",
+                    phase=phase,
+                    pp_stage=stage_idx,
+                    pp_rank=pp_rank,
+                    microbatch_idx=0,
+                    inputs=[
+                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                        TensorMeta(
+                            shape=(hidden_dim, hidden_dim),
+                            dtype=dtype_str,
+                            device="cpu",
+                        ),
+                    ],
+                    outputs=[
+                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu")
+                    ],
+                    attrs={"synthetic_compute_anchor": True, "synthetic_lane": "cube"},
                 )
-            )
+                graph.add_node(cube)
+
+            if needs["vec"]:
+                vec = OpNode(
+                    node_id=_next_id(phase, "vec", stage_idx),
+                    op_name="aten.add.Tensor",
+                    op_type="compute",
+                    phase=phase,
+                    pp_stage=stage_idx,
+                    pp_rank=pp_rank,
+                    microbatch_idx=0,
+                    inputs=[
+                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                    ],
+                    outputs=[
+                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu")
+                    ],
+                    attrs={"synthetic_compute_anchor": True, "synthetic_lane": "vec"},
+                )
+                graph.add_node(vec)
+
+            if cube is not None and vec is not None:
+                graph.add_edge(
+                    DataEdge(
+                        src_node_id=cube.node_id,
+                        dst_node_id=vec.node_id,
+                        edge_type="data",
+                    )
+                )
 
 
 def _infer_num_layers(model_parts: list[Any]) -> int:
