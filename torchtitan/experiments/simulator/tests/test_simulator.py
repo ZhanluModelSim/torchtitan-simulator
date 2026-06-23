@@ -760,6 +760,82 @@ class TestExport(unittest.TestCase):
             assert "Memory estimate summary" in content
             assert "Memory trace timeline" in content
 
+    def test_export_html_operator_swimlane_comm_scope_defaults_to_model_only(self):
+        from torchtitan.experiments.simulator.export import export_html
+
+        result = self._make_result()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "trace.html")
+            export_html(result, path)
+            with open(path) as f:
+                content = f.read()
+            assert "operator_swimlane_comm_scope" in content
+            assert "model_only" in content
+
+    def test_is_cluster_parallel_comm_node(self):
+        from torchtitan.experiments.simulator.export import (
+            _is_cluster_parallel_comm_node,
+        )
+        from torchtitan.experiments.simulator.nodes import OpNode
+
+        fsdp_comm = OpNode(
+            node_id="c1",
+            op_name="all_gather",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={"synthetic": True, "fsdp2": True},
+        )
+        pp_comm = OpNode(
+            node_id="c1b",
+            op_name="pp_send_activation",
+            op_type="comm_p2p",
+            phase="forward",
+            attrs={"synthetic": True, "pp": True},
+        )
+        tp_comm = OpNode(
+            node_id="c1c",
+            op_name="all_reduce",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={"synthetic": True, "tp": True},
+        )
+        cp_comm = OpNode(
+            node_id="c1d",
+            op_name="all_to_all",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={"synthetic": True, "cp": True},
+        )
+        ep_comm = OpNode(
+            node_id="c1e",
+            op_name="all_to_all",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={"synthetic": True, "ep": True},
+        )
+        real_comm = OpNode(
+            node_id="c2",
+            op_name="all_reduce",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={},
+        )
+        synthetic_compute = OpNode(
+            node_id="k1",
+            op_name="aten.mm.default",
+            op_type="compute",
+            phase="forward",
+            attrs={"synthetic": True, "fsdp2": True},
+        )
+
+        assert _is_cluster_parallel_comm_node(fsdp_comm) is True
+        assert _is_cluster_parallel_comm_node(pp_comm) is True
+        assert _is_cluster_parallel_comm_node(tp_comm) is False
+        assert _is_cluster_parallel_comm_node(cp_comm) is False
+        assert _is_cluster_parallel_comm_node(ep_comm) is False
+        assert _is_cluster_parallel_comm_node(real_comm) is False
+        assert _is_cluster_parallel_comm_node(synthetic_compute) is False
+
     def test_chrome_trace_schedule_events_have_des_timing(self):
         from torchtitan.experiments.simulator.des_engine import simulate_multi_rank_des
         from torchtitan.experiments.simulator.export import export_chrome_trace
@@ -1560,6 +1636,70 @@ class TestSyntheticComputeAnchors(unittest.TestCase):
         assert any("mm" in n.op_name for n in forward_compute), (
             "forward phase should include at least one cube-like compute anchor"
         )
+
+    def test_inject_synthetic_compute_scales_with_layer_count(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            SimulationResult,
+            TensorMeta,
+        )
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _inject_synthetic_compute_anchors,
+        )
+
+        graph = ComputeGraph()
+        graph.add_node(
+            OpNode(
+                "fwd_vec",
+                "aten.add.Tensor",
+                "compute",
+                "forward",
+                [TensorMeta((1, 16), "torch.bfloat16", "cpu")],
+                [TensorMeta((1, 16), "torch.bfloat16", "cpu")],
+            )
+        )
+        result = SimulationResult(compute_graph=graph)
+
+        class MockParallelism:
+            pipeline_parallel_degree = 2
+
+        class MockTraining:
+            mixed_precision_param = "bfloat16"
+
+        class MockConfig:
+            parallelism = MockParallelism()
+            training = MockTraining()
+
+        class MockModelPart(nn.Module):
+            n_layers = 4
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(16, 16)
+
+        class MockTrainer:
+            config = MockConfig()
+            model_parts = [MockModelPart()]
+
+        _inject_synthetic_compute_anchors(result, MockTrainer())
+
+        target = MockParallelism.pipeline_parallel_degree * MockModelPart.n_layers
+        phase_counts: dict[str, dict[str, int]] = {}
+        for phase in ("forward", "backward"):
+            compute_nodes = [
+                n
+                for n in result.compute_graph.nodes.values()
+                if n.phase == phase and n.op_type == "compute"
+            ]
+            cube = sum(1 for n in compute_nodes if "mm" in n.op_name.lower())
+            vec = len(compute_nodes) - cube
+            phase_counts[phase] = {"cube": cube, "vec": vec}
+
+        assert phase_counts["forward"]["cube"] >= target
+        assert phase_counts["forward"]["vec"] >= target
+        assert phase_counts["backward"]["cube"] >= target
+        assert phase_counts["backward"]["vec"] >= target
 
 
 # ===========================================================================

@@ -3,7 +3,6 @@
 # All rights reserved.
 
 import os
-import torch
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 def main() -> None:

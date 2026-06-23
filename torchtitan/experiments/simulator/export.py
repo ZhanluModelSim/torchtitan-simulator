@@ -26,7 +26,7 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-from .nodes import ComputeGraph, OpNode, SimulationResult, TrainingSchedule
+from .nodes import ComputeGraph, OpNode, SimulationResult
 
 # ---------------------------------------------------------------------------
 # Colour scheme for DOT export (by op_type)
@@ -887,6 +887,16 @@ def _short_op_name(name: str, max_len: int = 42) -> str:
     return name if len(name) <= max_len else name[: max_len - 1] + "…"
 
 
+def _is_cluster_parallel_comm_node(node: OpNode) -> bool:
+    """Return True for synthetic scheduling comm nodes (FSDP/PP/DP)."""
+    if node.op_type not in {"comm_collective", "comm_p2p"}:
+        return False
+    attrs = node.attrs or {}
+    if not attrs.get("synthetic", False):
+        return False
+    return any(attrs.get(key, False) for key in ("fsdp2", "pp", "dp"))
+
+
 def export_html(
     result: SimulationResult,
     path: str | os.PathLike,
@@ -1316,7 +1326,20 @@ def export_html(
       if (!container) return;
       
       const phase = '{phase}';
-      const nodes = (TRACE.compute_graph?.nodes || []).filter(n => n.phase === phase);
+      const operatorCommScope = (TRACE.metadata?.operator_swimlane_comm_scope || 'model_only').toLowerCase();
+      const isClusterParallelCommNode = (node) => {{
+        if (!node) return false;
+        const opType = node.op_type || '';
+        if (opType !== 'comm_collective' && opType !== 'comm_p2p') return false;
+        const attrs = node.attrs || {{}};
+        if (!attrs.synthetic) return false;
+        return Boolean(attrs.fsdp2 || attrs.pp || attrs.dp);
+      }};
+      const nodes = (TRACE.compute_graph?.nodes || []).filter(n => {{
+        if (n.phase !== phase) return false;
+        if (operatorCommScope !== 'all' && isClusterParallelCommNode(n)) return false;
+        return true;
+      }});
       const edges = (TRACE.compute_graph?.edges || []).filter(e => {{
         const srcNode = nodes.find(n => n.node_id === e.src);
         const dstNode = nodes.find(n => n.node_id === e.dst);

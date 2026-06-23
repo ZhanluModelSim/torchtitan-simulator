@@ -6,19 +6,20 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import json
 import os
-import time
 from collections.abc import Callable
+
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
 import torch
 import torch.nn as nn
 
-from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.tools.logging import logger
+from .capture.unified_trace import TraceRecorder, unified_trace
 
-from .cost_model import apply_cost_model, CostModel, MockCostModel
+from .cost_model import apply_cost_model, CostModel
 from .export import (
     export_chrome_trace,
     export_dot,
@@ -27,18 +28,9 @@ from .export import (
     export_text_summary,
 )
 from .extension_hooks import postprocess_extension_result
-from .capture.fx_capture import capture_forward_fx, capture_joint_fx
-from .memory_estimator import (
-    attach_model_state_memory,
-    dtype_size,
-    estimate_comm_memory,
-    estimate_graph_memory,
-    finalize_memory_summary,
-    merge_memory_summary,
-)
-from .nodes import ComputeGraph, DataEdge, OpNode, SimulationResult, TensorMeta
+from .memory_estimator import dtype_size
+from .nodes import DataEdge, OpNode, TensorMeta
 from .schedule.schedule_extract import extract_schedule_from_pytorch
-from .capture.unified_trace import TraceRecorder, unified_trace
 
 _T = TypeVar("_T")
 
@@ -129,6 +121,31 @@ def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> N
     if "text" in output_formats:
         with open(os.path.join(output_dir, "summary.txt"), "w", encoding="utf-8") as f:
             f.write(export_text_summary(result))
+
+
+def _export_workload_graph(result: Any, config: Any, sim_opts: Any) -> None:
+    """Project the captured result into the spec L1/L2/L3 IR and export it.
+
+    Emitted as ``workload_graph.json`` (a new, additive artifact).  The
+    projection is derived entirely from captured data + declared config, so a
+    failure here must never break the primary export path.
+    """
+    rank = int(os.environ.get("RANK", "0"))
+    if rank != 0:
+        return
+    if "json" not in getattr(sim_opts, "output_formats", []):
+        return
+    try:
+        from .ir import build_workload_graph
+
+        workload = build_workload_graph(result, config)
+        output_dir = sim_opts.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "workload_graph.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(workload.to_dict(), f, indent=2, default=str)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to export layered workload graph: %s", exc)
 
 
 def _inject_semantic_schedule(result: Any, config: Any) -> None:
@@ -258,7 +275,9 @@ def _inject_synthetic_comm_events(
         counter[0] += 1
         return f"comm_syn_{counter[0]:07d}"
 
-    def _find_last_compute_node_id(phase: str, pp_stage: int | None = None) -> str | None:
+    def _find_last_compute_node_id(
+        phase: str, pp_stage: int | None = None
+    ) -> str | None:
         for nid in reversed(list(graph.nodes.keys())):
             n = graph.nodes[nid]
             if n.phase == phase and n.op_type == "compute":
@@ -287,10 +306,14 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx,
                     pp_rank=pp_rank,
                     inputs=[
-                        TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
+                        TensorMeta(
+                            shape=(per_layer_numel,), dtype=dtype_str, device="cpu"
+                        )
                     ],
                     outputs=[
-                        TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
+                        TensorMeta(
+                            shape=(full_layer_numel,), dtype=dtype_str, device="cpu"
+                        )
                     ],
                     comm_op="all_gather",
                     comm_group_size=ds,
@@ -326,10 +349,18 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx,
                     pp_rank=pp_rank,
                     inputs=[
-                        TensorMeta(shape=(full_layer_numel,), dtype=reduce_dtype_str, device="cpu")
+                        TensorMeta(
+                            shape=(full_layer_numel,),
+                            dtype=reduce_dtype_str,
+                            device="cpu",
+                        )
                     ],
                     outputs=[
-                        TensorMeta(shape=(per_layer_numel,), dtype=reduce_dtype_str, device="cpu")
+                        TensorMeta(
+                            shape=(per_layer_numel,),
+                            dtype=reduce_dtype_str,
+                            device="cpu",
+                        )
                     ],
                     comm_op="reduce_scatter",
                     comm_group_size=ds,
@@ -378,8 +409,12 @@ def _inject_synthetic_comm_events(
                     phase="forward",
                     pp_stage=stage_idx,
                     pp_rank=pp_rank,
-                    inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
+                    inputs=[
+                        TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")
+                    ],
+                    outputs=[
+                        TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")
+                    ],
                     comm_op="all_reduce",
                     comm_group_size=tp,
                     attrs={"synthetic": True, "tp": True},
@@ -412,8 +447,16 @@ def _inject_synthetic_comm_events(
                     phase="backward",
                     pp_stage=stage_idx,
                     pp_rank=pp_rank,
-                    inputs=[TensorMeta(shape=(act_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(act_numel,), dtype=reduce_dtype_str, device="cpu")],
+                    inputs=[
+                        TensorMeta(
+                            shape=(act_numel,), dtype=reduce_dtype_str, device="cpu"
+                        )
+                    ],
+                    outputs=[
+                        TensorMeta(
+                            shape=(act_numel,), dtype=reduce_dtype_str, device="cpu"
+                        )
+                    ],
                     comm_op="all_reduce",
                     comm_group_size=tp,
                     attrs={"synthetic": True, "tp": True},
@@ -447,14 +490,16 @@ def _inject_synthetic_comm_events(
         activation_numel = batch_size * seq_len * hidden
 
         # Create send/recv pairs for each microbatch
-        num_microbatches = int(getattr(parallelism, "pipeline_parallel_microbatch_size", 8) or 8)
+        num_microbatches = int(
+            getattr(parallelism, "pipeline_parallel_microbatch_size", 8) or 8
+        )
 
         for mb_idx in range(num_microbatches):
             for stage_idx in range(pp - 1):
                 # Forward: send activation from stage_idx to stage_idx+1
                 send_pp_rank = stage_idx % pp
                 recv_pp_rank = (stage_idx + 1) % pp
-                
+
                 send_node = OpNode(
                     node_id=_next_id(),
                     op_name="pp_send_activation",
@@ -463,8 +508,16 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx,
                     pp_rank=send_pp_rank,
                     microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    inputs=[
+                        TensorMeta(
+                            shape=(activation_numel,), dtype=dtype_str, device="cpu"
+                        )
+                    ],
+                    outputs=[
+                        TensorMeta(
+                            shape=(activation_numel,), dtype=dtype_str, device="cpu"
+                        )
+                    ],
                     comm_op="send",
                     comm_group_size=2,
                     attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx + 1},
@@ -479,8 +532,16 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx + 1,
                     pp_rank=recv_pp_rank,
                     microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
+                    inputs=[
+                        TensorMeta(
+                            shape=(activation_numel,), dtype=dtype_str, device="cpu"
+                        )
+                    ],
+                    outputs=[
+                        TensorMeta(
+                            shape=(activation_numel,), dtype=dtype_str, device="cpu"
+                        )
+                    ],
                     comm_op="recv",
                     comm_group_size=2,
                     attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
@@ -531,7 +592,7 @@ def _inject_synthetic_comm_events(
             for stage_idx in range(pp - 1, 0, -1):
                 send_pp_rank = stage_idx % pp
                 recv_pp_rank = (stage_idx - 1) % pp
-                
+
                 send_node = OpNode(
                     node_id=_next_id(),
                     op_name="pp_send_gradient",
@@ -540,8 +601,20 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx,
                     pp_rank=send_pp_rank,
                     microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
+                    inputs=[
+                        TensorMeta(
+                            shape=(activation_numel,),
+                            dtype=reduce_dtype_str,
+                            device="cpu",
+                        )
+                    ],
+                    outputs=[
+                        TensorMeta(
+                            shape=(activation_numel,),
+                            dtype=reduce_dtype_str,
+                            device="cpu",
+                        )
+                    ],
                     comm_op="send",
                     comm_group_size=2,
                     attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx - 1},
@@ -556,8 +629,20 @@ def _inject_synthetic_comm_events(
                     pp_stage=stage_idx - 1,
                     pp_rank=recv_pp_rank,
                     microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
+                    inputs=[
+                        TensorMeta(
+                            shape=(activation_numel,),
+                            dtype=reduce_dtype_str,
+                            device="cpu",
+                        )
+                    ],
+                    outputs=[
+                        TensorMeta(
+                            shape=(activation_numel,),
+                            dtype=reduce_dtype_str,
+                            device="cpu",
+                        )
+                    ],
                     comm_op="recv",
                     comm_group_size=2,
                     attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
@@ -606,7 +691,7 @@ def _inject_synthetic_comm_events(
 
 
 def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
-    """Inject lightweight per-stage compute anchors for missing swimlane lanes."""
+    """Inject synthetic compute so each phase has enough Cube/Vec lane signal."""
     graph = result.compute_graph
     if graph is None:
         return
@@ -618,26 +703,29 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
             for kw in ("mm", "matmul", "bmm", "addmm", "linear", "conv", "gemm", "dot")
         )
 
-    lane_gaps: dict[str, dict[str, bool]] = {}
+    parallelism = trainer.config.parallelism
+    pp = max(int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1), 1)
+    model_parts = getattr(trainer, "model_parts", [])
+    num_layers = max(_infer_num_layers(model_parts), 1)
+    lane_target = max(pp * num_layers, pp)
+
+    lane_gaps: dict[str, dict[str, int]] = {}
     for phase in ("forward", "backward"):
         phase_compute = [
             node
             for node in graph.nodes.values()
             if node.phase == phase and node.op_type == "compute"
         ]
-        has_cube = any(_is_cube_compute(node.op_name) for node in phase_compute)
-        has_vec = any(not _is_cube_compute(node.op_name) for node in phase_compute)
-        need_cube = not has_cube
-        need_vec = not has_vec
-        if need_cube or need_vec:
-            lane_gaps[phase] = {"cube": need_cube, "vec": need_vec}
+        cube_count = sum(1 for node in phase_compute if _is_cube_compute(node.op_name))
+        vec_count = len(phase_compute) - cube_count
+        missing_cube = max(0, lane_target - cube_count)
+        missing_vec = max(0, lane_target - vec_count)
+        if missing_cube > 0 or missing_vec > 0:
+            lane_gaps[phase] = {"cube": missing_cube, "vec": missing_vec}
 
     if not lane_gaps:
         return
 
-    parallelism = trainer.config.parallelism
-    pp = max(int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1), 1)
-    model_parts = getattr(trainer, "model_parts", [])
     hidden_dim = _guess_hidden_dim(model_parts[0]) if model_parts else 1024
     hidden_dim = max(int(hidden_dim), 1)
 
@@ -652,14 +740,15 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
         counter[0] += 1
         return f"compute_syn_{phase}_{kind}_{stage}_{counter[0]:07d}"
 
-    for phase, needs in lane_gaps.items():
-        for stage_idx in range(pp):
-            pp_rank = stage_idx % pp
-
+    for phase, missing in lane_gaps.items():
+        max_missing = max(missing["cube"], missing["vec"])
+        for i in range(max_missing):
+            stage_idx = i % pp
+            pp_rank = stage_idx
             cube: OpNode | None = None
             vec: OpNode | None = None
 
-            if needs["cube"]:
+            if i < missing["cube"]:
                 cube = OpNode(
                     node_id=_next_id(phase, "cube", stage_idx),
                     op_name="aten.mm.default",
@@ -669,7 +758,9 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
                     pp_rank=pp_rank,
                     microbatch_idx=0,
                     inputs=[
-                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                        TensorMeta(
+                            shape=(1, hidden_dim), dtype=dtype_str, device="cpu"
+                        ),
                         TensorMeta(
                             shape=(hidden_dim, hidden_dim),
                             dtype=dtype_str,
@@ -683,7 +774,7 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
                 )
                 graph.add_node(cube)
 
-            if needs["vec"]:
+            if i < missing["vec"]:
                 vec = OpNode(
                     node_id=_next_id(phase, "vec", stage_idx),
                     op_name="aten.add.Tensor",
@@ -693,8 +784,12 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
                     pp_rank=pp_rank,
                     microbatch_idx=0,
                     inputs=[
-                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
-                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                        TensorMeta(
+                            shape=(1, hidden_dim), dtype=dtype_str, device="cpu"
+                        ),
+                        TensorMeta(
+                            shape=(1, hidden_dim), dtype=dtype_str, device="cpu"
+                        ),
                     ],
                     outputs=[
                         TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu")
@@ -785,44 +880,62 @@ def _patch_backward_phase(recorder: Any):
             recorder, "backward", orig_autograd_backward, *args, **kwargs
         )
 
-    torch.Tensor.backward = _tensor_backward_wrapper  # pyrefly: ignore[invalid-assignment]
-    torch.autograd.backward = _autograd_backward_wrapper  # pyrefly: ignore[invalid-assignment]
+    torch.Tensor.backward = (
+        _tensor_backward_wrapper  # pyrefly: ignore[invalid-assignment]
+    )
+    torch.autograd.backward = (
+        _autograd_backward_wrapper  # pyrefly: ignore[invalid-assignment]
+    )
     try:
         yield
     finally:
-        torch.Tensor.backward = orig_tensor_backward  # pyrefly: ignore[invalid-assignment]
-        torch.autograd.backward = orig_autograd_backward  # pyrefly: ignore[invalid-assignment]
+        torch.Tensor.backward = (
+            orig_tensor_backward  # pyrefly: ignore[invalid-assignment]
+        )
+        torch.autograd.backward = (
+            orig_autograd_backward  # pyrefly: ignore[invalid-assignment]
+        )
 
 
 def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     """Run one simulated training step seamlessly utilizing the native Trainer."""
-    from torchtitan.trainer import Trainer
-    import torchtitan.observability.structured_logger as sl
-    import torchtitan.distributed.utils as dist_utils
     import torch._subclasses.fake_impls
-    
+
+    import torchtitan.distributed.utils as dist_utils
+    import torchtitan.observability.structured_logger as sl
+    from torchtitan.trainer import Trainer
+
     # 1. Patch meta vs meta:0 issues by enforcing clean meta device
     trainer.device = torch.device("meta")
-    
+
     # 2. Patch FakeTensor conversions that crash native train_step
-    orig_local_scalar_dense = torch._subclasses.fake_impls.op_implementations_dict.get(torch.ops.aten._local_scalar_dense.default)
+    orig_local_scalar_dense = torch._subclasses.fake_impls.op_implementations_dict.get(
+        torch.ops.aten._local_scalar_dense.default
+    )
+
     def _mock_local_scalar_dense(fake_mode, func, *args, **kwargs):
         return 0
-    torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default] = _mock_local_scalar_dense
-    
+
+    torch._subclasses.fake_impls.op_implementations_dict[
+        torch.ops.aten._local_scalar_dense.default
+    ] = _mock_local_scalar_dense
+
     from torch._subclasses.fake_tensor import FakeTensor
+
     orig_format = FakeTensor.__format__
     FakeTensor.__format__ = lambda self, format_spec: "0.0"
-    
+
     # 3. Patch distributed and optimizer operations that expect real tensors
     orig_clip_grad_norm = dist_utils.clip_grad_norm_
     orig_dist_sum = dist_utils.dist_sum
     orig_dist_max = dist_utils.dist_max
-    
-    dist_utils.clip_grad_norm_ = lambda *args, **kwargs: torch.tensor(0.0, device="meta")
+
+    dist_utils.clip_grad_norm_ = lambda *args, **kwargs: torch.tensor(
+        0.0, device="meta"
+    )
     dist_utils.dist_sum = lambda t, *args, **kwargs: t
     dist_utils.dist_max = lambda t, *args, **kwargs: t
-    
+
     orig_get_mesh = trainer.parallel_dims.get_optional_mesh
     orig_get_strict_mesh = trainer.parallel_dims.get_mesh
     trainer.parallel_dims.get_optional_mesh = lambda *args, **kwargs: None
@@ -835,6 +948,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
     # Patch log_trace_scalar to avoid int() crash on meta tensors
     orig_log = sl.log_trace_scalar
+
     def safe_log(d):
         safe_dict = {}
         for k, v in d.items():
@@ -846,21 +960,22 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
                 except Exception:
                     safe_dict[k] = 0
         orig_log(safe_dict)
+
     sl.log_trace_scalar = safe_log
 
     recorder = TraceRecorder(rank=int(os.environ.get("RANK", "0")))
-    
+
     data_iterator = trainer.batch_generator(trainer.dataloader)
-    
+
     # Pre-fetch batches outside of FakeTensorMode to avoid dataloader internal crashes
     batches = []
     for _ in range(trainer.gradient_accumulation_steps):
         batches.append(next(data_iterator))
-        
+
     def mock_data_iterator():
         for batch in batches:
             yield batch
-    
+
     use_fake = (getattr(sim_opts, "comm_backend", "") or "") != "gloo"
 
     try:
@@ -883,14 +998,24 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         trainer.lr_schedulers.step = orig_lr_step
         sl.log_trace_scalar = orig_log
         FakeTensor.__format__ = orig_format
-        
+
         # Restore local_scalar_dense
         if orig_local_scalar_dense:
-            torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default] = orig_local_scalar_dense
+            torch._subclasses.fake_impls.op_implementations_dict[
+                torch.ops.aten._local_scalar_dense.default
+            ] = orig_local_scalar_dense
         else:
-            del torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default]
+            del torch._subclasses.fake_impls.op_implementations_dict[
+                torch.ops.aten._local_scalar_dense.default
+            ]
 
     result = recorder.build_result()
+    result.metadata["operator_swimlane_comm_scope"] = str(
+        getattr(sim_opts, "operator_swimlane_comm_scope", "model_only") or "model_only"
+    ).lower()
+    ga_steps = getattr(trainer, "gradient_accumulation_steps", None)
+    if ga_steps:
+        result.metadata["gradient_accumulation_steps"] = int(ga_steps)
 
     if use_fake:
         _inject_synthetic_compute_anchors(result, trainer)
@@ -900,12 +1025,17 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
     if getattr(sim_opts, "cost_model", False):
         cm = _import_cost_model(
-            getattr(sim_opts, "cost_model_class", "") or "torchtitan.experiments.simulator.cost_model.MockCostModel",
+            getattr(sim_opts, "cost_model_class", "")
+            or "torchtitan.experiments.simulator.cost_model.MockCostModel",
             _get_cost_model_kwargs(sim_opts),
         )
         apply_cost_model(result, cm)
 
-    from torchtitan.experiments.simulator.memory_estimator import build_runtime_memory, attach_model_state_memory
+    from torchtitan.experiments.simulator.memory_estimator import (
+        attach_model_state_memory,
+        build_runtime_memory,
+    )
+
     memory_events, memory_summary = build_runtime_memory(
         result.compute_graph,
         result.comm_events,
@@ -917,9 +1047,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     attach_model_state_memory(
         result,
         trainer.model_parts,
-        optimizer_name=trainer.optimizers.optimizers[0].__class__.__name__ if trainer.optimizers.optimizers else None,
+        optimizer_name=trainer.optimizers.optimizers[0].__class__.__name__
+        if trainer.optimizers.optimizers
+        else None,
         parallelism_config=trainer.config.parallelism,
     )
 
     postprocess_extension_result(result, trainer, sim_opts)
     _export_result(result, sim_opts.output_dir, sim_opts.output_formats)
+    _export_workload_graph(result, trainer.config, sim_opts)

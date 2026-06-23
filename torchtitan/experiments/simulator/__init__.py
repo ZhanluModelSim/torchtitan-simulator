@@ -42,6 +42,7 @@ from .export import (
     export_json,
     export_text_summary,
 )
+from .ir import build_workload_graph
 from .nodes import (
     ComputeGraph,
     DataEdge,
@@ -118,4 +119,6 @@ __all__ = [
     "export_chrome_trace",
     "export_html",
     "export_text_summary",
+    # Layered IR (L0-L3) projection
+    "build_workload_graph",
 ]

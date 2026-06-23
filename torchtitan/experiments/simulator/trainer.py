@@ -12,8 +12,6 @@ from typing import Any
 
 import torch
 
-from torchtitan.tools.logging import logger
-
 from torchtitan.trainer import Trainer
 
 from .cpu_env import patch_device_type_to_cpu
@@ -78,6 +76,14 @@ class SimulationConfig:
     for gloo.  ``\"meta\"`` creates shape-only parameters (0 bytes memory),
     suitable for simulating arbitrarily large models.  ``\"cpu\"`` creates
     real CPU tensors (required for gloo comm capture)."""
+    operator_swimlane_comm_scope: str = "model_only"
+    """Communication scope for forward/backward operator swimlanes in HTML.
+
+    ``"model_only"`` (default) hides synthetic scheduling comm nodes
+    (FSDP/PP/DP) from operator swimlanes while keeping them available in
+    schedule swimlanes and raw JSON. TP/CP/EP comm remains visible.
+    ``"all"`` shows every comm node.
+    """
 
 
 def _cpu_noop_parallelize(model, **__):

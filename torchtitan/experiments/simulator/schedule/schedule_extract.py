@@ -130,7 +130,6 @@ def _build_mock_stages_and_schedule(
     from torch.distributed.pipelining.schedules import (
         get_schedule_class,
         PipelineScheduleMulti,
-        PipelineScheduleSingle,
     )
 
     schedule_class = get_schedule_class(schedule_name)

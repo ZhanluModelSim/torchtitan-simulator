@@ -82,6 +82,34 @@ CLI 参数：
 | `trace.json` | Chrome Trace 格式（`chrome://tracing`），按 phase 分 thread，时间轴为逻辑顺序 |
 | `trace.html` | 自包含交互式 HTML：训练步骤层级、PP/FSDP/TP/DP 调度泳道、前向/反向算子 DAG、内存 timeline |
 | `summary.txt` | 人类可读的文本摘要：op 计数、通信统计、内存估算峰值 |
+| `workload_graph.json` | spec 分层 IR（L0 OpNode / L1 StepGraph / L2 ScheduleGraph / L3 WorkloadGraph）的投影结果 |
+
+### 分层 IR（L0–L3）
+
+对齐 `workload-model-platform/spec`，`simulator/ir/` 子包把已捕获的
+`SimulationResult` **投影**为四层 IR（不复刻 torchtitan 逻辑，全部派生自捕获数据 +
+声明式 config）：
+
+| 层 | 结构 | 来源 |
+| --- | --- | --- |
+| L0 | `SpecOpNode` | 捕获的 `OpNode` + 数据边，补 flops/comm_bytes/preds/succs |
+| L1 | `StepGraph` | 按捕获 `phase`（autograd/optimizer hook 派生）切出 fwd/bwd/opt 模板 |
+| L2 | `ScheduleGraph` | 捕获的 PP schedule 事件 + `config.parallelism` 声明并行度 |
+| L3 | `WorkloadGraph` | 迭代语义（steps/warmup/梯度累积）+ dataloader 数据流 |
+
+程序化使用：
+
+```python
+from torchtitan.experiments.simulator.ir import build_workload_graph
+workload = build_workload_graph(result, trainer.config)
+workload.to_dict()  # JSON-serializable 四层结构
+```
+
+`trace.html` 中前向/反向 operator swimlane 的通信口径由
+`simulation.operator_swimlane_comm_scope` 控制：
+
+- `model_only`（默认）：隐藏 synthetic 的 FSDP/PP/DP 调度通信，保留 TP/CP/EP 等模型内通信
+- `all`：显示所有通信（包含 synthetic 并行通信）
 
 ## 核心组件与数据流
 
@@ -123,6 +151,7 @@ CLI 参数：
 | `schedule/pp_schedule_extractor.py` | 从 PP schedule 提取语义事件和依赖 |
 | `capture/fx_capture.py` | 使用 make_fx + FakeTensorMode 静态捕获前向/联合图 |
 | `export.py` | 导出 JSON/DOT/Chrome Trace/HTML/Text |
+| `ir/` | spec 分层 IR 投影：op_node(L0)/step_graph(L1)/schedule_graph(L2)/workload_graph(L3)/builder |
 | `extension_hooks.py` | Duck-typed 钩子：collect_simulation_metadata / postprocess_simulation_result |
 | `nodes.py` | 数据模型：OpNode、DataEdge、ComputeGraph、MemoryEvent、SimulationResult 等 |
 
@@ -155,6 +184,7 @@ SimulationTrainer.Config(
         output_dir="./simulator_output",
         output_formats=["json", "dot", "chrome_trace", "html", "text"],
         capture_joint_fx=False,
+        operator_swimlane_comm_scope="model_only",
     ),
     parallelism=ParallelismConfig(
         pipeline_parallel_schedule="Interleaved1F1B",

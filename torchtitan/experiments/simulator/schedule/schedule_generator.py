@@ -16,8 +16,6 @@ visualisation shows the full parallel topology.
 
 from __future__ import annotations
 
-from typing import Any
-
 from ..nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
 
 

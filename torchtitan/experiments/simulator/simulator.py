@@ -31,15 +31,13 @@ serialised with :mod:`export`.
 
 from __future__ import annotations
 
-import contextlib
 import os
 from typing import Any
 
 import torch
 import torch.nn as nn
 
-from .capture.comm_interceptor import capture_comms, CommRecorder
-from .cpu_env import cpu_distributed_context, patch_device_type_to_cpu
+from .cpu_env import patch_device_type_to_cpu
 from .export import (
     export_chrome_trace,
     export_dot,
@@ -49,7 +47,7 @@ from .export import (
 )
 from .capture.fx_capture import capture_forward_fx, capture_joint_fx
 from .meta_env import patch_device_type_to_meta
-from .nodes import SimulationResult, TrainingSchedule
+from .nodes import SimulationResult
 from .schedule.pp_schedule_extractor import PPScheduleExtractor
 from .capture.runtime_capture import RuntimeCapture
 from .capture.unified_trace import TraceRecorder, unified_trace
