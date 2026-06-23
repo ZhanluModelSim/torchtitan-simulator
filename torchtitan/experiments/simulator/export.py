@@ -20,6 +20,7 @@ Supported formats
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 from html import escape
@@ -73,6 +74,117 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
     else:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Kernel-summary CSV export (CUDA / CANN kernel_summary compatible)
+# ---------------------------------------------------------------------------
+
+_KERNEL_SUMMARY_HEADER = [
+    "Order",
+    "Name",
+    "Type",
+    "Phase",
+    "PPStage",
+    "MicrobatchIdx",
+    "Start(us)",
+    "End(us)",
+    "Duration(us)",
+    "ComputeTime(us)",
+    "CommTime(us)",
+    "FLOPs",
+    "BytesRead",
+    "BytesWritten",
+]
+
+
+def _kernel_summary_rows(result: SimulationResult) -> list[dict[str, Any]]:
+    """Build per-operator rows for the kernel-summary CSV.
+
+    One row per operator across forward + backward + optimizer phases.
+
+    Operators are ordered by their DES start time when a discrete-event
+    schedule has run; otherwise they keep capture order and are laid out on
+    a sequential cumulative timeline derived from per-op durations (so a
+    meaningful Start/End/Duration is always produced).  Phase-boundary
+    sentinel nodes are excluded.
+    """
+    nodes = [
+        n for n in result.compute_graph.nodes.values() if n.op_type != "phase_boundary"
+    ]
+
+    has_des = any(n.des_start_time_us is not None for n in nodes)
+    if has_des:
+        nodes = sorted(
+            nodes,
+            key=lambda n: (
+                n.des_start_time_us if n.des_start_time_us is not None else 0.0
+            ),
+        )
+
+    rows: list[dict[str, Any]] = []
+    cursor = 0.0
+    for order, node in enumerate(nodes):
+        perf = node.perf_result
+        duration = float(perf.total_time_us) if perf is not None else 0.0
+
+        if has_des and node.des_start_time_us is not None:
+            start = float(node.des_start_time_us)
+            end = (
+                float(node.des_finish_time_us)
+                if node.des_finish_time_us is not None
+                else start + duration
+            )
+        else:
+            start = cursor
+            end = cursor + duration
+            cursor = end
+
+        rows.append(
+            {
+                "Order": order,
+                "Name": node.op_name,
+                "Type": node.op_type,
+                "Phase": node.phase,
+                "PPStage": node.pp_stage if node.pp_stage is not None else "",
+                "MicrobatchIdx": (
+                    node.microbatch_idx if node.microbatch_idx is not None else ""
+                ),
+                "Start(us)": round(start, 3),
+                "End(us)": round(end, 3),
+                "Duration(us)": round(duration, 3),
+                "ComputeTime(us)": round(perf.compute_time_us, 3) if perf else 0.0,
+                "CommTime(us)": round(perf.comm_time_us, 3) if perf else 0.0,
+                "FLOPs": perf.flops if perf else 0,
+                "BytesRead": perf.bytes_read if perf else 0,
+                "BytesWritten": perf.bytes_written if perf else 0,
+            }
+        )
+    return rows
+
+
+def export_kernel_summary_csv(
+    result: SimulationResult, path: str | os.PathLike
+) -> None:
+    """Write a per-operator kernel trace CSV.
+
+    The layout mirrors CUDA (nsys) / CANN (msprof) ``kernel_summary`` exports:
+    one row per operator with name, execution order, start/end time, duration,
+    and a per-op breakdown (compute vs. communication time, FLOPs, bytes).
+
+    Covers the full forward + backward + optimizer step.
+
+    Args:
+        result: The simulation result to serialize.
+        path: Output CSV file path (created / overwritten).
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    _populate_des_metadata(result)
+    rows = _kernel_summary_rows(result)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_KERNEL_SUMMARY_HEADER)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -555,31 +667,31 @@ def _populate_des_metadata(result: SimulationResult) -> None:
 
 def _compress_graph_by_stage_similarity(result: SimulationResult) -> dict[str, Any]:
     """Compress compute graph by detecting and merging similar PP stages.
-    
+
     For PP models with VPP, many stages have identical operation patterns.
     This function detects repeated stage groups and represents them as a
     single representative with a multiplier.
-    
+
     Returns a dict with:
     - nodes: compressed node list with stage ranges
     - edges: edges between compressed nodes
     - stage_groups: metadata about which stages were merged
     """
-    from collections import defaultdict, Counter
-    
+    from collections import Counter, defaultdict
+
     # Group nodes by (phase, pp_stage)
     groups = defaultdict(list)
     for node in result.compute_graph.nodes.values():
         key = (node.phase, node.pp_stage)
         groups[key].append(node)
-    
+
     # Analyze each group's signature (operation distribution)
     group_signatures = {}
     for key, nodes in groups.items():
         phase, stage = key
         if stage is None:
             continue  # Skip phase boundary nodes
-        
+
         # Create signature: sorted list of (op_name, count)
         op_counts = Counter(n.op_name for n in nodes)
         signature = tuple(sorted(op_counts.items()))
@@ -588,81 +700,85 @@ def _compress_graph_by_stage_similarity(result: SimulationResult) -> dict[str, A
             "node_count": len(nodes),
             "nodes": nodes,
         }
-    
+
     # Detect repeated stage groups
     # Group stages by (phase, signature)
     phase_stage_groups = defaultdict(list)
     for (phase, stage), info in group_signatures.items():
         phase_stage_groups[(phase, info["signature"])].append(stage)
-    
+
     # Build compressed representation
     compressed_nodes = []
     stage_groups = []
     kept_stages = set()
-    
+
     for (phase, signature), stages in phase_stage_groups.items():
         stages = sorted(stages)
-        
+
         # Find consecutive runs
         runs = []
         current_run = [stages[0]]
         for i in range(1, len(stages)):
-            if stages[i] == stages[i-1] + 1:
+            if stages[i] == stages[i - 1] + 1:
                 current_run.append(stages[i])
             else:
                 runs.append(current_run)
                 current_run = [stages[i]]
         runs.append(current_run)
-        
+
         # For each run, keep only the first stage as representative
         for run in runs:
             if len(run) == 1:
                 # Single stage, keep as-is
                 stage = run[0]
                 kept_stages.add((phase, stage))
-                stage_groups.append({
-                    "phase": phase,
-                    "stages": [stage],
-                    "count": 1,
-                    "representative": stage,
-                })
+                stage_groups.append(
+                    {
+                        "phase": phase,
+                        "stages": [stage],
+                        "count": 1,
+                        "representative": stage,
+                    }
+                )
             else:
                 # Multiple consecutive stages, keep first as representative
                 representative = run[0]
                 kept_stages.add((phase, representative))
-                stage_groups.append({
-                    "phase": phase,
-                    "stages": run,
-                    "count": len(run),
-                    "representative": representative,
-                })
-    
+                stage_groups.append(
+                    {
+                        "phase": phase,
+                        "stages": run,
+                        "count": len(run),
+                        "representative": representative,
+                    }
+                )
+
     # Also keep phase boundary nodes (stage=None)
     for key, nodes in groups.items():
         phase, stage = key
         if stage is None:
             kept_stages.add(key)
-    
+
     # Build compressed node list
     node_id_map = {}  # old_id -> new_id
     for (phase, stage) in kept_stages:
         nodes = groups[(phase, stage)]
         # Limit nodes per stage to keep JSON size manageable
         # Prioritize compute nodes over trivial ops
-        compute_nodes = [n for n in nodes if n.op_type == 'compute']
-        other_nodes = [n for n in nodes if n.op_type != 'compute']
+        compute_nodes = [n for n in nodes if n.op_type == "compute"]
+        other_nodes = [n for n in nodes if n.op_type != "compute"]
         limited_nodes = (compute_nodes[:200] + other_nodes[:50])[:250]
         for node in limited_nodes:
             node_dict = node.to_dict()
             node_id_map[node.node_id] = node.node_id
             compressed_nodes.append(node_dict)
-    
+
     # Build compressed edge list
     compressed_edges = []
     for edge in result.compute_graph.edges:
         if edge.src_node_id in node_id_map and edge.dst_node_id in node_id_map:
             compressed_edges.append(edge.to_dict())
-    
+
     return {
         "nodes": compressed_nodes,
         "edges": compressed_edges,
@@ -690,10 +806,10 @@ def _json_script_payload(result: SimulationResult) -> str:
         _inject_schedule_timing(
             {"schedule": schedule_data} if schedule_data else {}, result
         )
-        
+
         # Compress graph by stage similarity
         compressed_graph = _compress_graph_by_stage_similarity(result)
-        
+
         compact: dict[str, Any] = {
             "metadata": result.metadata,
             "schedule": schedule_data,

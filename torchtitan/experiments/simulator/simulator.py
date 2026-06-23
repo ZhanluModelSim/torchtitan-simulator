@@ -37,20 +37,22 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from .capture.fx_capture import capture_forward_fx, capture_joint_fx
+from .capture.runtime_capture import RuntimeCapture
+from .capture.unified_trace import TraceRecorder, unified_trace
+
 from .cpu_env import patch_device_type_to_cpu
 from .export import (
     export_chrome_trace,
     export_dot,
     export_html,
     export_json,
+    export_kernel_summary_csv,
     export_text_summary,
 )
-from .capture.fx_capture import capture_forward_fx, capture_joint_fx
 from .meta_env import patch_device_type_to_meta
 from .nodes import SimulationResult
 from .schedule.pp_schedule_extractor import PPScheduleExtractor
-from .capture.runtime_capture import RuntimeCapture
-from .capture.unified_trace import TraceRecorder, unified_trace
 
 
 class Simulator:
@@ -410,7 +412,7 @@ class Simulator:
             and schedule if applicable).
         """
         if output_formats is None:
-            output_formats = ["json", "dot", "chrome_trace", "html", "text"]
+            output_formats = ["json", "dot", "chrome_trace", "html", "text", "csv"]
 
         # 1. Static FX capture
         self._log("=== Phase 1: Static FX capture ===")
@@ -474,5 +476,10 @@ class Simulator:
             self._log(f"  Text summary → {p}")
             if self.verbose:
                 print(summary)
+
+        if "csv" in output_formats:
+            p = os.path.join(output_dir, "kernel_summary.csv")
+            export_kernel_summary_csv(rt_result, p)
+            self._log(f"  Kernel summary CSV → {p}")
 
         return rt_result

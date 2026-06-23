@@ -25,6 +25,7 @@ from .export import (
     export_dot,
     export_html,
     export_json,
+    export_kernel_summary_csv,
     export_text_summary,
 )
 from .extension_hooks import postprocess_extension_result
@@ -121,6 +122,10 @@ def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> N
     if "text" in output_formats:
         with open(os.path.join(output_dir, "summary.txt"), "w", encoding="utf-8") as f:
             f.write(export_text_summary(result))
+    if "csv" in output_formats:
+        export_kernel_summary_csv(
+            result, os.path.join(output_dir, "kernel_summary.csv")
+        )
 
 
 def _export_workload_graph(result: Any, config: Any, sim_opts: Any) -> None:

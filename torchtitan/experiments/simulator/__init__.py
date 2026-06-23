@@ -40,6 +40,7 @@ from .export import (
     export_dot,
     export_html,
     export_json,
+    export_kernel_summary_csv,
     export_text_summary,
 )
 from .ir import build_workload_graph
@@ -119,6 +120,7 @@ __all__ = [
     "export_chrome_trace",
     "export_html",
     "export_text_summary",
+    "export_kernel_summary_csv",
     # Layered IR (L0-L3) projection
     "build_workload_graph",
 ]

@@ -40,7 +40,7 @@ def deepseek_v4_sim_smoketest() -> SimulationTrainer.Config:
         checkpoint=CheckpointManager.Config(enable=False),
         simulation=SimulationConfig(
             output_dir="./simulator_output",
-            output_formats=["json", "dot", "chrome_trace", "html", "text"],
+            output_formats=["json", "dot", "chrome_trace", "html", "text", "csv"],
             semantic_schedule=True,
             cost_model=True,
             comm_backend="gloo",
@@ -82,7 +82,7 @@ def deepseek_v4_pro_sim_smoketest() -> SimulationTrainer.Config:
         checkpoint=CheckpointManager.Config(enable=False),
         simulation=SimulationConfig(
             output_dir="./simulator_output",
-            output_formats=["json", "dot", "chrome_trace", "html", "text"],
+            output_formats=["json", "dot", "chrome_trace", "html", "text", "csv"],
             semantic_schedule=True,
             cost_model=True,
             comm_backend="gloo",

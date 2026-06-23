@@ -41,7 +41,7 @@ python -m torchtitan.experiments.simulator.run_simulate \
   --job.config_file ./train_configs/llama3_8b.toml \
   --simulate.mode all \
   --simulate.output_dir ./sim_out \
-  --simulate.output_format json,dot,chrome_trace,html,text
+  --simulate.output_format json,dot,chrome_trace,html,text,csv
 
 # 多进程 PP 模拟（torchrun）
 torchrun --nproc_per_node 4 \
@@ -57,7 +57,7 @@ CLI 参数：
 | --- | --- | --- |
 | `--simulate.mode` | `all` | `fx`（静态图）、`runtime`（运行时捕获）、`schedule`（PP 调度提取）、`all` |
 | `--simulate.output_dir` | `./simulator_output` | 输出目录 |
-| `--simulate.output_format` | `json,dot,chrome_trace,html,text` | 输出格式列表 |
+| `--simulate.output_format` | `json,dot,chrome_trace,html,text,csv` | 输出格式列表 |
 | `--simulate.max_seq_len` | `128` | 输入序列长度 |
 | `--simulate.batch_size` | `2` | 输入 batch size |
 
@@ -82,7 +82,23 @@ CLI 参数：
 | `trace.json` | Chrome Trace 格式（`chrome://tracing`），按 phase 分 thread，时间轴为逻辑顺序 |
 | `trace.html` | 自包含交互式 HTML：训练步骤层级、PP/FSDP/TP/DP 调度泳道、前向/反向算子 DAG、内存 timeline |
 | `summary.txt` | 人类可读的文本摘要：op 计数、通信统计、内存估算峰值 |
+| `kernel_summary.csv` | 逐算子 trace（forward+backward+optimizer），格式对齐 CUDA/CANN kernel_summary：算子名/顺序/起止时间/耗时/breakdown |
 | `workload_graph.json` | spec 分层 IR（L0 OpNode / L1 StepGraph / L2 ScheduleGraph / L3 WorkloadGraph）的投影结果 |
+
+### kernel_summary.csv 列说明
+
+逐算子一行，覆盖 forward + backward + optimizer step；有 DES 调度时按 DES 起始时间排序并取其 start/end，否则按捕获顺序在串行累积时间轴上铺排。
+
+| 列 | 含义 |
+| --- | --- |
+| `Order` | 算子顺序（0 起的序号） |
+| `Name` / `Type` / `Phase` | 算子名 / 算子类别 / 所属阶段 |
+| `PPStage` / `MicrobatchIdx` | PP stage 与微批次（如有） |
+| `Start(us)` / `End(us)` / `Duration(us)` | 起始时间 / 结束时间 / 耗时 |
+| `ComputeTime(us)` / `CommTime(us)` | breakdown：计算/通信耗时拆解 |
+| `FLOPs` / `BytesRead` / `BytesWritten` | breakdown：算力与访存量 |
+
+> 注：fake_backend 路径下 optimizer.step 被 patch 为 no-op，因此该步算子可能不被捕获（CSV 仅在捕获到 optimizer 算子时输出对应行）。
 
 ### 分层 IR（L0–L3）
 
@@ -182,7 +198,7 @@ pytest torchtitan/experiments/simulator/tests/test_simulator.py -v
 SimulationTrainer.Config(
     simulation=SimulationConfig(
         output_dir="./simulator_output",
-        output_formats=["json", "dot", "chrome_trace", "html", "text"],
+        output_formats=["json", "dot", "chrome_trace", "html", "text", "csv"],
         capture_joint_fx=False,
         operator_swimlane_comm_scope="model_only",
     ),

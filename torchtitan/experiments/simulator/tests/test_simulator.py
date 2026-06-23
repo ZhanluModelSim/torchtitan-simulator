@@ -836,6 +836,165 @@ class TestExport(unittest.TestCase):
         assert _is_cluster_parallel_comm_node(real_comm) is False
         assert _is_cluster_parallel_comm_node(synthetic_compute) is False
 
+    def _make_phase_result_with_perf(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+            SimulationResult,
+            TensorMeta,
+        )
+
+        g = ComputeGraph(metadata={"rank": 0})
+        g.add_node(
+            OpNode(
+                "f1",
+                "aten.mm.default",
+                "compute",
+                "forward",
+                outputs=[TensorMeta((2, 4), "torch.float32", "cpu")],
+                perf_result=PerfResult(
+                    compute_time_us=10.0,
+                    total_time_us=10.0,
+                    flops=128,
+                    bytes_read=32,
+                    bytes_written=32,
+                ),
+            )
+        )
+        g.add_node(
+            OpNode(
+                "b1",
+                "all_reduce",
+                "comm_collective",
+                "backward",
+                comm_op="all_reduce",
+                perf_result=PerfResult(
+                    comm_time_us=5.0, total_time_us=5.0, bytes_written=64
+                ),
+            )
+        )
+        g.add_node(
+            OpNode(
+                "o1",
+                "adam_step",
+                "compute",
+                "optimizer",
+                perf_result=PerfResult(compute_time_us=3.0, total_time_us=3.0),
+            )
+        )
+        g.add_edge(DataEdge("f1", "b1", "data"))
+        g.add_edge(DataEdge("b1", "o1", "data"))
+        return SimulationResult(compute_graph=g, metadata={"mode": "test"})
+
+    def test_export_kernel_summary_csv_columns_and_rows(self):
+        import csv
+
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+
+        result = self._make_phase_result_with_perf()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+            assert os.path.exists(path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        # one row per operator across fwd + bwd + opt
+        assert len(rows) == 3
+        header = rows[0].keys()
+        for col in (
+            "Order",
+            "Name",
+            "Type",
+            "Phase",
+            "Start(us)",
+            "End(us)",
+            "Duration(us)",
+            "ComputeTime(us)",
+            "CommTime(us)",
+            "FLOPs",
+            "BytesRead",
+            "BytesWritten",
+        ):
+            assert col in header, col
+
+        phases = {r["Phase"] for r in rows}
+        assert phases == {"forward", "backward", "optimizer"}
+
+    def test_export_kernel_summary_csv_sequential_timeline(self):
+        import csv
+
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+
+        result = self._make_phase_result_with_perf()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        # order is a 0-based contiguous sequence
+        assert [int(r["Order"]) for r in rows] == [0, 1, 2]
+        # durations 10, 5, 3 → sequential cumulative timeline
+        assert float(rows[0]["Start(us)"]) == 0.0
+        assert float(rows[0]["End(us)"]) == 10.0
+        assert float(rows[1]["Start(us)"]) == 10.0
+        assert float(rows[1]["End(us)"]) == 15.0
+        assert float(rows[2]["Start(us)"]) == 15.0
+        assert float(rows[2]["End(us)"]) == 18.0
+        # breakdown is populated
+        assert float(rows[0]["ComputeTime(us)"]) == 10.0
+        assert float(rows[1]["CommTime(us)"]) == 5.0
+        assert int(rows[0]["FLOPs"]) == 128
+
+    def test_export_kernel_summary_csv_prefers_des_timing(self):
+        import csv
+
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+
+        result = self._make_phase_result_with_perf()
+        nodes = result.compute_graph.nodes
+        nodes["f1"].des_start_time_us = 100.0
+        nodes["f1"].des_finish_time_us = 110.0
+        nodes["b1"].des_start_time_us = 105.0
+        nodes["b1"].des_finish_time_us = 110.0
+        nodes["o1"].des_start_time_us = 110.0
+        nodes["o1"].des_finish_time_us = 113.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        # ordered by DES start time, using DES start/end directly
+        assert [r["Name"] for r in rows] == [
+            "aten.mm.default",
+            "all_reduce",
+            "adam_step",
+        ]
+        assert float(rows[0]["Start(us)"]) == 100.0
+        assert float(rows[1]["Start(us)"]) == 105.0
+
+    def test_export_kernel_summary_csv_excludes_phase_boundary(self):
+        import csv
+
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+
+        result = self._make_phase_result_with_perf()
+        result.compute_graph.add_phase_boundary_edges()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        assert all("phase_end" not in r["Name"] for r in rows)
+        assert all(r["Type"] != "phase_boundary" for r in rows)
+
     def test_chrome_trace_schedule_events_have_des_timing(self):
         from torchtitan.experiments.simulator.des_engine import simulate_multi_rank_des
         from torchtitan.experiments.simulator.export import export_chrome_trace
@@ -1513,9 +1672,7 @@ class TestSyntheticCommInjection(unittest.TestCase):
 
         assert len(result.comm_events) > 0, "Should inject FSDP comm events"
 
-        comm_edges = [
-            e for e in result.compute_graph.edges if e.edge_type == "data"
-        ]
+        comm_edges = [e for e in result.compute_graph.edges if e.edge_type == "data"]
         assert len(comm_edges) > 0, "Injected comm nodes should have sequential edges"
 
         for ce in result.comm_events:
@@ -1633,9 +1790,9 @@ class TestSyntheticComputeAnchors(unittest.TestCase):
             for n in result.compute_graph.nodes.values()
             if n.phase == "forward" and n.op_type == "compute"
         ]
-        assert any("mm" in n.op_name for n in forward_compute), (
-            "forward phase should include at least one cube-like compute anchor"
-        )
+        assert any(
+            "mm" in n.op_name for n in forward_compute
+        ), "forward phase should include at least one cube-like compute anchor"
 
     def test_inject_synthetic_compute_scales_with_layer_count(self):
         from torchtitan.experiments.simulator.nodes import (

@@ -23,7 +23,7 @@ from .trainer_runner import run_trainer_simulation
 class SimulationConfig:
     output_dir: str = "./simulator_output"
     output_formats: list[str] = field(
-        default_factory=lambda: ["json", "dot", "chrome_trace", "html", "text"]
+        default_factory=lambda: ["json", "dot", "chrome_trace", "html", "text", "csv"]
     )
     mode: str = "all"
     max_seq_len: int = 128
@@ -246,7 +246,6 @@ def _cpu_semantic_pipeline(
     return MockSchedule(), model_parts, True, True
 
 
-
 def _set_fake_world_size(config: Any) -> None:
     """Set ``NGPU``/``WORLD_SIZE`` from parallelism config for semantic schedule mode.
 
@@ -344,7 +343,7 @@ class SimulationTrainer(Trainer):
             config.model_spec.pipelining_fn = _cpu_noop_pipeline
 
         super().__init__(config)
-        
+
         if self._pp_model_parts:
             self.model_parts = self._pp_model_parts
 
