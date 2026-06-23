@@ -44,7 +44,7 @@ from torch._subclasses import FakeTensorMode
 from torch.library import register_fake
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from .nodes import (
+from ..nodes import (
     ComputeGraph,
     DataEdge,
     OpNode,
@@ -54,7 +54,7 @@ from .nodes import (
     TensorMeta,
     TrainingSchedule,
 )
-from .op_classification import classify_op, TRIVIAL_TARGETS
+from ..op_classification import classify_op, TRIVIAL_TARGETS
 
 
 @register_fake("aten::bincount")

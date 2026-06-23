@@ -48,7 +48,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from .nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
+from ..nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
 
 logger = logging.getLogger(__name__)
 

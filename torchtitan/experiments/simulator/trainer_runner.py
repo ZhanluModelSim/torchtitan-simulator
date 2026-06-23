@@ -27,7 +27,7 @@ from .export import (
     export_text_summary,
 )
 from .extension_hooks import postprocess_extension_result
-from .fx_capture import capture_forward_fx, capture_joint_fx
+from .capture.fx_capture import capture_forward_fx, capture_joint_fx
 from .memory_estimator import (
     attach_model_state_memory,
     dtype_size,
@@ -37,8 +37,8 @@ from .memory_estimator import (
     merge_memory_summary,
 )
 from .nodes import ComputeGraph, DataEdge, OpNode, SimulationResult, TensorMeta
-from .schedule_extract import extract_schedule_from_pytorch
-from .unified_trace import TraceRecorder, unified_trace
+from .schedule.schedule_extract import extract_schedule_from_pytorch
+from .capture.unified_trace import TraceRecorder, unified_trace
 
 _T = TypeVar("_T")
 

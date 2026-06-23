@@ -35,13 +35,13 @@ which trainer config is built, not the global training entry.
 | Component | Responsibility |
 | --- | --- |
 | `cpu_env.py` | Forces TorchTitan device helpers to resolve to CPU. |
-| `dispatch_interceptor.py` | Captures runtime PyTorch ops with input/output tensor metadata and producer-consumer data edges. |
-| `comm_interceptor.py` | Monkey-patches `torch.distributed` collectives and records communication events. |
-| `runtime_capture.py` | Coordinates op, comm, FSDP, and PP capture scopes. |
-| `graph_assembler.py` | Builds `ComputeGraph` nodes/edges and merges communication events. |
+| `capture/dispatch_interceptor.py` | Captures runtime PyTorch ops with input/output tensor metadata and producer-consumer data edges. |
+| `capture/comm_interceptor.py` | Monkey-patches `torch.distributed` collectives and records communication events. |
+| `capture/runtime_capture.py` | Coordinates op, comm, FSDP, and PP capture scopes. |
+| `capture/graph_assembler.py` | Builds `ComputeGraph` nodes/edges and merges communication events. |
 | `memory_estimator.py` | Estimates activation lifetimes, communication buffers, model parameters, gradients, and optimizer state memory. |
-| `pp_schedule_extractor.py` | Extracts semantic pipeline schedule events and dependencies. |
-| `fx_capture.py` | Optionally captures forward or joint forward/backward FX graphs. |
+| `schedule/pp_schedule_extractor.py` | Extracts semantic pipeline schedule events and dependencies. |
+| `capture/fx_capture.py` | Optionally captures forward or joint forward/backward FX graphs. |
 | `export.py` | Writes JSON, DOT, Chrome Trace, text summary, and interactive HTML. |
 | `trainer_runner.py` | Runs the native Trainer components for one simulated step and exports results. |
 | `extension_hooks.py` | Generic duck-typed hooks for external simulation extensions. |
@@ -263,19 +263,19 @@ The simulator works around these by:
    `Trainer.__init__` runs. The model is built on CPU without any FSDP/TP/PP
    wrappers, so the actual forward/backward executes as plain PyTorch.
 
-2. **Semantic schedule generation** (`schedule_generator.py`) creates a
+2. **Semantic schedule generation** (`schedule/schedule_extract.py`) creates a
    ``TrainingSchedule`` that mirrors what Interleaved1F1B (or any other
    TorchTitan schedule) would produce across the full multi-rank topology.
    Dependencies (PP send/recv, TP all-reduce, FSDP all-gather/reduce-scatter,
    DP gradient sync) are explicit.
 
 3. **No op modification** — the op trace captured by
-   ``dispatch_interceptor.py`` records the actual PyTorch operators that
+   ``capture/dispatch_interceptor.py`` records the actual PyTorch operators that
    execute on CPU, which is the ground truth for that single process.
 
 ### What the semantic schedule is and is not
 
-``schedule_generator.py`` produces a ``TrainingSchedule`` that:
+``schedule/schedule_extract.py`` produces a ``TrainingSchedule`` that:
 
 - ✅ Reflects the correct Interleaved1F1B warmup / 1F1B steady-state /
   cooldown order
@@ -288,7 +288,7 @@ The simulator works around these by:
   adaptive scheduling)
 
 On GPU/NPU hardware where TorchTitan can fully initialise, the
-``pp_schedule_extractor`` and ``attach_pp_hooks`` in ``runtime_capture.py``
+``schedule/pp_schedule_extractor.py`` and ``attach_pp_hooks`` in ``capture/runtime_capture.py``
 take over and record native events from the real schedule object.
 
 ### Parallelism topology constraints

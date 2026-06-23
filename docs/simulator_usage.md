@@ -115,13 +115,13 @@ CLI 参数：
 | `run_simulate.py` | 独立 CLI 入口：手动构建模型、配置 CPU env、调用 Simulator |
 | `simulator.py` | Simulator 类：fx/runtime/schedule 三模式的顶层 API |
 | `cpu_env.py` | 强制 device_type=CPU，初始化 gloo 分布式 |
-| `dispatch_interceptor.py` | 拦截 PyTorch dispatch，记录算子和 tensor 数据边 |
-| `comm_interceptor.py` | Monkey-patch torch.distributed，记录通信事件 |
-| `runtime_capture.py` | 统一管理所有拦截器的 context manager，组装 SimulationResult |
-| `graph_assembler.py` | 从 op 记录构建 ComputeGraph，合并通信事件 |
+| `capture/dispatch_interceptor.py` | 拦截 PyTorch dispatch，记录算子和 tensor 数据边 |
+| `capture/comm_interceptor.py` | Monkey-patch torch.distributed，记录通信事件 |
+| `capture/runtime_capture.py` | 统一管理所有拦截器的 context manager，组装 SimulationResult |
+| `capture/graph_assembler.py` | 从 op 记录构建 ComputeGraph，合并通信事件 |
 | `memory_estimator.py` | 估算 activation lifetime、comm buffer、model state 内存 |
-| `pp_schedule_extractor.py` | 从 PP schedule 提取语义事件和依赖 |
-| `fx_capture.py` | 使用 make_fx + FakeTensorMode 静态捕获前向/联合图 |
+| `schedule/pp_schedule_extractor.py` | 从 PP schedule 提取语义事件和依赖 |
+| `capture/fx_capture.py` | 使用 make_fx + FakeTensorMode 静态捕获前向/联合图 |
 | `export.py` | 导出 JSON/DOT/Chrome Trace/HTML/Text |
 | `extension_hooks.py` | Duck-typed 钩子：collect_simulation_metadata / postprocess_simulation_result |
 | `nodes.py` | 数据模型：OpNode、DataEdge、ComputeGraph、MemoryEvent、SimulationResult 等 |

@@ -29,8 +29,8 @@ from .comm_interceptor import capture_comms, CommRecorder
 from .dispatch_interceptor import capture_ops, OpRecorder
 from .fsdp_tracer import capture_fsdp_events, FSDPEventRecorder
 from .graph_assembler import GraphAssembler
-from .memory_estimator import build_runtime_memory
-from .nodes import ScheduleDep, ScheduleEvent, SimulationResult, TrainingSchedule
+from ..memory_estimator import build_runtime_memory
+from ..nodes import ScheduleDep, ScheduleEvent, SimulationResult, TrainingSchedule
 
 
 class RuntimeCapture:

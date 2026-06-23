@@ -27,7 +27,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from .nodes import TensorMeta
+from ..nodes import TensorMeta
 
 from .unified_trace import get_current_recorder
 

@@ -29,8 +29,8 @@ import torch
 import torch.utils._pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from .nodes import OpNode, TensorMeta
-from .op_classification import classify_op, TRIVIAL_TARGETS
+from ..nodes import OpNode, TensorMeta
+from ..op_classification import classify_op, TRIVIAL_TARGETS
 
 
 def _collect_tensor_metas(args: Any, kwargs: Any) -> list[TensorMeta]:

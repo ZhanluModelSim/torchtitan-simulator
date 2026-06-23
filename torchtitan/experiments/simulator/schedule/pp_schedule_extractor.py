@@ -37,7 +37,7 @@ import itertools
 import logging
 from typing import Any
 
-from .nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
+from ..nodes import ScheduleDep, ScheduleEvent, TrainingSchedule
 
 logger = logging.getLogger(__name__)
 

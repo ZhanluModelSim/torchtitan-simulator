@@ -31,7 +31,7 @@ from typing import Any
 import torch.fx as fx
 
 from .fx_capture import fx_graph_to_compute_graph
-from .nodes import ComputeGraph, DataEdge, OpNode, TensorMeta
+from ..nodes import ComputeGraph, DataEdge, OpNode, TensorMeta
 
 
 class GraphAssembler:

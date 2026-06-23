@@ -43,8 +43,8 @@ import torch.utils._pytree as pytree
 from torch._subclasses import FakeTensorMode
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from .nodes import ComputeGraph, DataEdge, OpNode, TensorMeta
-from .op_classification import classify_op, TRIVIAL_TARGETS
+from ..nodes import ComputeGraph, DataEdge, OpNode, TensorMeta
+from ..op_classification import classify_op, TRIVIAL_TARGETS
 
 
 def _tensor_meta_from_val(val: Any) -> TensorMeta | None:

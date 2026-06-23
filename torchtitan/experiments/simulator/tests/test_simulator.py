@@ -1564,6 +1564,32 @@ class TestPPScheduleExtractor(unittest.TestCase):
         assert len(sched.deps) > 0
 
 
+class TestSimulatorPackageLayout(unittest.TestCase):
+    def test_capture_subpackage_imports(self):
+        from torchtitan.experiments.simulator.capture.runtime_capture import (
+            RuntimeCapture,
+        )
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
+        assert RuntimeCapture is not None
+        assert TraceRecorder is not None
+        assert unified_trace is not None
+
+    def test_schedule_subpackage_imports(self):
+        from torchtitan.experiments.simulator.schedule.pp_schedule_extractor import (
+            PPScheduleExtractor,
+        )
+        from torchtitan.experiments.simulator.schedule.schedule_extract import (
+            extract_schedule_from_pytorch,
+        )
+
+        assert PPScheduleExtractor is not None
+        assert extract_schedule_from_pytorch is not None
+
+
 # ===========================================================================
 # Simulator integration test (CPU, no PP)
 # ===========================================================================

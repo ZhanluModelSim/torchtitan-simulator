@@ -38,7 +38,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from .comm_interceptor import capture_comms, CommRecorder
+from .capture.comm_interceptor import capture_comms, CommRecorder
 from .cpu_env import cpu_distributed_context, patch_device_type_to_cpu
 from .export import (
     export_chrome_trace,
@@ -47,12 +47,12 @@ from .export import (
     export_json,
     export_text_summary,
 )
-from .fx_capture import capture_forward_fx, capture_joint_fx
+from .capture.fx_capture import capture_forward_fx, capture_joint_fx
 from .meta_env import patch_device_type_to_meta
 from .nodes import SimulationResult, TrainingSchedule
-from .pp_schedule_extractor import PPScheduleExtractor
-from .runtime_capture import RuntimeCapture
-from .unified_trace import TraceRecorder, unified_trace
+from .schedule.pp_schedule_extractor import PPScheduleExtractor
+from .capture.runtime_capture import RuntimeCapture
+from .capture.unified_trace import TraceRecorder, unified_trace
 
 
 class Simulator:
