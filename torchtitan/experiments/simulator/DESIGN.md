@@ -673,3 +673,144 @@ These use duck typing to avoid import dependencies from core simulator code.
 - Separation of concerns: op-level -> step-level -> schedule-level -> workload-level
 - Spec-aligned for downstream hardware simulators
 - All projections derived from captured data, not re-implemented logic
+
+---
+
+## 20. Phase 4 — Natural Communication Capture
+
+### 20.1 Problem Statement
+
+The current synthetic communication injection (`_inject_synthetic_comm_events()`) uses heuristic assumptions to generate communication operators:
+- Assumes uniform layer distribution
+- Manually calculates tensor sizes
+- Hardcodes communication patterns (e.g., 2 TP all_reduce per layer)
+
+This approach is not capture-faithful and may produce inaccurate communication patterns.
+
+### 20.2 Experiment Results
+
+A series of experiments tested whether DTensor/FSDP2 can naturally emit communication operators when running on meta device with FakeProcessGroup:
+
+| Experiment | Method | Result |
+|------------|--------|--------|
+| 1a | FSDP2 on meta | ❌ `_validate_no_meta_params` rejects meta params |
+| 1b | DTensor TP on meta (ws=1) | ✅ Success but 0 comm ops (no comm needed for ws=1) |
+| 1b | DTensor TP on meta (ws=4) | ✅ **2 comm ops naturally emitted** (`all_reduce`, `wait_tensor`) |
+| 1b | FSDP2 on CPU (ws=4) | ✅ **10 comm ops naturally emitted** (all_gather, reduce_scatter) |
+| 1c | FSDP2 on meta + patch validation | ❌ Meta/cpu device propagation mismatch |
+| 1d | Multiple patching approaches | ❌ All failed due to deep incompatibilities |
+| 1e | Patch `FakeTensor._find_common_device` | ❌ Device mismatch error |
+| 1f | Patch `wrap_meta_outputs_with_default_device_logic` | ✅ **FSDP2 on meta naturally emits 10 comm ops** |
+
+### 20.3 Key Findings
+
+**DTensor TP on meta device + FakeProcessGroup(world_size>1) naturally emits communication operators:**
+- `all_reduce` for tensor parallel reductions
+- `wait_tensor` for async operation synchronization
+- Communication shapes match actual tensor dimensions
+- Zero heuristic code required
+
+**FSDP2 on meta device is possible with three targeted patches:**
+1. **Patch `FSDPParamGroup._validate_no_meta_params`** — Skip validation that rejects meta parameters
+2. **Patch `FakeTensor._find_common_device`** — Allow FSDP ops with mixed meta/cpu tensors by preferring meta device
+3. **Patch `FakeTensorMode.wrap_meta_outputs_with_default_device_logic`** — Convert CPU tensors to meta tensors for FSDP internal buffers
+
+**FSDP2 naturally emits all communication operators:**
+- Forward: `fsdp.all_gather_copy_in` + `c10d._allgather_base_` (per FSDP group)
+- Backward: all_gather (for gradient computation) + `c10d._reduce_scatter_base_` (for gradient reduction)
+- Communication shapes derived from actual model parameter dimensions
+
+### 20.4 Design Changes
+
+#### 20.4.1 New Module: `meta_device_patches.py`
+
+Encapsulates the three FSDP2 meta device patches:
+
+```python
+def apply_meta_device_patches():
+    """Enable FSDP2 to run on meta device for simulation."""
+    # Patch 1: Skip meta parameter validation
+    FSDPParamGroup._validate_no_meta_params = lambda self: None
+    
+    # Patch 2: Allow FSDP ops with mixed meta/cpu tensors
+    FakeTensor._find_common_device = _patched_find_common_device
+    
+    # Patch 3: Convert CPU tensors to meta for FSDP internal buffers
+    FakeTensorMode.wrap_meta_outputs_with_default_device_logic = _patched_wrap
+
+def restore_meta_device_patches():
+    """Restore original FSDP2 behavior."""
+    # ... restore original functions
+```
+
+#### 20.4.2 Modified `trainer.py`
+
+Replace `_cpu_noop_parallelize` stubs with real parallelization:
+
+```python
+def _meta_parallelize_llama(model: Any, parallel_dims: Any, **kwargs: Any) -> Any:
+    """Apply real TP/EP on meta device, skip FSDP."""
+    # Apply TP (DTensor placement) — works on meta
+    if parallel_dims.tp_enabled:
+        apply_non_moe_tp(model, parallel_dims.get_mesh("tp"), ...)
+    
+    # Apply EP (DTensor placement) — works on meta
+    if parallel_dims.ep_enabled:
+        apply_moe_ep_tp(model, ..., ep_mesh=parallel_dims.get_optional_mesh("ep"))
+    
+    # Skip FSDP (fully_shard) — will be applied later if needed
+    # FSDP requires real tensors, but we'll capture comm ops via natural emission
+    return model
+```
+
+#### 20.4.3 Modified `trainer_runner.py`
+
+Delete synthetic FSDP/TP communication injection:
+
+```python
+def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
+    # ... existing code ...
+    
+    # Apply meta device patches
+    from .meta_device_patches import apply_meta_device_patches
+    apply_meta_device_patches()
+    
+    # Run unified_trace — TP/FSDP comm ops emitted naturally
+    with unified_trace(recorder, model_parts, ...):
+        output = trainer.train_step()
+        output.backward()
+    
+    # Restore patches
+    from .meta_device_patches import restore_meta_device_patches
+    restore_meta_device_patches()
+    
+    # DELETE: _inject_synthetic_comm_events(...) — no longer needed for TP/FSDP
+    
+    # KEEP: PP send/recv injection (PP uses dist.send/recv, not DTensor)
+    if parallel_dims.pp > 1:
+        _inject_pp_send_recv(result, trainer.config)
+```
+
+### 20.5 Benefits
+
+| Aspect | Current (Synthetic) | Phase 4 (Natural) |
+|--------|---------------------|-------------------|
+| **Code** | ~400 lines of injection logic | ~50 lines of meta patches |
+| **TP accuracy** | Heuristic (2 all_reduce per layer) | Exact (from DTensor dispatch) |
+| **FSDP accuracy** | Manual shape calculation | Exact (from FSDP2 internals) |
+| **EP support** | Not implemented | Automatic (DTensor-based) |
+| **Maintenance** | Update for new parallelism types | Automatic (PyTorch handles it) |
+
+### 20.6 Limitations
+
+- **PP send/recv still requires injection** — Pipeline parallelism uses `dist.send()`/`dist.recv()` directly, not DTensor dispatch
+- **Meta device patches are fragile** — Depends on PyTorch internal implementation details that may change
+- **Requires FakeProcessGroup(world_size>1)** — Cannot simulate communication with world_size=1
+
+### 20.7 Implementation Plan
+
+1. **Create `meta_device_patches.py`** — Encapsulate the three patches
+2. **Modify `trainer.py`** — Replace `_cpu_noop_parallelize` with `_meta_parallelize_*`
+3. **Modify `trainer_runner.py`** — Apply patches, delete TP/FSDP injection
+4. **Update tests** — Verify natural emission produces correct comm ops
+5. **E2E validation** — Run DeepSeek V4 Pro simulation, compare with current results

@@ -673,3 +673,144 @@ _inject_synthetic_comm_events()
 - 关注点分离：算子级 -> 步骤级 -> 调度级 -> 工作负载级
 - 面向下游硬件仿真器的规范对齐
 - 所有投影从捕获数据派生，不重新实现逻辑
+
+---
+
+## 20. 第四阶段 — 自然通信捕获
+
+### 20.1 问题陈述
+
+当前的合成通信注入（`_inject_synthetic_comm_events()`）使用启发式假设来生成通信算子：
+- 假设层均匀分布
+- 手动计算张量大小
+- 硬编码通信模式（例如，每层 2 次 TP all_reduce）
+
+这种方法不是捕获忠实的，可能产生不准确的通信模式。
+
+### 20.2 实验结果
+
+一系列实验测试了 DTensor/FSDP2 在 meta device 上使用 FakeProcessGroup 运行时是否能自然发射通信算子：
+
+| 实验 | 方法 | 结果 |
+|------|------|------|
+| 1a | FSDP2 on meta | ❌ `_validate_no_meta_params` 拒绝 meta 参数 |
+| 1b | DTensor TP on meta (ws=1) | ✅ 成功但 0 个通信算子（ws=1 无需通信） |
+| 1b | DTensor TP on meta (ws=4) | ✅ **自然发射 2 个通信算子**（`all_reduce`、`wait_tensor`） |
+| 1b | FSDP2 on CPU (ws=4) | ✅ **自然发射 10 个通信算子**（all_gather、reduce_scatter） |
+| 1c | FSDP2 on meta + patch 验证 | ❌ Meta/cpu 设备传播不匹配 |
+| 1d | 多种 patching 方法 | ❌ 全部因深层不兼容而失败 |
+| 1e | Patch `FakeTensor._find_common_device` | ❌ 设备不匹配错误 |
+| 1f | Patch `wrap_meta_outputs_with_default_device_logic` | ✅ **FSDP2 on meta 自然发射 10 个通信算子** |
+
+### 20.3 关键发现
+
+**DTensor TP 在 meta device + FakeProcessGroup(world_size>1) 下自然发射通信算子：**
+- `all_reduce` 用于张量并行归约
+- `wait_tensor` 用于异步操作同步
+- 通信形状匹配实际张量维度
+- 无需启发式代码
+
+**FSDP2 在 meta device 上可通过三个针对性 patch 实现：**
+1. **Patch `FSDPParamGroup._validate_no_meta_params`** — 跳过拒绝 meta 参数的验证
+2. **Patch `FakeTensor._find_common_device`** — 通过优先选择 meta 设备允许 FSDP 算子使用混合 meta/cpu 张量
+3. **Patch `FakeTensorMode.wrap_meta_outputs_with_default_device_logic`** — 将 CPU 张量转换为 meta 张量用于 FSDP 内部缓冲区
+
+**FSDP2 自然发射所有通信算子：**
+- 前向：`fsdp.all_gather_copy_in` + `c10d._allgather_base_`（每个 FSDP 组）
+- 反向：all_gather（用于梯度计算）+ `c10d._reduce_scatter_base_`（用于梯度归约）
+- 通信形状从实际模型参数维度派生
+
+### 20.4 设计变更
+
+#### 20.4.1 新模块：`meta_device_patches.py`
+
+封装三个 FSDP2 meta device patches：
+
+```python
+def apply_meta_device_patches():
+    """启用 FSDP2 在 meta device 上运行以进行仿真。"""
+    # Patch 1: 跳过 meta 参数验证
+    FSDPParamGroup._validate_no_meta_params = lambda self: None
+    
+    # Patch 2: 允许 FSDP 算子使用混合 meta/cpu 张量
+    FakeTensor._find_common_device = _patched_find_common_device
+    
+    # Patch 3: 将 CPU 张量转换为 meta 张量用于 FSDP 内部缓冲区
+    FakeTensorMode.wrap_meta_outputs_with_default_device_logic = _patched_wrap
+
+def restore_meta_device_patches():
+    """恢复原始 FSDP2 行为。"""
+    # ... 恢复原始函数
+```
+
+#### 20.4.2 修改 `trainer.py`
+
+用真实并行化替换 `_cpu_noop_parallelize` 桩：
+
+```python
+def _meta_parallelize_llama(model: Any, parallel_dims: Any, **kwargs: Any) -> Any:
+    """在 meta device 上应用真实 TP/EP，跳过 FSDP。"""
+    # 应用 TP（DTensor placement）— 在 meta 上有效
+    if parallel_dims.tp_enabled:
+        apply_non_moe_tp(model, parallel_dims.get_mesh("tp"), ...)
+    
+    # 应用 EP（DTensor placement）— 在 meta 上有效
+    if parallel_dims.ep_enabled:
+        apply_moe_ep_tp(model, ..., ep_mesh=parallel_dims.get_optional_mesh("ep"))
+    
+    # 跳过 FSDP（fully_shard）— 稍后如需应用
+    # FSDP 需要真实张量，但我们将通过自然发射捕获通信算子
+    return model
+```
+
+#### 20.4.3 修改 `trainer_runner.py`
+
+删除合成 FSDP/TP 通信注入：
+
+```python
+def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
+    # ... 现有代码 ...
+    
+    # 应用 meta device patches
+    from .meta_device_patches import apply_meta_device_patches
+    apply_meta_device_patches()
+    
+    # 运行 unified_trace — TP/FSDP 通信算子自然发射
+    with unified_trace(recorder, model_parts, ...):
+        output = trainer.train_step()
+        output.backward()
+    
+    # 恢复 patches
+    from .meta_device_patches import restore_meta_device_patches
+    restore_meta_device_patches()
+    
+    # 删除：_inject_synthetic_comm_events(...) — TP/FSDP 不再需要
+    
+    # 保留：PP send/recv 注入（PP 使用 dist.send/recv，不走 DTensor）
+    if parallel_dims.pp > 1:
+        _inject_pp_send_recv(result, trainer.config)
+```
+
+### 20.5 收益
+
+| 方面 | 当前（合成） | 第四阶段（自然） |
+|------|-------------|-----------------|
+| **代码** | ~400 行注入逻辑 | ~50 行 meta patches |
+| **TP 精度** | 启发式（每层 2 次 all_reduce） | 精确（来自 DTensor dispatch） |
+| **FSDP 精度** | 手动形状计算 | 精确（来自 FSDP2 内部） |
+| **EP 支持** | 未实现 | 自动（基于 DTensor） |
+| **维护** | 为新并行类型更新 | 自动（PyTorch 处理） |
+
+### 20.6 限制
+
+- **PP send/recv 仍需注入** — 流水线并行直接使用 `dist.send()`/`dist.recv()`，不走 DTensor dispatch
+- **Meta device patches 脆弱** — 依赖可能变化的 PyTorch 内部实现细节
+- **需要 FakeProcessGroup(world_size>1)** — 无法用 world_size=1 模拟通信
+
+### 20.7 实施计划
+
+1. **创建 `meta_device_patches.py`** — 封装三个 patches
+2. **修改 `trainer.py`** — 用 `_meta_parallelize_*` 替换 `_cpu_noop_parallelize`
+3. **修改 `trainer_runner.py`** — 应用 patches，删除 TP/FSDP 注入
+4. **更新测试** — 验证自然发射产生正确的通信算子
+5. **E2E 验证** — 运行 DeepSeek V4 Pro 仿真，与当前结果比较
