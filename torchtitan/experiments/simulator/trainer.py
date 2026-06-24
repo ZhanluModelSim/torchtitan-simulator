@@ -86,15 +86,109 @@ class SimulationConfig:
     """
 
 
-def _cpu_noop_parallelize(model, **__):
-    """CPU-only parallelize stub: return model unchanged.
+def _meta_parallelize_with_skip_fsdp(original_parallelize_fn):
+    """Create a wrapper that applies real parallelization but skips FSDP.
 
-    The real ``parallelize_llama`` calls ``apply_fsdp`` / ``fully_shard``
-    which allocate CUDA tensors that cannot be materialised on CPU-only
-    builds.  Skipping FSDP/TP is safe because the interception-based
-    runtime capture records the actual ops that execute.
+    For Phase 4 natural communication capture, we need to:
+    1. Apply TP/EP/CP via DTensor (works on meta device, emits comm ops naturally)
+    2. Skip FSDP (requires real tensors, applied later with meta patches)
+
+    This wrapper patches ``apply_fsdp`` to be a no-op during the parallelize
+    phase, then restores it. FSDP will be applied later in trainer_runner.py
+    with meta device patches enabled.
+
+    Args:
+        original_parallelize_fn: The real parallelize function from the model
+            (e.g., parallelize_llama, parallelize_deepseek_v4).
+
+    Returns:
+        A wrapper function that applies TP/EP/CP but skips FSDP.
     """
-    return model
+    import inspect
+
+    # Inspect the original function signature to know which kwargs to pass
+    sig = inspect.signature(original_parallelize_fn)
+    valid_params = set(sig.parameters.keys())
+
+    def wrapper(model, **kwargs):
+        # Filter kwargs to only include parameters accepted by the original function
+        # This removes simulator-specific kwargs like 'config', 'model_parts_holder', etc.
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+        
+        # Provide default values for required parameters that might be missing
+        # model_converters is used by some models (e.g., DeepSeek) but not provided by trainer
+        if 'model_converters' in valid_params and 'model_converters' not in filtered_kwargs:
+            filtered_kwargs['model_converters'] = []
+        
+        # Add missing DeepSeek-specific parallelism attributes with defaults
+        # expert_parallel_comm_backend is used by DeepSeek but not in base ParallelismConfig
+        # Since ParallelismConfig uses slots=True, we need to add it at the class level
+        from torchtitan.config.configs import ParallelismConfig
+        if not hasattr(ParallelismConfig, 'expert_parallel_comm_backend'):
+            # Add the attribute to the class with default value
+            ParallelismConfig.expert_parallel_comm_backend = 'allgather'
+        
+        # Patch get_optional_mesh to handle missing dimensions gracefully
+        # DeepSeek parallelize calls get_optional_mesh("etp") which may not exist
+        from torchtitan.distributed.parallel_dims import ParallelDims
+        original_get_optional_mesh = ParallelDims.get_optional_mesh
+        
+        def patched_get_optional_mesh(self, dims):
+            """Patched version that returns None for missing dimensions instead of raising."""
+            try:
+                return original_get_optional_mesh(self, dims)
+            except ValueError as e:
+                if "Invalid mesh dim" in str(e):
+                    # Return None for missing optional dimensions
+                    return None
+                raise
+        
+        ParallelDims.get_optional_mesh = patched_get_optional_mesh
+        
+        # Add missing DeepSeek-specific ParallelDims attributes
+        # fsdp_gradient_divide_factor is used by DeepSeek but not in base ParallelDims
+        if not hasattr(ParallelDims, 'fsdp_gradient_divide_factor'):
+            ParallelDims.fsdp_gradient_divide_factor = None
+        
+        # Apply meta device patches BEFORE calling parallelize
+        # This allows FSDP to work on meta device during parallelize
+        from .meta_device_patches import apply_meta_device_patches, restore_meta_device_patches
+        from torchtitan.tools.logging import logger
+        
+        # On meta device, FSDP2's MixedPrecisionPolicy casts params to
+        # bfloat16, but intermediate tensors are float32. DTensor's sharding
+        # propagator rejects mixed-dtype ops on meta. Force fp32 to avoid this.
+        _training = kwargs.get("training")
+        if _training is not None and getattr(_training, "mixed_precision_param", None) != "float32":
+            _training.mixed_precision_param = "float32"
+            logger.info("Phase 4: Forced mixed_precision_param=fp32 for meta simulation")
+
+        # Disable selective activation checkpointing on meta. AC's mutation
+        # check raises on FakeTensors (in-place ops in MoE dispatch trigger
+        # "tensor cached during AC has been mutated"). On meta (0-byte tensors)
+        # AC has no memory benefit, so disabling is safe.
+        _ac = kwargs.get("ac_config")
+        if _ac is not None and getattr(_ac, "mode", "none") != "none":
+            _ac.mode = "none"
+            logger.info("Phase 4: Disabled activation checkpointing for meta simulation")
+
+        logger.info("Phase 4: Applying meta device patches before parallelize")
+        apply_meta_device_patches()
+
+        try:
+            logger.info("Phase 4: Calling real parallelize (TP/EP/FSDP on full model)")
+            logger.info(f"  - expert_parallel_comm_backend: {getattr(ParallelismConfig, 'expert_parallel_comm_backend', 'N/A')}")
+            logger.info(f"  - fsdp_gradient_divide_factor: {getattr(ParallelDims, 'fsdp_gradient_divide_factor', 'N/A')}")
+
+            result = original_parallelize_fn(model, **filtered_kwargs)
+            logger.info("Phase 4: Real parallelize completed (TP/EP/FSDP applied)")
+
+            return result
+        finally:
+            restore_meta_device_patches()
+            ParallelDims.get_optional_mesh = original_get_optional_mesh
+
+    return wrapper
 
 
 def _cpu_gloo_parallelize_llama(model: Any, **__: Any) -> Any:
@@ -222,28 +316,45 @@ def _cpu_semantic_pipeline(
     if parallelize_fn is not None:
         model = parallelize_fn(model, **kwargs)
 
-    if pp_degree <= 1 or model_parts_holder is None:
-        return None, [model], True, True
-
-    model_parts = _cpu_pp_module_split(model, config, model_config)
-    # Move parts back to meta device immediately to avoid OOM for large
-    # models (1T+ parameters).  The Trainer loop that follows will call
-    # to_empty + init_weights on model_parts, which would materialize
-    # 1T+ floats on CPU.  We skip that path by setting parallel_dims.pp=0
-    # after super().__init__() and replacing model_parts with these meta
-    # copies.
-    for part in model_parts:
-        part.to_empty(device="meta")
+    # Phase 4: Do NOT PP-split the model. The split uses copy.deepcopy which
+    # strips the FSDP2 wrapper class and breaks DTensor mesh alignment.
+    # Instead, run the full (TP+FSDP2-wrapped) model via SequentialPipelineSchedule.
+    # The PP schedule for visualization is still extracted separately via
+    # _inject_semantic_schedule (which builds a mock PyTorch schedule).
     model_parts_holder.clear()
-    model_parts_holder.extend(model_parts)
+    model_parts_holder.extend([model])
 
-    class MockSchedule:
-        def step(self, *args, **kwargs):
-            if "losses" in kwargs and isinstance(kwargs["losses"], list):
-                kwargs["losses"].append(torch.tensor(0.0, device="meta"))
-            return torch.tensor(0.0, device="meta")
+    class SequentialPipelineSchedule:
+        """Flattened PP schedule that runs all model parts sequentially.
 
-    return MockSchedule(), model_parts, True, True
+        Instead of real inter-stage PP communication (which needs
+        ``dist.send/recv``), this schedule runs every part in sequence:
+        ``out = part_0(inp) → part_1(out) → … → part_N(out)``.  FSDP2
+        lifecycle hooks fire on each part, naturally emitting
+        ``all_gather`` / ``reduce_scatter`` during the trace.
+        """
+
+        def __init__(self, parts, loss_fn):
+            self.parts = parts
+            self.loss_fn = loss_fn
+
+        def step(self, *args, target=None, losses=None, loss_kwargs=None, **kwargs):
+            output = args[0] if args else kwargs.pop("input", None)
+            for part in self.parts:
+                output = part(output)
+            if target is not None and self.loss_fn is not None:
+                loss = self.loss_fn(output, target, **(loss_kwargs or {}))
+            else:
+                loss = output.sum()
+            if losses is not None:
+                losses.append(loss)
+            # Trigger backward so FSDP2 reduce-scatter hooks fire and
+            # backward-phase ops are captured by the trace.
+            loss.backward()
+            return loss
+
+    loss_fn = kwargs.get("loss_fn")
+    return SequentialPipelineSchedule([model], loss_fn), [model], True, True
 
 
 def _set_fake_world_size(config: Any) -> None:
@@ -329,7 +440,14 @@ class SimulationTrainer(Trainer):
             else:
                 config.model_spec.parallelize_fn = _cpu_gloo_parallelize_llama
         else:
-            config.model_spec.parallelize_fn = _cpu_noop_parallelize
+            # Phase 4: Use real parallelize with FSDP skipped
+            # This applies TP/EP/CP via DTensor on meta device, which naturally
+            # emits communication operators. FSDP will be applied later in
+            # trainer_runner.py with meta device patches.
+            original_parallelize_fn = config.model_spec.parallelize_fn
+            config.model_spec.parallelize_fn = _meta_parallelize_with_skip_fsdp(
+                original_parallelize_fn
+            )
 
         # Use PP-semantic pipeline when PP > 1 and not gloo mode
         self._pp_model_parts: list[Any] = []
@@ -353,6 +471,8 @@ class SimulationTrainer(Trainer):
         # materialise CPU tensors.  FSDP1 on meta/empty tensors crashes.
         if comm_backend == "gloo":
             self.model_parts = [_apply_fsdp1_on_cpu(m) for m in self.model_parts]
+        # For fake_backend mode, FSDP2 is applied during parallelize with meta device patches
+        # (see _meta_parallelize_with_skip_fsdp wrapper)
 
     def train(self):
         comm_backend = getattr(self.config.simulation, "comm_backend", "") or ""

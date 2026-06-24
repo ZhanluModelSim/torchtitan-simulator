@@ -38,15 +38,19 @@ except ImportError:
     DeepEPExpertParallel = None  # type: ignore[assignment]
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp, NoParallel
 from torchtitan.models.common import moe as moe_module
-from torchtitan.models.llama3.parallelize import apply_fsdp as _apply_fsdp_upstream
+from torchtitan.models.llama4.parallelize import apply_fsdp as _apply_fsdp_upstream
 
-# apply_replicate doesn't exist in llama3.parallelize in this torchtitan version.
-# Provide a minimal stub.
+# apply_replicate doesn't exist in llama3/llama4 parallelize in this torchtitan
+# version.  Provide a minimal stub.
 def apply_replicate(model: nn.Module, dp_mesh: DeviceMesh):
     return model
 
 
 def apply_fsdp(*args, **kwargs):
+    # llama4's apply_fsdp accepts ep_degree and edp_mesh for EP-aware FSDP
+    # (per-param mesh routing: expert params use edp_mesh, non-expert use
+    # dp_mesh).  It does not accept gradient_divide_factor; filter it out.
+    kwargs.pop("gradient_divide_factor", None)
     return _apply_fsdp_upstream(*args, **kwargs)
 
 

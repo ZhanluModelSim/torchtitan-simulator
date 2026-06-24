@@ -36,6 +36,67 @@ from .schedule.schedule_extract import extract_schedule_from_pytorch
 _T = TypeVar("_T")
 
 
+def _reapply_fsdp2_to_parts(trainer: Any, fsdp_mesh: Any = None) -> None:
+    """Re-apply FSDP2 to each model part after PP split.
+
+    The PP module split uses ``copy.deepcopy``, which strips the FSDP2 wrapper
+    class (``FSDPModule.__new__`` creates instances of the *original* class even
+    under ``disable_fsdp_module_new_init``).  Re-applying ``fully_shard`` to
+    each part restores the FSDP2 lifecycle hooks so that unshard/reshard emit
+    ``all_gather`` / ``reduce_scatter`` during the trace.
+
+    Must be called **after** ``apply_meta_device_patches()`` — FSDP2 on meta
+    requires the meta device patches to be active.  ``fsdp_mesh`` should be
+    saved **before** the runner's ``get_mesh`` no-op patch.
+    """
+    parallel_dims = getattr(trainer, "parallel_dims", None)
+    if parallel_dims is None:
+        return
+    dp_shard = int(getattr(parallel_dims, "dp_shard", 1) or 1)
+    if dp_shard <= 1:
+        return  # FSDP not enabled
+
+    dp_mesh = fsdp_mesh
+    if dp_mesh is None:
+        # Fallback: try to look up the mesh (only works if get_mesh not patched)
+        for names in (["dp_replicate", "dp_shard"], ["dp_shard"], ["fsdp"]):
+            try:
+                dp_mesh = parallel_dims.get_mesh(names)
+                break
+            except Exception:
+                continue
+    if dp_mesh is None:
+        logger.warning("_reapply_fsdp2: no FSDP mesh available, skipping")
+        return
+
+    training = getattr(trainer.config, "training", None)
+    from torch.distributed.fsdp import fully_shard
+
+    # Note: we intentionally do NOT set MixedPrecisionPolicy here.  On meta
+    # device, param-dtype casting causes DTensor sharding-propagation dtype
+    # mismatches.  Keeping the original param dtype (float32) avoids this
+    # and the foreach_reduce dtype-coercion patch (meta_device_patches #4)
+    # handles any residual gradient-dtype non-uniformity during backward.
+    for i, part in enumerate(trainer.model_parts):
+        # Skip parts that are already FSDP-wrapped
+        if "FSDP" in type(part).__name__:
+            continue
+        # Clear any residual FSDP composable attributes.  FSDP2 was deferred
+        # (skipped during parallelize via the fully_shard no-op), so there
+        # should be no composable tracking — but clear defensively.
+        for _, m in part.named_modules():
+            for attr in (
+                "_is_fsdp_managed_module",
+                "_fsdp_use_orig_params",
+            ):
+                m.__dict__.pop(attr, None)
+        try:
+            fully_shard(part, mesh=dp_mesh, reshard_after_forward=True)
+            logger.info("Re-applied FSDP2 to model part %d", i)
+        except Exception as e:
+            logger.warning("FSDP2 re-application failed for part %d: %s", i, e)
+
+
 def _get_cost_model_kwargs(sim_opts: Any) -> dict[str, Any]:
     """Normalise ``cost_model_kwargs`` from config or CLI.
 
@@ -200,6 +261,249 @@ def _inject_semantic_schedule(result: Any, config: Any) -> None:
             existing.add_event(ev)
         for dep in semantic.deps:
             existing.add_dep(dep)
+
+
+def _inject_pp_send_recv(
+    result: Any,
+    trainer: Any,
+) -> None:
+    """Inject synthetic PP send/recv events for fake_backend mode.
+
+    Pipeline parallelism uses dist.send()/dist.recv() directly (not DTensor),
+    so these communication operators must still be injected even with Phase 4
+    natural communication capture.
+
+    Args:
+        result: SimulationResult to inject events into
+        trainer: Trainer instance with parallelism config
+    """
+    graph = result.compute_graph
+    parallelism = trainer.config.parallelism
+    model_parts = trainer.model_parts
+
+    pp = int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1)
+    if pp <= 1:
+        return  # No pipeline parallelism
+
+    # Determine dtype from config
+    from torchtitan.config import TORCH_DTYPE_MAP
+
+    mp_param = getattr(trainer.config.training, "mixed_precision_param", "bfloat16")
+    torch_dtype = TORCH_DTYPE_MAP.get(mp_param, torch.bfloat16)
+    dtype_str = str(torch_dtype)
+    mp_reduce = getattr(trainer.config.training, "mixed_precision_reduce", "float32")
+    reduce_dtype_str = str(TORCH_DTYPE_MAP.get(mp_reduce, torch.float32))
+
+    seq_len = trainer.config.training.seq_len
+    batch_size = trainer.config.training.local_batch_size
+    hidden = _guess_hidden_dim(model_parts[0])
+    activation_numel = batch_size * seq_len * hidden
+
+    # Create send/recv pairs for each microbatch
+    num_microbatches = int(
+        getattr(parallelism, "pipeline_parallel_microbatch_size", 8) or 8
+    )
+
+    counter = [len(graph.nodes)]
+
+    def _next_id() -> str:
+        counter[0] += 1
+        return f"comm_pp_{counter[0]:07d}"
+
+    for mb_idx in range(num_microbatches):
+        # Forward: send activation from stage_idx to stage_idx+1
+        for stage_idx in range(pp - 1):
+            send_pp_rank = stage_idx % pp
+            recv_pp_rank = (stage_idx + 1) % pp
+
+            send_node = OpNode(
+                node_id=_next_id(),
+                op_name="pp_send_activation",
+                op_type="comm_p2p",
+                phase="forward",
+                pp_stage=stage_idx,
+                pp_rank=send_pp_rank,
+                microbatch_idx=mb_idx,
+                inputs=[
+                    TensorMeta(
+                        shape=(activation_numel,), dtype=dtype_str, device="cpu"
+                    )
+                ],
+                outputs=[
+                    TensorMeta(
+                        shape=(activation_numel,), dtype=dtype_str, device="cpu"
+                    )
+                ],
+                comm_op="send",
+                comm_group_size=2,
+                attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx + 1},
+            )
+            graph.add_node(send_node)
+
+            recv_node = OpNode(
+                node_id=_next_id(),
+                op_name="pp_recv_activation",
+                op_type="comm_p2p",
+                phase="forward",
+                pp_stage=stage_idx + 1,
+                pp_rank=recv_pp_rank,
+                microbatch_idx=mb_idx,
+                inputs=[
+                    TensorMeta(
+                        shape=(activation_numel,), dtype=dtype_str, device="cpu"
+                    )
+                ],
+                outputs=[
+                    TensorMeta(
+                        shape=(activation_numel,), dtype=dtype_str, device="cpu"
+                    )
+                ],
+                comm_op="recv",
+                comm_group_size=2,
+                attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
+            )
+            graph.add_node(recv_node)
+
+            # Add edge: send -> recv
+            graph.add_edge(DataEdge(send_node.node_id, recv_node.node_id, "pp_p2p"))
+
+            result.comm_events.append(
+                {
+                    "event_id": send_node.node_id,
+                    "op": "send",
+                    "group_size": 2,
+                    "phase": "forward",
+                    "pp_stage": stage_idx,
+                    "pp_rank": send_pp_rank,
+                    "microbatch": mb_idx,
+                    "tensor_meta": {
+                        "shape": [batch_size, seq_len, hidden],
+                        "dtype": dtype_str,
+                        "device": "cpu",
+                    },
+                    "source_node_ids": [],
+                    "synthetic": True,
+                }
+            )
+            result.comm_events.append(
+                {
+                    "event_id": recv_node.node_id,
+                    "op": "recv",
+                    "group_size": 2,
+                    "phase": "forward",
+                    "pp_stage": stage_idx + 1,
+                    "pp_rank": recv_pp_rank,
+                    "microbatch": mb_idx,
+                    "tensor_meta": {
+                        "shape": [batch_size, seq_len, hidden],
+                        "dtype": dtype_str,
+                        "device": "cpu",
+                    },
+                    "source_node_ids": [send_node.node_id],
+                    "synthetic": True,
+                }
+            )
+
+        # Backward: send gradient from stage_idx+1 to stage_idx
+        for stage_idx in range(pp - 1, 0, -1):
+            send_pp_rank = stage_idx % pp
+            recv_pp_rank = (stage_idx - 1) % pp
+
+            send_node = OpNode(
+                node_id=_next_id(),
+                op_name="pp_send_gradient",
+                op_type="comm_p2p",
+                phase="backward",
+                pp_stage=stage_idx,
+                pp_rank=send_pp_rank,
+                microbatch_idx=mb_idx,
+                inputs=[
+                    TensorMeta(
+                        shape=(activation_numel,),
+                        dtype=reduce_dtype_str,
+                        device="cpu",
+                    )
+                ],
+                outputs=[
+                    TensorMeta(
+                        shape=(activation_numel,),
+                        dtype=reduce_dtype_str,
+                        device="cpu",
+                    )
+                ],
+                comm_op="send",
+                comm_group_size=2,
+                attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx - 1},
+            )
+            graph.add_node(send_node)
+
+            recv_node = OpNode(
+                node_id=_next_id(),
+                op_name="pp_recv_gradient",
+                op_type="comm_p2p",
+                phase="backward",
+                pp_stage=stage_idx - 1,
+                pp_rank=recv_pp_rank,
+                microbatch_idx=mb_idx,
+                inputs=[
+                    TensorMeta(
+                        shape=(activation_numel,),
+                        dtype=reduce_dtype_str,
+                        device="cpu",
+                    )
+                ],
+                outputs=[
+                    TensorMeta(
+                        shape=(activation_numel,),
+                        dtype=reduce_dtype_str,
+                        device="cpu",
+                    )
+                ],
+                comm_op="recv",
+                comm_group_size=2,
+                attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
+            )
+            graph.add_node(recv_node)
+
+            # Add edge: send -> recv
+            graph.add_edge(DataEdge(send_node.node_id, recv_node.node_id, "pp_p2p"))
+
+            result.comm_events.append(
+                {
+                    "event_id": send_node.node_id,
+                    "op": "send",
+                    "group_size": 2,
+                    "phase": "backward",
+                    "pp_stage": stage_idx,
+                    "pp_rank": send_pp_rank,
+                    "microbatch": mb_idx,
+                    "tensor_meta": {
+                        "shape": [batch_size, seq_len, hidden],
+                        "dtype": reduce_dtype_str,
+                        "device": "cpu",
+                    },
+                    "source_node_ids": [],
+                    "synthetic": True,
+                }
+            )
+            result.comm_events.append(
+                {
+                    "event_id": recv_node.node_id,
+                    "op": "recv",
+                    "group_size": 2,
+                    "phase": "backward",
+                    "pp_stage": stage_idx - 1,
+                    "pp_rank": recv_pp_rank,
+                    "microbatch": mb_idx,
+                    "tensor_meta": {
+                        "shape": [batch_size, seq_len, hidden],
+                        "dtype": reduce_dtype_str,
+                        "device": "cpu",
+                    },
+                    "source_node_ids": [send_node.node_id],
+                    "synthetic": True,
+                }
+            )
 
 
 def _inject_synthetic_comm_events(
@@ -930,6 +1234,15 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     orig_format = FakeTensor.__format__
     FakeTensor.__format__ = lambda self, format_spec: "0.0"
 
+    # DTensor wraps FakeTensor but has its own __format__; patch it too
+    # so logging/metrics that format DTensors don't crash on meta.
+    try:
+        from torch.distributed.tensor import DTensor as _DTensor
+        _orig_dt_format = _DTensor.__format__
+        _DTensor.__format__ = lambda self, format_spec: "0.0"
+    except Exception:
+        _orig_dt_format = None
+
     # 3. Patch distributed and optimizer operations that expect real tensors
     orig_clip_grad_norm = dist_utils.clip_grad_norm_
     orig_dist_sum = dist_utils.dist_sum
@@ -983,6 +1296,12 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
     use_fake = (getattr(sim_opts, "comm_backend", "") or "") != "gloo"
 
+    # Phase 4: Apply meta device patches for natural FSDP communication emission
+    from .meta_device_patches import apply_meta_device_patches, restore_meta_device_patches
+    
+    if use_fake:
+        apply_meta_device_patches()
+
     try:
         with unified_trace(
             recorder,
@@ -993,6 +1312,10 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
             with _patch_backward_phase(recorder):
                 Trainer.train_step(trainer, mock_data_iterator())
     finally:
+        # Phase 4: Restore meta device patches
+        if use_fake:
+            restore_meta_device_patches()
+        
         # Restore patched methods
         dist_utils.clip_grad_norm_ = orig_clip_grad_norm
         dist_utils.dist_sum = orig_dist_sum
@@ -1003,6 +1326,8 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         trainer.lr_schedulers.step = orig_lr_step
         sl.log_trace_scalar = orig_log
         FakeTensor.__format__ = orig_format
+        if _orig_dt_format is not None:
+            _DTensor.__format__ = _orig_dt_format
 
         # Restore local_scalar_dense
         if orig_local_scalar_dense:
@@ -1024,7 +1349,9 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
     if use_fake:
         _inject_synthetic_compute_anchors(result, trainer)
-        _inject_synthetic_comm_events(result, trainer, sim_opts)
+        # Phase 4: TP/FSDP communication is now emitted naturally by real parallelization
+        # Only PP send/recv still needs synthetic injection (uses dist.send/recv directly)
+        _inject_pp_send_recv(result, trainer)
     if getattr(sim_opts, "semantic_schedule", False):
         _inject_semantic_schedule(result, trainer.config)
 

@@ -29,6 +29,7 @@ Usage::
 from __future__ import annotations
 
 import types
+from contextlib import contextmanager
 
 
 def _make_meta_device_module():
@@ -54,9 +55,14 @@ def _make_meta_device_module():
         def elapsed_time(self, *args, **kwargs): return 0.0
         def synchronize(self): pass
 
+    @contextmanager
+    def _stream(stream=None):
+        yield stream
+
     return types.SimpleNamespace(
         Stream=FakeStream,
         Event=FakeEvent,
+        stream=_stream,
         current_stream=lambda: FakeStream(),
         set_device=lambda device: None,
         is_initialized=lambda: True,
