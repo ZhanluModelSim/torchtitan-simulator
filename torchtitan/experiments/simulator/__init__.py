@@ -11,28 +11,13 @@ TorchTitan CPU Simulator — Public API
 Capture forward/backward computation graphs and training schedules (PP, FSDP)
 on a pure CPU environment without any GPU hardware.
 
-Quick start::
-
-    from torchtitan.experiments.simulator import Simulator, export_json
-
-    sim = Simulator()
-
-    # Static FX trace (no execution)
-    result = sim.simulate_fx(model, example_inputs=(tokens,))
-
-    # Dynamic runtime capture (1 real training step on CPU)
-    result = sim.simulate_runtime([model], example_inputs=(tokens,))
-
-    # PP schedule extraction only
-    result = sim.simulate_pp_schedule(pp_sched)
-
-    # Export to file
-    export_json(result, "output/result.json")
+The primary entry point is :class:`SimulationTrainer` (via ``run_train.sh``).
 """
 
 import importlib
 import sys
 
+from .capture.unified_trace import TraceRecorder, unified_trace
 from .cost_model import apply_cost_model, CostModel, MockCostModel
 from .des_engine import DESEngine, simulate_multi_rank_des, simulate_single_rank_des
 from .export import (
@@ -55,27 +40,10 @@ from .nodes import (
     TensorMeta,
     TrainingSchedule,
 )
-from .simulator import Simulator
+from .trainer import SimulationConfig, SimulationTrainer
 
+# Backward-compat module aliases so that old import paths still resolve.
 _MODULE_ALIASES = {
-    "torchtitan.experiments.simulator.comm_interceptor": (
-        "torchtitan.experiments.simulator.capture.comm_interceptor"
-    ),
-    "torchtitan.experiments.simulator.dispatch_interceptor": (
-        "torchtitan.experiments.simulator.capture.dispatch_interceptor"
-    ),
-    "torchtitan.experiments.simulator.fsdp_tracer": (
-        "torchtitan.experiments.simulator.capture.fsdp_tracer"
-    ),
-    "torchtitan.experiments.simulator.fx_capture": (
-        "torchtitan.experiments.simulator.capture.fx_capture"
-    ),
-    "torchtitan.experiments.simulator.graph_assembler": (
-        "torchtitan.experiments.simulator.capture.graph_assembler"
-    ),
-    "torchtitan.experiments.simulator.runtime_capture": (
-        "torchtitan.experiments.simulator.capture.runtime_capture"
-    ),
     "torchtitan.experiments.simulator.unified_trace": (
         "torchtitan.experiments.simulator.capture.unified_trace"
     ),
@@ -94,8 +62,12 @@ for _old_mod, _new_mod in _MODULE_ALIASES.items():
     sys.modules.setdefault(_old_mod, importlib.import_module(_new_mod))
 
 __all__ = [
-    # Main class
-    "Simulator",
+    # Entry point
+    "SimulationTrainer",
+    "SimulationConfig",
+    # Capture
+    "TraceRecorder",
+    "unified_trace",
     # Data model
     "SimulationResult",
     "ComputeGraph",
