@@ -426,7 +426,6 @@ def compute_des_utilization(result: SimulationResult) -> dict[str, Any]:
 
     return {
         "e2e_step_time_us": round(e2e_step, 3),
-        "single_rank_step_time_us": round(e2e_step, 3),
         "compute_busy_us": round(compute_busy, 3),
         "comm_busy_us": round(comm_busy, 3),
         "overlap_us": round(overlap, 3),

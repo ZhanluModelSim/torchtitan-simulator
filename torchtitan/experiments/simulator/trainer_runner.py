@@ -230,10 +230,21 @@ def _project_pp_comm_from_schedule(
 
     pp_events = [
         e for e in schedule.events
-        if e.event_type in _PP_EVENT_MAP and e.rank == 0
+        if e.event_type in _PP_EVENT_MAP
     ]
     if not pp_events:
         return
+
+    # Deduplicate by (event_type, pp_stage, microbatch_idx) — multiple ranks
+    # share the same pp_stage; create one representative OpNode per unique key
+    # so all ranks' events link to the same node and get consistent duration.
+    seen_keys: set[tuple[str, int | None, int | None]] = set()
+    unique_pp_events = []
+    for ev in pp_events:
+        key = (ev.event_type, ev.pp_stage, ev.microbatch_idx)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_pp_events.append(ev)
 
     # Build send→recv dep map from schedule's pp_comm edges
     send_to_recv: dict[str, list[str]] = {}
@@ -268,7 +279,7 @@ def _project_pp_comm_from_schedule(
         counter[0] += 1
         return f"comm_pp_{counter[0]:07d}"
 
-    for ev in pp_events:
+    for ev in unique_pp_events:
         op_name, phase, comm_op = _PP_EVENT_MAP[ev.event_type]
         dt = dtype_str if phase == "forward" else reduce_dtype_str
         node_id = _next_id()

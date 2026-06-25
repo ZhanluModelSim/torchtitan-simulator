@@ -65,7 +65,6 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
         path: Output file path (will be created / overwritten).
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _populate_des_metadata(result)
     data = result.to_dict()
     _inject_schedule_timing(data, result)
     node_count = len(result.compute_graph.nodes)
@@ -180,7 +179,6 @@ def export_kernel_summary_csv(
         path: Output CSV file path (created / overwritten).
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _populate_des_metadata(result)
     rows = _kernel_summary_rows(result)
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_KERNEL_SUMMARY_HEADER)
@@ -794,7 +792,6 @@ def _compress_graph_by_stage_similarity(result: SimulationResult) -> dict[str, A
 
 def _json_script_payload(result: SimulationResult) -> str:
     node_count = len(result.compute_graph.nodes)
-    _populate_des_metadata(result)
     if node_count > 10000:
         # For large graphs, compress by merging similar PP stages
         schedule_data = None
@@ -1062,8 +1059,14 @@ def export_html(
         )
     data_payload = _json_script_payload(result)
     steps = sorted({_event_step(ev) for ev in schedule_events}) or [0]
-    has_des = any(
-        n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
+    has_des = (
+        "des_engine" in result.metadata
+        or any(n.des_start_time_us is not None
+               for n in result.compute_graph.nodes.values())
+        or (result.schedule is not None and any(
+            ev.des_start_time_us is not None
+            for ev in result.schedule.events
+        ))
     )
     des_cards = ""
     if has_des:
@@ -2024,7 +2027,12 @@ def export_text_summary(result: SimulationResult) -> str:
 
     section("Metadata")
     for k, v in result.metadata.items():
-        if k in ("cost_model", "des_engine", "des_memory"):
+        if k in ("cost_model", "des_engine", "des_memory",
+                 "_schedule_events_enriched", "perf_schedule"):
+            continue
+        # Skip large nested dicts/lists that would bloat the summary
+        if isinstance(v, (list, dict)) and len(str(v)) > 500:
+            lines.append(f"  {k}: <{len(v) if isinstance(v, list) else len(v)} items>")
             continue
         lines.append(f"  {k}: {v}")
 
