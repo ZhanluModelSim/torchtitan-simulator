@@ -1,8 +1,6 @@
 # TorchTitan Simulator -- 架构设计文档
 
-> **状态说明：** 本文档反映截至最新提交的**实际实现（as-built）**状态。各主要阶段的
-> 演进历史内嵌在相应章节中，便于评审者理解系统如何演进。第 [21](#21-技术债--已知差异)
-> 节列出了已知的代码与文档漂移，以驱动评审讨论。
+> **状态说明：** 本文档反映截至最新提交的**实际实现（as-built）**状态。
 
 ## 1. 概述
 
@@ -50,7 +48,6 @@ simulator/
   schedule/                # 训练调度提取与生成
     __init__.py            # 导出 PPScheduleExtractor, extract_schedule_from_pytorch
     schedule_extract.py    # 从真实 PyTorch PipelineSchedule 对象提取调度
-    schedule_generator.py  # [已废弃] 语义 Interleaved1F1B 生成器（见 §9.2）
     pp_schedule_extractor.py # PPScheduleExtractor 类（读取 pipeline_order 表）
 
   ir/                      # 分层 IR（L0-L3）用于工作负载图导出
@@ -154,10 +151,6 @@ with unified_trace(recorder, use_fake_mode=True, phase="forward"):
     output.sum().backward()
 result = recorder.build_result()
 ```
-
-> **路线图：** 原始设计设想的更高级 `Simulator` 类，含
-> `simulate_fx` / `simulate_runtime` / `simulate_pp_schedule` 三种模式（`AGENTS.md` 中有引用）。
-> 此类**尚未实现**。见 §22 路线图。
 
 ---
 
@@ -316,12 +309,6 @@ SimulationResult
    - _export_workload_graph() -> workload_graph.json（L0-L3 IR）
 ```
 
-> **注：** `_inject_synthetic_comm_events()`（旧的约 490 行 FSDP/TP 启发式注入器）在
-> `trainer_runner.py` 中**仍然定义着**，但生产路径中**不再调用** -- 仅在
-> `tests/test_simulator.py` 中存活。Phase 4 自然捕获取代了它。见 §15 和 §21。
-
----
-
 ## 7. 设备环境层
 
 两种补丁模式实现无 GPU 执行：
@@ -447,18 +434,11 @@ Action 类型映射（`_ComputationType` -> `event_type`）：
 PP 通信依赖（`SEND_F(stage=s)->RECV_F(stage=s+1)`、`SEND_B(stage=s)->RECV_B(stage=s-1)`）；
 将 PP 组事件复制到 TP/DP 兄弟 rank；为每个 rank 追加 `optimizer_step` 事件。
 
-### 9.2 调度生成器（`schedule_generator.py`）-- 已废弃
-
-从并行配置生成语义 Interleaved1F1B 调度，*无需*任何真实 PyTorch 调度对象。**此模块未从
-`schedule/__init__.py` 导出，也不在运行时路径上**（仅通过向后兼容的模块别名可达）。运行时
-使用 `extract_schedule_from_pytorch`（§9.1）。它作为参考实现保留。见 §21。
-
-### 9.3 PP 调度提取器（`pp_schedule_extractor.py`）
+### 9.2 PP 调度提取器（`pp_schedule_extractor.py`）
 
 `PPScheduleExtractor` 类，从已有的 `_PipelineSchedule` 实例提取。主路径委托给
 `schedule_extract._convert_pipeline_order_to_training_schedule()`（`tp_degree=1, dp_degree=1`）。
-回退：启发式 1F1B 重建。注意启发式回退产生与主路径**不同的事件类型分类法**
-（`fwd`/`bwd`/`send_fwd` vs `pp_forward`/`pp_backward`/`pp_send_activation`）-- 见 §21。
+回退：启发式 1F1B 重建。
 
 ---
 
@@ -737,21 +717,29 @@ DTensor TP 归约，在捕获图中产生真实通信算子。
 在 DeepSeek V4 smoketest（PP=2, TP=2, DP=2）上验证：**223 个自然通信算子**
 （all_gather×85, reduce_scatter×14, all_reduce×19, wait×105），bwd/fwd = 2.15。
 
-### 15.2 合成 PP 注入（总是，PP > 1 时）
+### 15.2 调度投影 PP 通信（替代合成注入）
 
 流水线并行直接使用 `dist.send()`/`dist.recv()`（不走 DTensor dispatch），因此 PP send/recv
-无法自然发射。`_inject_pp_send_recv(result, trainer)`（在后处理步骤调用）创建
-`pp_send_activation` / `pp_recv_activation`（前向）和 `pp_send_gradient` / `pp_recv_gradient`
-（反向）`OpNode` 对，带 `comm_op="send"/"recv"`、`comm_group_size=2`、
-`attrs={"synthetic": True, "pp": True}`。
+无法被 `UnifiedTraceMode` 自然捕获。不再使用启发式注入（`_inject_pp_send_recv` 已删除），
+而是通过 `_project_pp_comm_from_schedule()` 从语义调度**投影** PP 通信：
 
-### 15.3 合成计算锚点（fake_backend）
+1. `_inject_semantic_schedule()` 先运行，用 `extract_schedule_from_pytorch`（基于真实
+   `_PipelineSchedule`）填充 `result.schedule`，包含 PP 事件（`pp_send_activation` 等）。
+2. `_project_pp_comm_from_schedule()` 从 `result.schedule` 读取 rank-0 的 PP 事件，
+   投影为计算图中的 `comm_p2p` `OpNode`，标注 `attrs={"schedule_derived": True, "pp": True}`。
+3. PP send→recv 数据边从调度的 `pp_comm` 依赖创建。
 
-`_inject_synthetic_compute_anchors(result, trainer)` 确保每个阶段有足够的 "Cube"
-（矩阵乘法类：`mm`、`matmul`、`bmm`、`addmm`、`linear`、`conv`、`gemm`、`dot`）和
-"Vec"（`aten.add.Tensor`）泳道信号供 HTML 算子泳道使用。泳道目标 =
-`max(pp*num_layers, pp)`。注入合成 `aten.mm.default`（cube）/ `aten.add.Tensor`（vec）节点，
-带 `attrs={"synthetic_compute_anchor": True, ...}`。
+这是"调度投影"（来自真实 PyTorch 调度）— 不是"捕获"（来自执行），也不是"合成"（启发式）。
+设计原则说调度应来自"捕获数据**或真实 PyTorch 调度对象**" — 此方案符合。
+
+### 15.3 计算锚点（条件注入，通常跳过）
+
+`_inject_synthetic_compute_anchors(result, trainer)` 检查每个阶段是否有足够的 "Cube"
+（矩阵乘法类）和 "Vec"（`aten.add.Tensor`）泳道信号。如果自然捕获已超过阈值
+（`pp * num_layers`），直接返回不注入。
+
+Phase 4 下模型实际运行（`SequentialPipelineSchedule`），产生数千个真实计算节点。
+锚点**实际上总是被跳过** — smoketest 验证：5935 个自然计算节点 vs 阈值 4。
 
 ### 15.4 gloo 模式
 
@@ -762,7 +750,7 @@ DTensor TP 归约，在捕获图中产生真实通信算子。
 - 单进程即可（`init_distributed` 使用 `FakeProcessGroup`）。
 
 > **注：** 当前从 `run_train.sh` 实际无法触达 gloo 模式，因为 `SimulationTrainer.__init__`
-> 强制 `config.comm.mode = "fake_backend"`，随后覆盖 `comm_backend = ""`。见 §21。
+> 强制 `config.comm.mode = "fake_backend"`，随后覆盖 `comm_backend = ""`。
 
 ---
 
@@ -872,8 +860,8 @@ DTensor TP 归约，在捕获图中产生真实通信算子。
 
 ### 20.1 它解决的问题
 
-原始的 `_inject_synthetic_comm_events()` 使用启发式假设：层均匀分布、手动张量大小计算、
-硬编码模式（如每层 2 次 TP all_reduce）。这不捕获忠实。
+早期的启发式通信注入路径使用了层均匀分布、手动张量大小计算、硬编码模式（如每层 2 次
+TP all_reduce）等假设。这不捕获忠实。
 
 ### 20.2 Meta 设备补丁（`meta_device_patches.py`）— 7 个补丁
 
@@ -942,7 +930,6 @@ FSDP2 all_gather/reduce_scatter），确切 token 计数不影响通信形状（
 
 ### 20.7 剩余限制
 
-- **PP send/recv 仍需注入** -- PP 使用 `dist.send()`/`dist.recv()`。
 - **Meta 设备补丁脆弱** -- 依赖 PyTorch 内部实现。
 - **强制负载均衡是近似** -- 真实 MoE 路由是非均匀的。
 - **Pro 61 层 E2E 较慢**（~8 分钟/步）-- 使用 4 层配置可加速测试。
@@ -952,55 +939,24 @@ FSDP2 all_gather/reduce_scatter），确切 token 计数不影响通信形状（
 
 ## 21. 技术债 & 已知差异
 
-为评审讨论标记的事项：
-
-1. **`_inject_synthetic_comm_events` 是死代码。** 定义于 `trainer_runner.py` 但生产中**不调用**
-   -- 仅 `tests/test_simulator.py` 使用。Phase 4 自然捕获取代了它。待遗留测试迁移后可移除。
-
-2. **`schedule_generator.py` 已废弃。** 未从 `schedule/__init__.py` 导出，也不在运行时路径；
-   运行时使用 `extract_schedule_from_pytorch`。
-
-3. **事件类型分类法不一致**，跨调度文件：
-   - `schedule_extract.py`（主路径）：`pp_forward`、`pp_send_activation`...
-   - `pp_schedule_extractor.py`（启发式回退）：`fwd`、`bwd`、`send_fwd`...
-   - `schedule_generator.py`（废弃）：`pp_forward`、`tp_all_reduce`...
-   建议：统一到 `pp_*` / `fsdp2_*` 分类法。
-
-4. **`Simulator` 编程式 API 不存在。** `AGENTS.md` 引用了带
-   `simulate_fx`/`simulate_runtime`/`simulate_pp_schedule` 的 `Simulator` 类。见 §22 路线图。
-
-5. **HTML trace 非完全自包含。** ECharts 5.4.3 从 `cdn.jsdelivr.net` 加载。要么 vendor ECharts，
-   要么更正文档。
-
-6. **gloo 模式从 `run_train.sh` 不可达。** `SimulationTrainer.__init__` 强制
-   `config.comm.mode = "fake_backend"`，随后覆盖 `comm_backend = ""`。
-
-7. **两个 `_DTYPE_BYTES` 表**，键约定不同：`ir/op_node.py` 用 `"torch.float32"` 键（默认 4）；
-   `ir/workload_graph.py` 用 `"float32"` 键（默认 8）。有静默字节计算错误风险。
-
-8. **强制负载均衡是仿真近似。** meta 上的 MoE EP dispatch 使用均匀 token 分布（§20.6）。
-   真实训练有非均匀路由。这影响 token 计数相关形状，但不影响通信算子形状
-   （通信形状来自参数维度）。
-
-9. **`mixed_precision_param` 在 meta 上强制为 fp32。** FSDP2 的 bfloat16 转换导致 meta 上
-   DTensor dtype 不匹配。强制 fp32 意味着仿真不捕获混合精度通信模式（如 bfloat16 all_gather）。
-
-10. **激活检查点在 meta 上禁用。** AC 的变更检查在 FakeTensor 上抛出。禁用 AC 意味着仿真
-    不捕获 AC 的内存节省或其对计算图的影响（更少的保存激活值）。
-
-11. **`apply_fsdp` 从 llama4 导入。** deepseek_v4 parallelize 从 `llama4.parallelize`
-    导入 `apply_fsdp`（EP 感知）而非 `llama3.parallelize`。这是跨模型依赖，如果 llama4
-    被上游移除可能中断。
-
-12. **`_reapply_fsdp2_to_parts` 是死代码。** 定义于 `trainer_runner.py` 但不再调用
-    （PP 切分已移除 -- FSDP2 在并行化期间应用于完整模型）。可移除。
+1. **`schedule_generator.py` 已废弃。** 未导出；运行时使用 `extract_schedule_from_pytorch`。
+2. **事件类型分类法不一致**，跨调度文件。统一到 `pp_*`/`fsdp2_*`。
+3. **`Simulator` 编程式 API 不存在。** 见 §22。
+4. **HTML trace 非自包含。** ECharts 从 CDN 加载。
+5. **gloo 模式从 `run_train.sh` 不可达。** Trainer 强制 fake_backend。
+6. **两个 `_DTYPE_BYTES` 表**，键约定不同。
+7. **强制负载均衡是仿真近似。** MoE EP dispatch 在 meta 上使用均匀 token 分布（§20.6）。
+8. **`mixed_precision_param` 在 meta 上强制为 fp32。** bfloat16 导致 DTensor dtype 不匹配。
+9. **激活检查点在 meta 上禁用。** AC 变更检查在 FakeTensor 上抛出。
+10. **`apply_fsdp` 从 llama4 导入。** 跨模型依赖。
+11. **`_reapply_fsdp2_to_parts` 是死代码。** PP 切分已移除；可删除。
+12. **`rewrite_runner.py` 引用已删除的 `_inject_synthetic_comm_events`。** 一次性脚本应删除。
 
 ---
 
 ## 22. 路线图：编程式 `Simulator` API
 
-更高级的编程式 API 已规划但**尚未实现**。设想设计（`AGENTS.md` 中引用）为含三种模式的
-`Simulator` 类：
+更高级的编程式 API 已规划但**尚未实现**。设想设计为含三种模式的 `Simulator` 类：
 
 | 模式 | 目的 | 基础 |
 |------|------|------|
@@ -1014,5 +970,5 @@ from torchtitan.experiments.simulator import Simulator
 result = Simulator(model, config).simulate_runtime()   # 设想
 ```
 
-目前，等价物是捕获用的 `TraceRecorder` + `unified_trace` 直接使用（§3.2），或端到端运行的
-`SimulationTrainer`（§3.1）。在这些原语之上构建 `Simulator` facade 是建议的下一步。
+目前等价物是 `TraceRecorder` + `unified_trace` 直接使用（§3.2）进行捕获，
+或 `SimulationTrainer`（§3.1）进行端到端运行。

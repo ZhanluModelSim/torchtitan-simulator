@@ -1,9 +1,7 @@
 # TorchTitan Simulator -- Architecture Design Document
 
 > **Status note:** This document reflects the **as-built** implementation as of the
-> latest commit. A short history of major phases is kept inline so reviewers can see
-> how the system evolved. Section [21](#21-tech-debt--known-discrepancies) lists known
-> code-vs-doc drift to drive review discussion.
+> latest commit.
 
 ## 1. Overview
 
@@ -58,7 +56,6 @@ simulator/
   schedule/                # Training schedule extraction & generation
     __init__.py            # Exports PPScheduleExtractor, extract_schedule_from_pytorch
     schedule_extract.py    # Extract schedule from real PyTorch PipelineSchedule objects
-    schedule_generator.py  # [ORPHANED] semantic Interleaved1F1B generator (see §9.2)
     pp_schedule_extractor.py # PPScheduleExtractor class (reads pipeline_order tables)
 
   ir/                      # Layered IR (L0-L3) for workload graph export
@@ -166,10 +163,6 @@ with unified_trace(recorder, use_fake_mode=True, phase="forward"):
     output.sum().backward()
 result = recorder.build_result()
 ```
-
-> **Roadmap:** The original design envisioned a higher-level `Simulator` class with
-> `simulate_fx` / `simulate_runtime` / `simulate_pp_schedule` modes (referenced in
-> `AGENTS.md`). This class is **not yet implemented**. See §22 for the roadmap.
 
 ---
 
@@ -334,13 +327,6 @@ SimulationResult
    - _export_workload_graph() -> workload_graph.json (L0-L3 IR)
 ```
 
-> **Note:** `_inject_synthetic_comm_events()` (the old ~490-line FSDP/TP heuristic
-> injector) is **still defined** in `trainer_runner.py` but is **no longer called** in
-> the production path -- it survives only in `tests/test_simulator.py`. Phase 4 natural
-> capture replaced it. See §15 and §21.
-
----
-
 ## 7. Device Environment Layer
 
 Two patching modes enable GPU-free execution:
@@ -471,21 +457,11 @@ adds sequential `control` deps within each PP rank; adds cross-rank PP comm deps
 (`SEND_F(stage=s)->RECV_F(stage=s+1)`, `SEND_B(stage=s)->RECV_B(stage=s-1)`); replicates
 PP-group events across TP/DP sibling ranks; appends an `optimizer_step` event per rank.
 
-### 9.2 Schedule Generator (`schedule_generator.py`) -- ORPHANED
-
-Generates a semantic Interleaved1F1B schedule from parallelism config *without* any real
-PyTorch schedule object. **This module is not exported from `schedule/__init__.py` and is
-not called in the runtime path** (it is only reachable via a backward-compat module
-alias). The runtime uses `extract_schedule_from_pytorch` (§9.1) instead. It is kept as a
-reference implementation. See §21.
-
-### 9.3 PP Schedule Extractor (`pp_schedule_extractor.py`)
+### 9.2 PP Schedule Extractor (`pp_schedule_extractor.py`)
 
 `PPScheduleExtractor` class for extracting from a pre-existing `_PipelineSchedule`
 instance. Primary path delegates to `schedule_extract._convert_pipeline_order_to_training_schedule()`
-(with `tp_degree=1, dp_degree=1`). Fallback: heuristic 1F1B reconstruction. Note the
-heuristic fallback emits a **different event-type taxonomy** (`fwd`/`bwd`/`send_fwd`) than
-the primary path (`pp_forward`/`pp_backward`/`pp_send_activation`) -- see §21.
+(with `tp_degree=1, dp_degree=1`). Fallback: heuristic 1F1B reconstruction.
 
 ---
 
@@ -782,21 +758,37 @@ TP reductions, producing real comm ops in the captured graph.
 Verified on DeepSeek V4 smoketest (PP=2, TP=2, DP=2): **223 natural comm ops**
 (all_gather×85, reduce_scatter×14, all_reduce×19, wait×105), bwd/fwd ratio = 2.15.
 
-### 15.2 Synthetic PP injection (always, for PP > 1)
+### 15.2 Schedule-derived PP communication (replaces synthetic injection)
 
-Pipeline parallelism uses `dist.send()`/`dist.recv()` directly (not DTensor dispatch), so
-PP send/recv cannot be emitted naturally. `_inject_pp_send_recv(result, trainer)` (called
-in the post-processing step) creates `pp_send_activation` / `pp_recv_activation`
-(forward) and `pp_send_gradient` / `pp_recv_gradient` (backward) `OpNode` pairs with
-`comm_op="send"/"recv"`, `comm_group_size=2`, `attrs={"synthetic": True, "pp": True}`.
+Pipeline parallelism uses `dist.send()`/`dist.recv()` directly (not DTensor dispatch),
+so PP send/recv cannot be naturally captured by `UnifiedTraceMode`.  Instead of
+heuristic injection (`_inject_pp_send_recv`, now removed), PP communication is
+**projected from the semantic schedule** via `_project_pp_comm_from_schedule()`:
 
-### 15.3 Synthetic compute anchors (fake_backend)
+1. `_inject_semantic_schedule()` runs first, populating `result.schedule` with PP
+   events (`pp_send_activation`, `pp_recv_activation`, `pp_send_gradient`,
+   `pp_recv_gradient`) derived from the real `_PipelineSchedule.pipeline_order_with_comms`
+   action table.
+2. `_project_pp_comm_from_schedule()` reads rank-0 PP events from `result.schedule`
+   and projects them into the compute graph as `comm_p2p` `OpNode`s with
+   `attrs={"schedule_derived": True, "pp": True}`.
+3. PP send→recv data edges are created from the schedule's `pp_comm` dependencies.
 
-`_inject_synthetic_compute_anchors(result, trainer)` ensures each phase has enough
-"Cube" (matmul-like: `mm`, `matmul`, `bmm`, `addmm`, `linear`, `conv`, `gemm`, `dot`) and
-"Vec" (`aten.add.Tensor`) lane signal for the HTML operator swimlanes. Lane target =
-`max(pp*num_layers, pp)`. Injects synthetic `aten.mm.default` (cube) / `aten.add.Tensor`
-(vec) nodes with `attrs={"synthetic_compute_anchor": True, ...}`.
+This is "schedule-derived" (from real PyTorch schedule) — not "captured" (from
+execution) but not "synthetic" (heuristic) either.  The design principle says
+schedules should come from "captured data **or real PyTorch schedule objects**" —
+this fits.
+
+### 15.3 Compute anchors (conditional, usually skipped)
+
+`_inject_synthetic_compute_anchors(result, trainer)` checks if each phase has enough
+"Cube" (matmul-like) and "Vec" (`aten.add.Tensor`) lane signal for the HTML operator
+swimlanes. If the natural capture already exceeds the threshold (`pp * num_layers`),
+it returns immediately without injecting anything.
+
+With Phase 4, the model is actually run (via `SequentialPipelineSchedule`), producing
+thousands of real compute nodes. The anchors are **effectively always skipped** —
+verified on smoketest: 5935 natural compute nodes vs threshold of 4.
 
 ### 15.4 gloo Mode
 
@@ -808,7 +800,7 @@ Real CPU communication capture:
 
 > **Note:** gloo mode is effectively unreachable from `run_train.sh` today because
 > `SimulationTrainer.__init__` forces `config.comm.mode = "fake_backend"`, which then
-> overrides `comm_backend = ""`. See §21.
+> overrides `comm_backend = ""`.
 
 ---
 
@@ -929,8 +921,8 @@ Two duck-typed hooks for external side-loads (e.g. torchtitan-npu):
 
 ### 20.1 Problem it solved
 
-The original `_inject_synthetic_comm_events()` used heuristic assumptions: uniform layer
-distribution, manual tensor-size calculation, hardcoded patterns (e.g. 2 TP all_reduce
+The earlier heuristic communication-injection path used assumptions such as uniform layer
+distribution, manual tensor-size calculation, and hardcoded patterns (e.g. 2 TP all_reduce
 per layer). This was not capture-faithful.
 
 ### 20.2 Meta device patches (`meta_device_patches.py`) — 7 patches
@@ -1007,7 +999,6 @@ parameter dimensions, not token counts).
 
 ### 20.7 Remaining limitations
 
-- **PP send/recv still requires injection** — PP uses `dist.send()`/`dist.recv()`.
 - **Meta device patches are fragile** — depend on PyTorch internal implementation.
 - **Forced load-balance is an approximation** — real MoE routing is non-uniform.
 - **Pro 61-layer E2E is slow** (~8 min/step) — use 4-layer config for faster testing.
@@ -1018,55 +1009,23 @@ parameter dimensions, not token counts).
 
 ## 21. Tech Debt & Known Discrepancies
 
-Items flagged for review discussion:
-
-1. **`_inject_synthetic_comm_events` is dead code.** Defined in `trainer_runner.py`
-   but **not called** in production -- only used in `tests/test_simulator.py`. Phase 4
-   natural capture superseded it. Candidate for removal once legacy tests are migrated.
-
-2. **`schedule_generator.py` is orphaned.** Not exported from `schedule/__init__.py`
-   and not on the runtime path; the runtime uses `extract_schedule_from_pytorch`.
-
-3. **Event-type taxonomy is inconsistent** across schedule files:
-   - `schedule_extract.py` (primary): `pp_forward`, `pp_send_activation`, ...
-   - `pp_schedule_extractor.py` (heuristic fallback): `fwd`, `bwd`, `send_fwd`, ...
-   - `schedule_generator.py` (orphaned): `pp_forward`, `tp_all_reduce`, ...
-   Recommendation: unify on the `pp_*` / `fsdp2_*` taxonomy.
-
-4. **`Simulator` programmatic API does not exist.** `AGENTS.md` references a
-   `Simulator` class with `simulate_fx`/`simulate_runtime`/`simulate_pp_schedule`.
-   See §22 roadmap.
-
-5. **HTML trace is not fully self-contained.** ECharts 5.4.3 loaded from `cdn.jsdelivr.net`.
-   Either vendor ECharts or correct the docs.
-
-6. **gloo mode unreachable from `run_train.sh`.** `SimulationTrainer.__init__` forces
-   `config.comm.mode = "fake_backend"`, which then overrides `comm_backend = ""`.
-
-7. **Two `_DTYPE_BYTES` tables** with different key conventions:
-   `ir/op_node.py` uses `"torch.float32"` keys (default 4); `ir/workload_graph.py` uses
-   `"float32"` keys (default 8). Risk of silent byte-miscalculation.
-
-8. **Forced load-balance is a simulation approximation.** The MoE EP dispatch on meta
-   uses uniform token distribution (§20.6). Real training has non-uniform routing.
-   This affects token-count-dependent shapes but not comm op shapes (which come from
-   parameter dimensions).
-
-9. **`mixed_precision_param` forced to fp32 on meta.** FSDP2's bfloat16 casting causes
-   DTensor dtype mismatch on meta. The forced fp32 means the simulation doesn't
-   capture mixed-precision communication patterns (e.g. bfloat16 all_gather).
-
-10. **Activation checkpointing disabled on meta.** AC's mutation check raises on
-    FakeTensors. Disabling AC means the simulation doesn't capture AC's memory savings
-    or its impact on the compute graph (fewer saved activations).
-
-11. **`apply_fsdp` imported from llama4.** The deepseek_v4 parallelize imports
-    `apply_fsdp` from `llama4.parallelize` (EP-aware) instead of `llama3.parallelize`.
-    This is a cross-model dependency that may break if llama4 is removed from upstream.
-
-12. **`_reapply_fsdp2_to_parts` is dead code.** Defined in `trainer_runner.py` but
-    no longer called (PP split was removed — FSDP2 is applied to the full model
-    during parallelize). Candidate for removal.
+1. **`schedule_generator.py` is orphaned.** Not exported; runtime uses
+   `extract_schedule_from_pytorch`.
+2. **Event-type taxonomy inconsistent** across schedule files. Unify on `pp_*`/`fsdp2_*`.
+3. **`Simulator` programmatic API does not exist.** See §22.
+4. **HTML trace not self-contained.** ECharts from CDN.
+5. **gloo mode unreachable from `run_train.sh`.** Trainer forces fake_backend.
+6. **Two `_DTYPE_BYTES` tables** with different key conventions.
+7. **Forced load-balance is a simulation approximation.** MoE EP dispatch uses
+   uniform token distribution on meta (§20.6).
+8. **`mixed_precision_param` forced to fp32 on meta.** bfloat16 causes DTensor
+   dtype mismatch.
+9. **Activation checkpointing disabled on meta.** AC mutation check raises on
+   FakeTensors.
+10. **`apply_fsdp` imported from llama4.** Cross-model dependency.
+11. **`_reapply_fsdp2_to_parts` is dead code.** PP split removed; candidate for removal.
+12. **`rewrite_runner.py` references deleted `_inject_synthetic_comm_events`.**
+    One-off script should be deleted.
 
 ---
 
@@ -1088,5 +1047,4 @@ result = Simulator(model, config).simulate_runtime()   # intended
 ```
 
 Today, the equivalent is the `TraceRecorder` + `unified_trace` direct usage (§3.2) for
-capture, or `SimulationTrainer` (§3.1) for end-to-end runs. Building the `Simulator`
-facade on top of these primitives is the proposed next step.
+capture, or `SimulationTrainer` (§3.1) for end-to-end runs.
