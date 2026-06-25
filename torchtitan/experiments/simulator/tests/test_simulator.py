@@ -640,35 +640,17 @@ class TestExport(unittest.TestCase):
             with open(path) as f:
                 content = f.read()
             assert "TorchTitan Simulation Trace" in content
-            assert "operator swimlane" in content
             # Check for ECharts library
             assert "echarts" in content
-            # Check for new visualization containers
+            # Check for visualization containers
             assert "memory-timeline" in content
             assert "timeline-" in content
-            assert "swimlane-" in content
-            # Check for swimlane categories
-            assert "Cube" in content
-            assert "Vec" in content
-            assert "Communication" in content
             # Check for summary cards
             assert "Per-GPU model state" in content
             assert "Whole-model state" in content
             assert "Activation peak" in content
             assert "Memory estimate summary" in content
             assert "Memory trace timeline" in content
-
-    def test_export_html_operator_swimlane_comm_scope_defaults_to_model_only(self):
-        from torchtitan.experiments.simulator.export import export_html
-
-        result = self._make_result()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "trace.html")
-            export_html(result, path)
-            with open(path) as f:
-                content = f.read()
-            assert "operator_swimlane_comm_scope" in content
-            assert "model_only" in content
 
     def test_is_cluster_parallel_comm_node(self):
         from torchtitan.experiments.simulator.export import (
