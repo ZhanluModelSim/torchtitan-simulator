@@ -7,30 +7,28 @@
 """
 Meta device patches for FSDP2 simulation.
 
-Enables FSDP2 (fully_shard) to run on meta device by patching PyTorch
-internal functions:
+Applies 7 patches to enable FSDP2/DTensor/MoE to run on meta device and
+naturally emit communication operators:
 
 1. Skip _validate_no_meta_params -- FSDP2 normally rejects meta parameters
 2. Patch FakeTensor._find_common_device -- Allow mixed meta/cpu tensors
 3. Patch wrap_meta_outputs -- Convert CPU tensors to meta for FSDP buffers
-4. Patch foreach_reduce -- Coerce unsharded_grads to a uniform dtype so the
-   FSDP2 reduce-scatter dtype-uniformity assertion does not fire on meta/fake
-   tensors (mixed-precision training can produce bfloat16 + float32 grads)
-
-These patches allow natural emission of FSDP2 communication operators
-(all_gather, reduce_scatter) without synthetic injection.
+4. Patch foreach_reduce -- Coerce mixed-dtype gradients to uniform dtype
+5. Patch _unimplemented_deepcopy -- Allow FSDP module deepcopy (PP splitting)
+6. Patch nn.Module.to_empty -- No-op on meta (preserve FSDP2 sharding state)
+7. Patch repeat_interleave -- Return placeholder for dynamic output shapes
 
 Usage:
     from torchtitan.experiments.simulator.meta_device_patches import (
         apply_meta_device_patches,
         restore_meta_device_patches,
     )
-    
+
     # Apply patches before unified_trace
     apply_meta_device_patches()
-    
+
     # ... run unified_trace with FSDP2 on meta device ...
-    
+
     # Restore patches after unified_trace
     restore_meta_device_patches()
 """
@@ -212,14 +210,16 @@ def _collect_identity_copy_objects(obj, memo, seen=None):
 
 def apply_meta_device_patches() -> None:
     """
-    Apply patches to enable FSDP2 on meta device.
-    
+    Apply 7 patches to enable FSDP2/DTensor/MoE on meta device.
+
     Patches:
     1. FSDPParamGroup._validate_no_meta_params -- Skip meta parameter validation
     2. FakeTensor._find_common_device -- Allow mixed meta/cpu for FSDP ops
     3. FakeTensorMode.wrap_meta_outputs_with_default_device_logic -- Convert CPU to meta
     4. _fsdp_collectives.foreach_reduce -- Coerce mixed-dtype gradients to uniform dtype
     5. _fully_shard._unimplemented_deepcopy -- Allow FSDP module deepcopy for PP splitting
+    6. nn.Module.to_empty -- No-op on meta (preserve FSDP2 sharding state)
+    7. fake_impls repeat_interleave -- Return placeholder for dynamic output shapes
 
     Must be called before running unified_trace with FSDP2 on meta device.
     Call restore_meta_device_patches() after unified_trace completes.

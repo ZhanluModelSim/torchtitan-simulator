@@ -37,7 +37,7 @@ simulator/
   op_classification.py     # 统一的算子分类（compute/comm/data_move/memory）
   cpu_env.py               # CPU 设备补丁（monkey-patch torch.cuda -> CPU 桩）
   meta_env.py              # Meta 设备补丁（0 字节张量，用于大模型仿真）
-  meta_device_patches.py   # Phase 4：3 个 FSDP2 补丁，启用 meta 上的自然通信
+  meta_device_patches.py   # Phase 4：7 个 meta 设备补丁，启用 meta 上的自然通信
   synthetic_dataloader.py  # SyntheticTokenDataLoader（随机 token 生成）
   extension_hooks.py       # NPU/其他 side-load 的扩展点
 
@@ -297,9 +297,9 @@ SimulationResult
 3. 后处理
    - result = recorder.build_result()
    - 设置 metadata（operator_swimlane_comm_scope、gradient_accumulation_steps）
-   - [use_fake] _inject_synthetic_compute_anchors(result, trainer)  # Cube/Vec 泳道
-   - [use_fake] _inject_pp_send_recv(result, trainer)              # PP 仍为合成
-   - [semantic_schedule] _inject_semantic_schedule(result, config)  # 真实 PyTorch 调度
+   - [semantic_schedule] _inject_semantic_schedule(result, config) # 真实 PyTorch 调度
+   - [use_fake] _project_pp_comm_from_schedule(result, trainer)   # PP 调度投影
+   - [use_fake] _inject_synthetic_compute_anchors(result, trainer) # 条件注入(通常跳过)
    - [cost_model] apply_cost_model(result, cm)
    - 内存估算（build_runtime_memory + attach_model_state_memory）
    - postprocess_extension_result(result, trainer, sim_opts)        # 鸭子类型 hook
@@ -906,7 +906,7 @@ TP all_reduce）等假设。这不捕获忠实。
 Phase 4 后，仿真结果的通信来自：
 - **自然**（TP/FSDP2/EP）：来自 DTensor/FSDP2 dispatch 的精确形状。验证：smoketest 上 223 个算子
   （all_gather, reduce_scatter, all_reduce, wait_tensor）。
-- **合成 PP**（`_inject_pp_send_recv`）：仍为启发式，因为 PP 直接使用 `dist.send/recv`。
+- **调度投影 PP**（`_project_pp_comm_from_schedule`）：从真实 `_PipelineSchedule` 投影，shape 由配置估计。
 - **合成计算锚点**（`_inject_synthetic_compute_anchors`）：用于可视化的 Cube/Vec 泳道填充。
 
 ### 20.6 强制负载均衡 MoE dispatch（仅 meta）
@@ -939,18 +939,22 @@ FSDP2 all_gather/reduce_scatter），确切 token 计数不影响通信形状（
 
 ## 21. 技术债 & 已知差异
 
-1. **`schedule_generator.py` 已废弃。** 未导出；运行时使用 `extract_schedule_from_pytorch`。
-2. **事件类型分类法不一致**，跨调度文件。统一到 `pp_*`/`fsdp2_*`。
-3. **`Simulator` 编程式 API 不存在。** 见 §22。
-4. **HTML trace 非自包含。** ECharts 从 CDN 加载。
-5. **gloo 模式从 `run_train.sh` 不可达。** Trainer 强制 fake_backend。
-6. **两个 `_DTYPE_BYTES` 表**，键约定不同。
-7. **强制负载均衡是仿真近似。** MoE EP dispatch 在 meta 上使用均匀 token 分布（§20.6）。
-8. **`mixed_precision_param` 在 meta 上强制为 fp32。** bfloat16 导致 DTensor dtype 不匹配。
-9. **激活检查点在 meta 上禁用。** AC 变更检查在 FakeTensor 上抛出。
-10. **`apply_fsdp` 从 llama4 导入。** 跨模型依赖。
-11. **`_reapply_fsdp2_to_parts` 是死代码。** PP 切分已移除；可删除。
-12. **`rewrite_runner.py` 引用已删除的 `_inject_synthetic_comm_events`。** 一次性脚本应删除。
+1. **事件类型分类法不一致**，跨调度文件。统一到 `pp_*`/`fsdp2_*`。
+2. **`Simulator` 编程式 API 不存在。** 见 §22。
+3. **HTML trace 非自包含。** ECharts 从 CDN 加载。
+4. **gloo 模式从 `run_train.sh` 不可达。** Trainer 强制 fake_backend。
+5. **强制负载均衡是仿真近似。** MoE EP dispatch 在 meta 上使用均匀 token 分布（§20.6）。
+6. **`mixed_precision_param` 在 meta 上强制为 fp32。** bfloat16 导致 DTensor dtype 不匹配。
+7. **激活检查点在 meta 上禁用。** AC 变更检查在 FakeTensor 上抛出。
+8. **`apply_fsdp` 从 llama4 导入。** 跨模型依赖。
+9. **DeepSeek 特化逻辑在 `trainer.py` 中。** `expert_parallel_comm_backend`、
+   `fsdp_gradient_divide_factor`、`get_optional_mesh` 补丁和模型名字符串判断是
+   DeepSeek 特定的，但位于通用仿真器 wrapper 中。应迁移到模型适配层。
+10. **仿真器逻辑在核心模型文件中。** `token_dispatcher.py` 有 `_is_fake` 强制负载均衡
+    分支。已标注为 simulator-only 但未隔离到 `experiments/simulator/`。
+11. **`collect_extension_metadata` 已定义但未调用。** 扩展包在捕获阶段无法收集 metadata。
+12. **配置项已定义但未实现。** `mode`、`capture_joint_fx`、`max_seq_len`、`batch_size`
+    已定义但未被消费。已标注为"Reserved for future use。"
 
 ---
 

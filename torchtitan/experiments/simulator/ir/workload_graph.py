@@ -82,15 +82,7 @@ class WorkloadGraph:
             "total_runtime_est": self.total_runtime_est,
             "total_cost_est": self.total_cost_est,
         }
-
-
-_DTYPE_BYTES = {
-    "int64": 8,
-    "int32": 4,
-    "bfloat16": 2,
-    "float16": 2,
-    "float32": 4,
-}
+from .op_node import _DTYPE_BYTES
 
 
 class WorkloadBuilder:
@@ -117,7 +109,7 @@ class WorkloadBuilder:
 
         data_inputs: list[DataFlow] = []
         if seq_len and batch:
-            volume = batch * seq_len * _DTYPE_BYTES.get(token_dtype, 8) * max(1, ga)
+            volume = batch * seq_len * _DTYPE_BYTES.get(token_dtype, 4) * max(1, ga)
             data_inputs.append(
                 DataFlow(
                     source="dataloader",

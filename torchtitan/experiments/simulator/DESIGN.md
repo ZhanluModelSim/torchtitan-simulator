@@ -45,7 +45,7 @@ simulator/
   op_classification.py     # Unified op classification (compute/comm/data_move/memory)
   cpu_env.py               # CPU device patching (monkey-patches torch.cuda -> CPU stubs)
   meta_env.py              # Meta device patching (0-byte tensors for large model sim)
-  meta_device_patches.py   # Phase 4: 3 FSDP2 patches enabling natural comm on meta
+  meta_device_patches.py   # Phase 4: 7 meta device patches enabling natural comm on meta
   synthetic_dataloader.py  # SyntheticTokenDataLoader (random token generation)
   extension_hooks.py       # Extension points for NPU/other side-loads
 
@@ -315,9 +315,9 @@ SimulationResult
 3. Post-processing
    - result = recorder.build_result()
    - Set metadata (operator_swimlane_comm_scope, gradient_accumulation_steps)
-   - [use_fake] _inject_synthetic_compute_anchors(result, trainer)  # Cube/Vec lanes
-   - [use_fake] _inject_pp_send_recv(result, trainer)              # PP still synthetic
    - [semantic_schedule] _inject_semantic_schedule(result, config) # real PyTorch schedule
+   - [use_fake] _project_pp_comm_from_schedule(result, trainer)   # PP schedule projection
+   - [use_fake] _inject_synthetic_compute_anchors(result, trainer) # conditional (usually skipped)
    - [cost_model] apply_cost_model(result, cm)
    - Memory estimation (build_runtime_memory + attach_model_state_memory)
    - postprocess_extension_result(result, trainer, sim_opts)       # duck-typed hook
@@ -970,8 +970,8 @@ during the trace (triggering FSDP2/TP hooks):
 After Phase 4, a simulation result's communication comes from:
 - **Natural** (TP/FSDP2/EP): exact shapes from DTensor/FSDP2 dispatch. Verified: 223
   ops on smoketest (all_gather, reduce_scatter, all_reduce, wait_tensor).
-- **Synthetic PP** (`_inject_pp_send_recv`): still heuristic, because PP uses
-  `dist.send/recv` directly.
+- **Schedule-derived PP** (`_project_pp_comm_from_schedule`): projected from real
+  `_PipelineSchedule`, shapes estimated from config.
 - **Synthetic compute anchors** (`_inject_synthetic_compute_anchors`): Cube/Vec lane
   padding for visualization.
 
@@ -1009,23 +1009,29 @@ parameter dimensions, not token counts).
 
 ## 21. Tech Debt & Known Discrepancies
 
-1. **`schedule_generator.py` is orphaned.** Not exported; runtime uses
-   `extract_schedule_from_pytorch`.
-2. **Event-type taxonomy inconsistent** across schedule files. Unify on `pp_*`/`fsdp2_*`.
-3. **`Simulator` programmatic API does not exist.** See §22.
-4. **HTML trace not self-contained.** ECharts from CDN.
-5. **gloo mode unreachable from `run_train.sh`.** Trainer forces fake_backend.
-6. **Two `_DTYPE_BYTES` tables** with different key conventions.
-7. **Forced load-balance is a simulation approximation.** MoE EP dispatch uses
+1. **Event-type taxonomy inconsistent** across schedule files. Unify on `pp_*`/`fsdp2_*`.
+2. **`Simulator` programmatic API does not exist.** See §22.
+3. **HTML trace not self-contained.** ECharts from CDN.
+4. **gloo mode unreachable from `run_train.sh`.** Trainer forces fake_backend.
+5. **Forced load-balance is a simulation approximation.** MoE EP dispatch uses
    uniform token distribution on meta (§20.6).
-8. **`mixed_precision_param` forced to fp32 on meta.** bfloat16 causes DTensor
+6. **`mixed_precision_param` forced to fp32 on meta.** bfloat16 causes DTensor
    dtype mismatch.
-9. **Activation checkpointing disabled on meta.** AC mutation check raises on
+7. **Activation checkpointing disabled on meta.** AC mutation check raises on
    FakeTensors.
-10. **`apply_fsdp` imported from llama4.** Cross-model dependency.
-11. **`_reapply_fsdp2_to_parts` is dead code.** PP split removed; candidate for removal.
-12. **`rewrite_runner.py` references deleted `_inject_synthetic_comm_events`.**
-    One-off script should be deleted.
+8. **`apply_fsdp` imported from llama4.** Cross-model dependency.
+9. **DeepSeek-specific logic in `trainer.py`.** `expert_parallel_comm_backend`,
+   `fsdp_gradient_divide_factor`, `get_optional_mesh` patches, and model-name
+   string checks are DeepSeek-specific but live in the generic simulator wrapper.
+   Should be moved to a model adapter layer.
+10. **Simulator logic in core model files.** `token_dispatcher.py` has a
+    `_is_fake` branch for forced load-balance. Annotated as simulator-only but
+    not isolated to `experiments/simulator/`.
+11. **`collect_extension_metadata` defined but not called.** Extension packages
+    cannot collect metadata during capture.
+12. **Config fields reserved but unimplemented.** `mode`, `capture_joint_fx`,
+    `max_seq_len`, `batch_size` are defined but not consumed. Annotated as
+    "Reserved for future use."
 
 ---
 

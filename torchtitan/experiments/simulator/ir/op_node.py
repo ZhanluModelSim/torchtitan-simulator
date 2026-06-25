@@ -23,20 +23,20 @@ from typing import Any
 from ..nodes import ComputeGraph, OpNode, TensorMeta
 
 _DTYPE_BYTES: dict[str, int] = {
-    "torch.float64": 8,
-    "torch.float32": 4,
+    "torch.float64": 8, "float64": 8,
+    "torch.float32": 4, "float32": 4,
     "torch.float": 4,
-    "torch.bfloat16": 2,
-    "torch.float16": 2,
+    "torch.bfloat16": 2, "bfloat16": 2,
+    "torch.float16": 2, "float16": 2, "half": 2,
     "torch.half": 2,
-    "torch.int64": 8,
+    "torch.int64": 8, "int64": 8, "long": 8,
     "torch.long": 8,
-    "torch.int32": 4,
+    "torch.int32": 4, "int32": 4, "int": 4,
     "torch.int": 4,
-    "torch.int16": 2,
-    "torch.int8": 1,
-    "torch.uint8": 1,
-    "torch.bool": 1,
+    "torch.int16": 2, "int16": 2,
+    "torch.int8": 1, "int8": 1,
+    "torch.uint8": 1, "uint8": 1,
+    "torch.bool": 1, "bool": 1,
 }
 
 

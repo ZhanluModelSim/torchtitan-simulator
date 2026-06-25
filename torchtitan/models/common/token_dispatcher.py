@@ -246,15 +246,11 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
             )
 
         # ------------------------------------------------------------------
-        # Forced load-balance path for meta / fake-tensor simulation.
+        # Simulator-only: forced load-balance path for meta / fake-tensor.
         #
-        # On meta device, FakeTensors carry no real values, so bincount /
-        # all_to_all / .tolist() all produce zeros, leading to zero-sized
-        # splits and dynamic-shape crashes downstream.  When the input is a
-        # FakeTensor (or on meta device), bypass the dynamic token-count
-        # path and assume tokens are uniformly distributed across experts.
-        # This gives concrete, non-zero split lists so all downstream shapes
-        # are static and consistent.
+        # This branch is activated only when FakeTensors are detected (meta
+        # device simulation). It is NOT used in real training. See
+        # torchtitan/experiments/simulator/DESIGN.md §20.6 for rationale.
         # ------------------------------------------------------------------
         _is_fake = any(
             isinstance(t, torch.Tensor) and hasattr(t, "fake_mode")

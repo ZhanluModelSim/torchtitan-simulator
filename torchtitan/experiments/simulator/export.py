@@ -13,8 +13,9 @@ Supported formats
 * **JSON** — full structured dump, loadable back into Python dicts.
 * **DOT** — Graphviz dot format with colour-coded nodes by op type.
 * **Chrome Trace** — ``chrome://tracing`` compatible JSON for timeline views.
-* **HTML** — self-contained interactive visualization with expandable training
-  steps, swimlane schedules, and per-phase operator DAGs.
+* **HTML** — interactive visualization with expandable training
+  steps, swimlane schedules, and per-phase operator DAGs. Data is embedded
+  inline; ECharts 5.4.3 is loaded from CDN (not fully offline).
 * **Text summary** — human-readable console output with statistics.
 """
 
@@ -1021,11 +1022,10 @@ def export_html(
     max_dag_nodes_per_phase: int = 220,
 ) -> None:
     """
-    Write a self-contained HTML visualization using ECharts and AntV G6.
+    Write an interactive HTML visualization using ECharts.
 
-    Uses ECharts for timeline/swimlane visualization and AntV G6 for DAG
-    visualization. These libraries provide better performance and interactivity
-    compared to custom canvas rendering.
+    Data is embedded inline in the HTML. ECharts 5.4.3 is loaded from
+    CDN (``cdn.jsdelivr.net``); the page is not fully offline.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     schedule_events = _schedule_events_for_html(result)

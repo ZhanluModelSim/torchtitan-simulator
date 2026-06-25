@@ -26,9 +26,13 @@ class SimulationConfig:
         default_factory=lambda: ["json", "dot", "chrome_trace", "html", "text", "csv"]
     )
     mode: str = "all"
+    """Reserved for future use. Currently all modes produce the same output."""
     max_seq_len: int = 128
+    """Reserved for future use. Actual seq_len comes from training config."""
     batch_size: int = 2
+    """Reserved for future use. Actual batch size comes from training config."""
     capture_joint_fx: bool = False
+    """Reserved for future use. Joint fwd+bwd FX capture not yet implemented."""
     semantic_schedule: bool = False
     cost_model: bool = False
     """When ``True``, run a :class:`CostModel` over the compute graph.

@@ -53,9 +53,6 @@ _MODULE_ALIASES = {
     "torchtitan.experiments.simulator.schedule_extract": (
         "torchtitan.experiments.simulator.schedule.schedule_extract"
     ),
-    "torchtitan.experiments.simulator.schedule_generator": (
-        "torchtitan.experiments.simulator.schedule.schedule_generator"
-    ),
 }
 
 for _old_mod, _new_mod in _MODULE_ALIASES.items():
