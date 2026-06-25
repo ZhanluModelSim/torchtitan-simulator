@@ -1449,6 +1449,7 @@ class TestCostModel(unittest.TestCase):
         flops = _estimate_flops(node)
         assert flops == 5 * 4, f"silu should be 5 FLOPs/elem, got {flops}"
 
+
 class TestSyntheticComputeAnchors(unittest.TestCase):
     def test_inject_synthetic_compute_adds_backward_compute(self):
         from torchtitan.experiments.simulator.nodes import (
@@ -2319,9 +2320,6 @@ class TestMetaDevicePatch(unittest.TestCase):
             tt_utils.device_module = original_dm
 
 
-
-
-
 class TestFSDP1FakeProcessGroupIntegration(unittest.TestCase):
     """Test that FSDP1 + FakeProcessGroup + CommRecorder captures
     all_gather / reduce_scatter events without multi-process execution."""
@@ -2891,6 +2889,136 @@ class TestDESEngine(unittest.TestCase):
         step_time = simulate_multi_rank_des(result)
         assert step_time > 0, f"Expected positive step time, got {step_time}"
         assert all(e.des_start_time_us is not None for e in schedule.events)
+
+
+class TestRankSemanticExpansion(unittest.TestCase):
+    def _fake_trainer(self):
+        from types import SimpleNamespace
+
+        training = SimpleNamespace(
+            mixed_precision_param="bfloat16",
+            mixed_precision_reduce="float32",
+            seq_len=4,
+            local_batch_size=2,
+        )
+        return SimpleNamespace(
+            config=SimpleNamespace(training=training),
+            model_parts=[],
+        )
+
+    def _two_rank_pp_send_result(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            ScheduleEvent,
+            SimulationResult,
+            TrainingSchedule,
+        )
+
+        schedule = TrainingSchedule()
+        for rank in (0, 1):
+            schedule.add_event(
+                ScheduleEvent(
+                    f"send_r{rank}",
+                    "pp_send_activation",
+                    rank=rank,
+                    pp_stage=0,
+                    pp_rank=0,
+                    microbatch_idx=0,
+                )
+            )
+        return SimulationResult(compute_graph=ComputeGraph(), schedule=schedule)
+
+    def test_pp_comm_projection_preserves_rank_specific_events(self):
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _project_pp_comm_from_schedule,
+        )
+
+        result = self._two_rank_pp_send_result()
+
+        _project_pp_comm_from_schedule(result, self._fake_trainer())
+
+        pp_nodes = [
+            node
+            for node in result.compute_graph.nodes.values()
+            if node.op_type == "comm_p2p"
+        ]
+        assert len(pp_nodes) == 2
+        assert {node.rank for node in pp_nodes} == {0, 1}
+        assert {node.attrs.get("schedule_event_id") for node in pp_nodes} == {
+            "send_r0",
+            "send_r1",
+        }
+
+    def test_schedule_linking_uses_rank_specific_pp_comm_nodes(self):
+        from torchtitan.experiments.simulator.cost_model import link_schedule_to_graph
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            PerfResult,
+            ScheduleEvent,
+            SimulationResult,
+            TrainingSchedule,
+        )
+
+        graph = ComputeGraph()
+        for rank in (0, 1):
+            graph.add_node(
+                OpNode(
+                    f"send_node_r{rank}",
+                    "pp_send_activation",
+                    "comm_p2p",
+                    "forward",
+                    [],
+                    [],
+                    attrs={
+                        "schedule_derived": True,
+                        "pp": True,
+                        "schedule_event_id": f"send_r{rank}",
+                    },
+                    rank=rank,
+                    pp_stage=0,
+                    microbatch_idx=0,
+                    perf_result=PerfResult(total_time_us=7.0, comm_time_us=7.0),
+                )
+            )
+
+        schedule = TrainingSchedule()
+        for rank in (0, 1):
+            schedule.add_event(
+                ScheduleEvent(
+                    f"send_r{rank}",
+                    "pp_send_activation",
+                    rank=rank,
+                    pp_stage=0,
+                    pp_rank=0,
+                    microbatch_idx=0,
+                )
+            )
+        result = SimulationResult(compute_graph=graph, schedule=schedule)
+
+        link_schedule_to_graph(result)
+
+        by_rank = {event.rank: event.op_node_ids for event in schedule.events}
+        assert by_rank == {0: ["send_node_r0"], 1: ["send_node_r1"]}
+
+    def test_kernel_summary_writes_rank_specific_pp_comm_files(self):
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+        from torchtitan.experiments.simulator.nodes import PerfResult
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _project_pp_comm_from_schedule,
+        )
+
+        result = self._two_rank_pp_send_result()
+        _project_pp_comm_from_schedule(result, self._fake_trainer())
+        for node in result.compute_graph.nodes.values():
+            node.perf_result = PerfResult(total_time_us=3.0, comm_time_us=3.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+
+            assert os.path.exists(os.path.join(tmpdir, "kernel_summary_rank0.csv"))
+            assert os.path.exists(os.path.join(tmpdir, "kernel_summary_rank1.csv"))
 
 
 class TestDESUtilization(unittest.TestCase):

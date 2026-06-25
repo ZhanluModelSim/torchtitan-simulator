@@ -24,6 +24,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+from collections import Counter
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -77,10 +78,11 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Kernel-summary CSV export (CUDA / CANN kernel_summary compatible)
+# Kernel-summary CSV export (CUDA / Ascend kernel_summary compatible)
 # ---------------------------------------------------------------------------
 
 _KERNEL_SUMMARY_HEADER = [
+    "Rank",
     "Order",
     "Name",
     "Type",
@@ -142,6 +144,7 @@ def _kernel_summary_rows(result: SimulationResult) -> list[dict[str, Any]]:
 
         rows.append(
             {
+                "Rank": node.rank,
                 "Order": order,
                 "Name": node.op_name,
                 "Type": node.op_type,
@@ -166,24 +169,44 @@ def _kernel_summary_rows(result: SimulationResult) -> list[dict[str, Any]]:
 def export_kernel_summary_csv(
     result: SimulationResult, path: str | os.PathLike
 ) -> None:
-    """Write a per-operator kernel trace CSV.
+    """Write per-operator kernel trace CSVs, split by rank.
 
-    The layout mirrors CUDA (nsys) / CANN (msprof) ``kernel_summary`` exports:
+    The layout mirrors CUDA (nsys) / Ascend (msprof) ``kernel_summary`` exports:
     one row per operator with name, execution order, start/end time, duration,
     and a per-op breakdown (compute vs. communication time, FLOPs, bytes).
 
     Covers the full forward + backward + optimizer step.
 
+    Outputs:
+    - ``kernel_summary.csv`` — all ranks combined (with Rank column)
+    - ``kernel_summary_rank{N}.csv`` — one file per rank
+
     Args:
         result: The simulation result to serialize.
-        path: Output CSV file path (created / overwritten).
+        path: Output CSV file path (base path; per-rank files derive from it).
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     rows = _kernel_summary_rows(result)
+
+    # Combined CSV (all ranks, with Rank column)
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=_KERNEL_SUMMARY_HEADER)
         writer.writeheader()
         writer.writerows(rows)
+
+    # Per-rank CSVs
+    base = str(path).rsplit(".", 1)[0]  # "kernel_summary" from "kernel_summary.csv"
+    rank_rows: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        r = row.get("Rank", 0)
+        rank_rows.setdefault(r, []).append(row)
+
+    for r, r_rows in sorted(rank_rows.items()):
+        rank_path = f"{base}_rank{r}.csv"
+        with open(rank_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_KERNEL_SUMMARY_HEADER)
+            writer.writeheader()
+            writer.writerows(r_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1063,11 @@ def export_html(
     if not phases:
         phases = ["unknown"]
     graph_summary = result.compute_graph.summary()
+    graph_comm_ops_count = sum(
+        1
+        for n in result.compute_graph.nodes.values()
+        if n.op_type in ("comm_collective", "comm_p2p")
+    )
     memory_summary = result.metadata.get("memory", {}) or {}
     peak_memory = memory_summary.get(
         "peak_live_bytes", memory_summary.get("graph_peak_live_bytes", 0)
@@ -1061,12 +1089,13 @@ def export_html(
     steps = sorted({_event_step(ev) for ev in schedule_events}) or [0]
     has_des = (
         "des_engine" in result.metadata
-        or any(n.des_start_time_us is not None
-               for n in result.compute_graph.nodes.values())
-        or (result.schedule is not None and any(
-            ev.des_start_time_us is not None
-            for ev in result.schedule.events
-        ))
+        or any(
+            n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
+        )
+        or (
+            result.schedule is not None
+            and any(ev.des_start_time_us is not None for ev in result.schedule.events)
+        )
     )
     des_cards = ""
     if has_des:
@@ -1113,8 +1142,19 @@ def export_html(
   <title>{escape(title)}</title>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
   <style>
-    :root {{ --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#94a3b8; --border:#334155; }}
-    body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }}
+    :root {{
+      --bg:#0f172a;
+      --panel:#111827;
+      --text:#e5e7eb;
+      --muted:#94a3b8;
+      --border:#334155;
+    }}
+    body {{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      background:var(--bg);
+      color:var(--text);
+    }}
     header {{ padding:24px 28px; background:#020617; border-bottom:1px solid var(--border); }}
     main {{ padding:20px 28px 60px; }}
     h1 {{ margin:0 0 8px; font-size:24px; }}
@@ -1137,7 +1177,7 @@ def export_html(
       <div class="card"><div class="num">{len(result.compute_graph.nodes)}</div><div>Operator nodes</div></div>
       <div class="card"><div class="num">{len(result.compute_graph.edges)}</div><div>Graph edges</div></div>
       <div class="card"><div class="num">{len(schedule_events)}</div><div>Swimlane events</div></div>
-      <div class="card"><div class="num">{sum(1 for n in result.compute_graph.nodes.values() if n.op_type in ('comm_collective','comm_p2p'))}</div><div>Graph comm ops</div></div>
+      <div class="card"><div class="num">{graph_comm_ops_count}</div><div>Graph comm ops</div></div>
       <div class="card"><div class="num">{len(result.comm_events)}</div><div>PP projected events</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(per_gpu_model_state))}</div><div>Per-GPU model state</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(whole_model_state))}</div><div>Whole-model state</div></div>
@@ -1187,19 +1227,25 @@ def export_html(
     const desMemory = TRACE.metadata?.des_memory || {{}};
     const memoryTimeline = desMemory.timeline || [];
     const memoryMeta = TRACE.metadata?.memory || {{}};
-    
+
     // Extract parallelism info
     const tpDegree = memoryMeta.tp_degree || 1;
     const fsdpDegree = memoryMeta.fsdp_degree || 1;
     const shardFactor = memoryMeta.shard_factor || 1;
-    
+
     // Use DES timeline data: [time_us, total_bytes]
     const memoryData = memoryTimeline.map(s => [s.time_us, s.total_bytes]);
     const staticMemory = desMemory.static_memory_bytes || 0;
-    
+
     // Calculate whole-model static memory for reference
     const wholeModelStatic = staticMemory * shardFactor;
-    
+    const staticMemoryData = memoryData.length > 0
+      ? [[memoryData[0][0], staticMemory], [memoryData[memoryData.length - 1][0], staticMemory]]
+      : [];
+    const wholeModelStaticData = memoryData.length > 0
+      ? [[memoryData[0][0], wholeModelStatic], [memoryData[memoryData.length - 1][0], wholeModelStatic]]
+      : [];
+
     memoryChart.setOption({{
       tooltip: {{
         trigger: 'axis',
@@ -1260,7 +1306,7 @@ def export_html(
         {{
           name: 'Per-GPU Static',
           type: 'line',
-          data: memoryData.length > 0 ? [[memoryData[0][0], staticMemory], [memoryData[memoryData.length-1][0], staticMemory]] : [],
+          data: staticMemoryData,
           lineStyle: {{ width: 2, color: '#ef4444', type: 'dashed' }},
           itemStyle: {{ color: '#ef4444' }},
           showSymbol: false,
@@ -1269,7 +1315,7 @@ def export_html(
         {{
           name: 'Whole-Model Static',
           type: 'line',
-          data: memoryData.length > 0 ? [[memoryData[0][0], wholeModelStatic], [memoryData[memoryData.length-1][0], wholeModelStatic]] : [],
+          data: wholeModelStaticData,
           lineStyle: {{ width: 2, color: '#f59e0b', type: 'dotted' }},
           itemStyle: {{ color: '#f59e0b' }},
           showSymbol: false,
@@ -1292,12 +1338,15 @@ def export_html(
         const evStep = e.metadata?.step ?? e.step ?? 0;
         return parseInt(evStep) === {step};
       }});
-      
+
       if (events.length === 0) {{
-        document.getElementById('timeline-{step}').innerHTML = '<div style="padding:40px;text-align:center;color:#666;">No schedule events for this step</div>';
+        const timelineEl = document.getElementById('timeline-{step}');
+        timelineEl.innerHTML =
+          '<div style="padding:40px;text-align:center;color:#666;">' +
+          'No schedule events for this step</div>';
         return;
       }}
-      
+
       // Group events by rank
       const rankMap = {{}};
       events.forEach(ev => {{
@@ -1305,10 +1354,10 @@ def export_html(
         if (!rankMap[rank]) rankMap[rank] = [];
         rankMap[rank].push(ev);
       }});
-      
+
       const ranks = Object.keys(rankMap).sort((a, b) => parseInt(a) - parseInt(b));
       const seriesData = [];
-      
+
       // Color mapping for event types
       const colorMap = {{
         'forward': '#3b82f6',
@@ -1320,7 +1369,7 @@ def export_html(
         'fsdp': '#06b6d4',
         'default': '#6b7280'
       }};
-      
+
       function getEventColor(eventType) {{
         const type = (eventType || '').toLowerCase();
         if (type.includes('forward') || type.includes('fwd')) return colorMap.forward;
@@ -1332,13 +1381,13 @@ def export_html(
         if (type.includes('comm') || type.includes('all_') || type.includes('reduce')) return colorMap.comm;
         return colorMap.default;
       }}
-      
+
       ranks.forEach((rank, rankIdx) => {{
         rankMap[rank].forEach(ev => {{
           const start = ev.perf_cumulative_start_us || 0;
           const duration = ev.perf_total_time_us || 0;
           const end = start + duration;
-          
+
           seriesData.push({{
             name: ev.event_type,
             value: [rankIdx, start, end, duration],
@@ -1349,7 +1398,7 @@ def export_html(
           }});
         }});
       }});
-      
+
       chart.setOption({{
         tooltip: {{
           trigger: 'item',
@@ -1376,7 +1425,7 @@ def export_html(
           name: 'Time',
           nameLocation: 'middle',
           nameGap: 30,
-          axisLabel: {{ 
+          axisLabel: {{
             formatter: (val) => fmt(val),
             color: '#666'
           }},
@@ -1388,7 +1437,7 @@ def export_html(
           type: 'category',
           data: ranks.map(r => 'Rank ' + r),
           inverse: true,
-          axisLabel: {{ 
+          axisLabel: {{
             color: '#333',
             fontWeight: 'bold'
           }},
@@ -1405,7 +1454,7 @@ def export_html(
             const end = api.coord([api.value(2), rankIdx]);
             const height = api.size([0, 1])[1] * 0.7;
             const width = Math.max(2, end[0] - start[0]);
-            
+
             return {{
               type: 'rect',
               shape: {{
@@ -1501,11 +1550,13 @@ def export_text_summary(result: SimulationResult) -> str:
 
     section("Communication")
     # Graph comm ops (from compute graph OpNodes)
-    graph_comm = [n for n in result.compute_graph.nodes.values()
-                 if n.op_type in ("comm_collective", "comm_p2p")]
+    graph_comm = [
+        n
+        for n in result.compute_graph.nodes.values()
+        if n.op_type in ("comm_collective", "comm_p2p")
+    ]
     lines.append(f"  Graph comm ops: {len(graph_comm)}")
-    from collections import Counter as _C
-    graph_comm_ops = _C(n.comm_op or n.op_name for n in graph_comm)
+    graph_comm_ops = Counter(n.comm_op or n.op_name for n in graph_comm)
     for op, c in sorted(graph_comm_ops.items()):
         lines.append(f"    {op:<22}: {c}")
     # PP projected events (from result.comm_events)
@@ -1658,14 +1709,19 @@ def export_text_summary(result: SimulationResult) -> str:
             lines.append("")
             lines.append("  Per-phase peak memory:")
             for phase, data in sorted(phase_peak.items()):
-                lines.append(
-                    f"    {phase:<14}: peak={_format_bytes(data.get('peak_total_bytes', 0))}  dynamic={_format_bytes(data.get('peak_dynamic_bytes', 0))}"
-                )
+                peak = _format_bytes(data.get("peak_total_bytes", 0))
+                dynamic = _format_bytes(data.get("peak_dynamic_bytes", 0))
+                lines.append(f"    {phase:<14}: peak={peak}  dynamic={dynamic}")
 
     section("Metadata")
     for k, v in result.metadata.items():
-        if k in ("cost_model", "des_engine", "des_memory",
-                 "_schedule_events_enriched", "perf_schedule"):
+        if k in (
+            "cost_model",
+            "des_engine",
+            "des_memory",
+            "_schedule_events_enriched",
+            "perf_schedule",
+        ):
             continue
         # Skip large nested dicts/lists that would bloat the summary
         if isinstance(v, (list, dict)) and len(str(v)) > 500:

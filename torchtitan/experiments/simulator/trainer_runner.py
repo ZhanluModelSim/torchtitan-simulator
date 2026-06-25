@@ -29,7 +29,6 @@ from .export import (
     export_text_summary,
 )
 from .extension_hooks import postprocess_extension_result
-from .memory_estimator import dtype_size
 from .nodes import DataEdge, OpNode, TensorMeta
 from .schedule.schedule_extract import extract_schedule_from_pytorch
 
@@ -228,20 +227,17 @@ def _project_pp_comm_from_schedule(
         "pp_recv_gradient": ("pp_recv_gradient", "backward", "recv"),
     }
 
-    pp_events = [
-        e for e in schedule.events
-        if e.event_type in _PP_EVENT_MAP
-    ]
+    pp_events = [e for e in schedule.events if e.event_type in _PP_EVENT_MAP]
     if not pp_events:
         return
 
-    # Deduplicate by (event_type, pp_stage, microbatch_idx) — multiple ranks
-    # share the same pp_stage; create one representative OpNode per unique key
-    # so all ranks' events link to the same node and get consistent duration.
-    seen_keys: set[tuple[str, int | None, int | None]] = set()
+    # Deduplicate by rank as well as stage/microbatch. Compute ops captured on
+    # rank 0 can be reused as templates, but PP send/recv are rank-specific
+    # schedule edges and must not collapse across ranks.
+    seen_keys: set[tuple[str, int, int | None, int | None]] = set()
     unique_pp_events = []
     for ev in pp_events:
-        key = (ev.event_type, ev.pp_stage, ev.microbatch_idx)
+        key = (ev.event_type, ev.rank, ev.pp_stage, ev.microbatch_idx)
         if key not in seen_keys:
             seen_keys.add(key)
             unique_pp_events.append(ev)
@@ -250,9 +246,7 @@ def _project_pp_comm_from_schedule(
     send_to_recv: dict[str, list[str]] = {}
     for dep in schedule.deps:
         if dep.dep_type == "pp_comm":
-            send_to_recv.setdefault(dep.from_event_id, []).append(
-                dep.to_event_id
-            )
+            send_to_recv.setdefault(dep.from_event_id, []).append(dep.to_event_id)
 
     # Compute tensor shapes from config (same logic as old injector)
     from torchtitan.config import TORCH_DTYPE_MAP
@@ -264,11 +258,7 @@ def _project_pp_comm_from_schedule(
     reduce_dtype_str = str(TORCH_DTYPE_MAP.get(mp_reduce, torch.float32))
     seq_len = training.seq_len
     batch_size = training.local_batch_size
-    hidden = (
-        _guess_hidden_dim(trainer.model_parts[0])
-        if trainer.model_parts
-        else 512
-    )
+    hidden = _guess_hidden_dim(trainer.model_parts[0]) if trainer.model_parts else 512
     activation_numel = batch_size * seq_len * hidden
 
     graph = result.compute_graph
@@ -288,22 +278,19 @@ def _project_pp_comm_from_schedule(
             op_name=op_name,
             op_type="comm_p2p",
             phase=phase,
+            rank=ev.rank,
             pp_stage=ev.pp_stage,
             pp_rank=ev.pp_rank,
             microbatch_idx=ev.microbatch_idx,
-            inputs=[
-                TensorMeta(
-                    shape=(activation_numel,), dtype=dt, device="cpu"
-                )
-            ],
-            outputs=[
-                TensorMeta(
-                    shape=(activation_numel,), dtype=dt, device="cpu"
-                )
-            ],
+            inputs=[TensorMeta(shape=(activation_numel,), dtype=dt, device="cpu")],
+            outputs=[TensorMeta(shape=(activation_numel,), dtype=dt, device="cpu")],
             comm_op=comm_op,
             comm_group_size=2,
-            attrs={"schedule_derived": True, "pp": True},
+            attrs={
+                "schedule_derived": True,
+                "pp": True,
+                "schedule_event_id": ev.event_id,
+            },
         )
         graph.add_node(node)
         event_id_to_node_id[ev.event_id] = node_id
@@ -313,10 +300,12 @@ def _project_pp_comm_from_schedule(
                 "event_id": node_id,
                 "op": comm_op,
                 "group_size": 2,
+                "rank": ev.rank,
                 "phase": phase,
                 "pp_stage": ev.pp_stage,
                 "pp_rank": ev.pp_rank,
                 "microbatch": ev.microbatch_idx,
+                "schedule_event_id": ev.event_id,
                 "tensor_meta": {
                     "shape": [batch_size, seq_len, hidden],
                     "dtype": dt,
@@ -582,6 +571,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     # so logging/metrics that format DTensors don't crash on meta.
     try:
         from torch.distributed.tensor import DTensor as _DTensor
+
         _orig_dt_format = _DTensor.__format__
         _DTensor.__format__ = lambda self, format_spec: "0.0"
     except Exception:
@@ -649,8 +639,11 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     use_fake = (getattr(sim_opts, "comm_backend", "") or "") != "gloo"
 
     # Phase 4: Apply meta device patches for natural FSDP communication emission
-    from .meta_device_patches import apply_meta_device_patches, restore_meta_device_patches
-    
+    from .meta_device_patches import (
+        apply_meta_device_patches,
+        restore_meta_device_patches,
+    )
+
     if use_fake:
         apply_meta_device_patches()
 
@@ -667,7 +660,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         # Phase 4: Restore meta device patches
         if use_fake:
             restore_meta_device_patches()
-        
+
         # Restore patched methods
         dist_utils.clip_grad_norm_ = orig_clip_grad_norm
         dist_utils.dist_sum = orig_dist_sum
@@ -745,7 +738,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     # --- Unified metric computation (before export, format-order-independent) ---
     # Populate DES metadata once here so all exporters (including text-only)
     # can read it without lazy-loading side effects.
-    from .export import _populate_des_metadata, _inject_schedule_timing
+    from .export import _inject_schedule_timing, _populate_des_metadata
 
     _populate_des_metadata(result)
     # Inject schedule timing into result.metadata so DES memory timeline
@@ -754,7 +747,9 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     _inject_schedule_timing(_result_dict, result)
     result.metadata["perf_schedule"] = _result_dict.get("perf_schedule", {})
     if "schedule" in _result_dict and "events" in _result_dict["schedule"]:
-        result.metadata["_schedule_events_enriched"] = _result_dict["schedule"]["events"]
+        result.metadata["_schedule_events_enriched"] = _result_dict["schedule"][
+            "events"
+        ]
 
     postprocess_extension_result(result, trainer, sim_opts)
     _export_result(result, sim_opts.output_dir, sim_opts.output_formats)
