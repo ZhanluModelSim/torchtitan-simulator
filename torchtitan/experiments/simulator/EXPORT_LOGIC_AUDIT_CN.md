@@ -1,346 +1,350 @@
-# Simulator 导出逻辑审计清单
+# Simulator 导出逻辑二次审计清单
 
 > 审计日期：2026-06-25  
-> 审计范围：`torchtitan/experiments/simulator/export.py`、`trainer_runner.py` 中的导出编排、`des_engine.py` 中导出依赖的 DES 汇总，以及当前 `simulator_output/` 输出件。
+> 审计依据：当前 `simulator_output/` 输出件、`DESIGN_PROPOSAL_EXPORT_FIX_CN.md`、当前 `export.py` / `trainer_runner.py` / `des_engine.py` 实现。
+> 本文覆盖上一版 `EXPORT_LOGIC_AUDIT_CN.md`。
 
 ## 结论
 
-当前导出链路**基本能完整生成多格式输出，且 JSON/CSV/summary 的核心计数在当前样例中自洽**；但从设计原则看，它只能算“部分符合”：
+本轮整改已经修复了上一版审计中的多项展示口径问题：HTML 首页的 Activation peak、Predicted step time、通信统计标签、Swimlane events 标签已经与当前输出件对齐；文本 summary 也已拆分 graph comm ops 与 PP projected events。
 
-| 设计原则 | 结论 | 主要原因 |
-|---|---|---|
-| Side-loaded 实验 | 基本符合 | 导出逻辑位于 `torchtitan/experiments/simulator/`，没有修改 `train.py`；但导出函数会反向修改 `SimulationResult.metadata`，使导出不再是纯输出动作。 |
-| 捕获忠实 | 部分符合 | 主体依赖捕获到的 `SimulationResult`，但 HTML/Chrome trace 的 schedule timing fallback 会按 phase 均分时间；PP comm 和合成 compute anchor 也会把非捕获信息写入最终输出。 |
-| PyTorch 原生 | 基本符合 | 导出使用 PyTorch 捕获结果和调度对象派生数据，没有重新实现训练主逻辑；HTML 前端依赖 ECharts CDN，不影响 PyTorch 原生训练原则，但影响离线交付。 |
-| 模型无关核心 | 部分违反 | 导出前处理会访问 `trainer.model_parts` 并通过模型结构猜测 layer/hidden dim，核心导出管线暴露了模型反射逻辑。 |
+但当前实现仍有三个需要优先处理的问题：
 
-## 当前输出件的自洽性
+1. **Schedule swimlane 前四个 rank 与后四个 rank 明显不对称，根因在导出前的 PP comm projection 只处理 `rank == 0`。** 当前 JSON 中 rank 0-3 的 PP comm event 都绑定了 `op_node_ids`，duration 约 1-3 us；rank 4-7 同类 event 没有 `op_node_ids`，DES 回退到 phase 均分，duration 约 199 us / 442 us。HTML 只是忠实渲染了这组异常数据。
+2. **“后处理与导出分离”只做到部分落地。** `trainer_runner.py` 已经在 `_export_result()` 前统一生成 DES metadata 和 schedule timing；但 `export_json()`、`export_kernel_summary_csv()`、`_json_script_payload()` 内仍保留 `_populate_des_metadata()`，导出函数仍不是纯读取。
+3. **新增 `_schedule_events_enriched` metadata 造成 summary 和 JSON metadata 膨胀。** 当前 `summary.txt` 达到 276 KB，其中大部分来自把 696 条 enriched schedule events 作为 metadata 原样打印；这与“summary 应为人类可读摘要”的目标冲突。
 
-当前 `simulator_output/` 文件完整，但体积较大：
+## 当前输出件概况
 
-| 文件 | 大小 | 说明 |
-|---|---:|---|
-| `workload_graph.json` | 391 MB | L1-L3 workload graph，当前最大输出件。 |
-| `simulation_result.json` | 240 MB | 完整结构化结果。 |
-| `trace.json` | 113 MB | Chrome trace。 |
-| `compute_graph.dot` | 42 MB | Graphviz DOT。 |
-| `kernel_summary.csv` | 31 MB | 逐 op 性能明细。 |
-| `trace.html` | 4.2 MB | 交互式 HTML，可视化数据经过压缩/截断。 |
-| `summary.txt` | 8 KB | 文本汇总。 |
+当前 `simulator_output/` 已不再是上一轮的 800MB 级输出，输出体积明显下降：
 
-已校验的当前样例：
-
-| 项目 | 结果 |
+| 文件 | 当前大小 |
 |---|---:|
-| JSON compute nodes | 309247 |
-| JSON edges | 285018 |
-| CSV rows | 309247 |
-| schedule events | 6336 |
-| schedule deps | 13624 |
-| `result.comm_events` | 48 |
-| graph `comm_collective` | 4554 |
-| graph `comm_p2p` | 48 |
-| memory events | 121814 |
+| `summary.txt` | 276 KB |
+| `kernel_summary.csv` | 552 KB |
+| `compute_graph.dot` | 836 KB |
+| `trace.json` | 2.5 MB |
+| `trace.html` | 5.9 MB |
+| `workload_graph.json` | 7.9 MB |
+| `simulation_result.json` | 9.7 MB |
+
+当前核心计数：
+
+| 项目 | 当前值 |
+|---|---:|
+| compute graph nodes | 6275 |
+| compute graph edges | 4930 |
+| schedule events | 696 |
+| schedule deps | 1390 |
+| HTML swimlane events | 744 |
+| graph comm ops | 219 |
+| PP projected events / `result.comm_events` | 48 |
+| memory events | 2321 |
+| CSV rows | 6275 |
 | CSV 负 duration | 0 |
 | CSV `ComputeTime > Duration` | 0 |
 | CSV `CommTime > Duration` | 0 |
-| CSV `Duration != End-Start` | 0 |
 
-这说明当前输出的基础结构没有明显损坏；主要问题集中在**指标口径、导出副作用、HTML 展示和大图可扩展性**。
+## 整改方案落地情况
 
-## 问题清单
+| 方案项 | 当前状态 | 证据 | 审计结论 |
+|---|---|---|---|
+| DES metadata 前移到导出前统一生成 | 部分完成 | `trainer_runner.py:734-746` | 已前移，但 exporter 内仍保留懒加载调用。 |
+| memory summary 同时写入 `metadata["memory"]` | 完成 | `trainer_runner.py:720-723`；`trace.html:37` | HTML Activation peak 已显示 261.2 MiB。 |
+| 通信指标拆分 | 完成 | `summary.txt:18-29`；`trace.html:33-34` | Graph comm ops=219，PP projected events=48。 |
+| Predicted step time 使用 DES fallback | 完成 | `export.py:1056-1062`；`trace.html:39` | HTML 显示 36.194 ms，不再是 0。 |
+| Schedule events 标签改为 Swimlane events | 完成 | `export.py:1152`；`trace.html:32` | 标签与“schedule + comm 可视化事件”语义一致。 |
+| compact HTML truncation metadata | 代码实现，当前输出未触发 | `export.py:814-826` | 当前 graph 6275 nodes，小于 10000，因此没有 `_truncation` 是合理的。 |
+| `timing_source` 标注 | 完成 | `export.py:884-897`；当前 HTML 中出现 1392 次 `timing_source` | schedule timing 来源可见。 |
+| 移除 exporter 内 `_populate_des_metadata()` | 未完成 | `export.py:68`、`export.py:183`、`export.py:797` | 仍存在导出副作用入口，虽有 early-return 幂等保护。 |
+| 模型反射从导出管线移出 | 未完成，方案也标为后续 | `trainer_runner.py:256-260`、`trainer_runner.py:348-371`、`trainer_runner.py:453-494` | `_guess_hidden_dim()` / `_infer_num_layers()` 仍在通用 runner。 |
 
-### P0. HTML 的 Activation peak 当前显示错误
+## 已修复项确认
 
-**现象**
+### 1. HTML Activation peak 已修复
 
-当前 `trace.html` 卡片显示：
+当前 HTML 首页：
 
 ```text
-Activation peak: 0 B
+Activation peak: 261.2 MiB
 ```
 
-但 `summary.txt` 和 `simulation_result.json` 中存在顶层内存峰值：
+对应 summary / JSON：
 
 ```text
-peak_live_bytes: 257551912868
-graph_peak_live_bytes: 257551912868
+peak_live_bytes: 273906808
+graph_peak_live_bytes: 273906808
 ```
 
-**证据**
+这说明 `metadata["memory"]` 嵌套写入已生效。
 
-- `export.py:1037-1040`：HTML 从 `result.metadata["memory"]` 读取 `peak_live_bytes` / `graph_peak_live_bytes`。
-- `summary.txt:103-104`：当前样例的 `peak_live_bytes` 和 `graph_peak_live_bytes` 位于 metadata 顶层。
-- `trace.html:36`：当前页面实际渲染为 `Activation peak = 0 B`。
+### 2. HTML Predicted step time 已修复
 
-**影响**
-
-HTML 首页最重要的内存峰值卡片直接误导用户，会让用户以为激活峰值不存在。
-
-**设计原则判断**
-
-违反“捕获忠实”：已捕获并导出的内存峰值没有被正确展示。
-
-### P0. 文本 summary 和 HTML 的通信事件口径容易误导
-
-**现象**
-
-`summary.txt` 的 “Communication Events” 只显示 48 个 send/recv：
+当前 HTML 首页：
 
 ```text
-Total comm events: 48
-send: 24
-recv: 24
+Predicted step time: 36.194 ms
 ```
 
-但同一个 compute graph 中还有：
+对应 DES summary：
 
 ```text
-comm_collective: 4554
-comm_p2p: 48
+E2E step time (DES): 36.194 ms
 ```
 
-**证据**
+`cost_model` metadata 为空时回退到 `metadata["des_engine"]["e2e_step_time_us"]` 的逻辑已生效。
 
-- `export.py:1847-1854`：`export_text_summary()` 的 “Communication Events” 只统计 `result.comm_events`。
-- `export.py:1139`：HTML 卡片 `Communication events` 也只显示 `len(result.comm_events)`。
-- `summary.txt:7-10`：graph 类型计数中存在 4554 个 `comm_collective` 和 48 个 `comm_p2p`。
-- `summary.txt:18-23`：通信事件章节只显示 48。
+### 3. 通信统计口径已拆分
 
-**影响**
-
-用户会误判“通信很少”，而实际图中存在大量 collective 通信节点。该问题尤其影响性能瓶颈判断和硬件仿真输入检查。
-
-**设计原则判断**
-
-违反“捕获忠实”的展示层含义：捕获到的通信算子存在，但汇总卡片只展示了另一套窄口径事件。
-
-### P0. 导出结果依赖 output format 顺序，`text` 单独导出可能缺 DES 汇总
-
-**现象**
-
-DES metadata 不是在仿真结束时统一生成，而是在部分导出函数内部懒加载写入：
-
-- `export_json()` 调用 `_populate_des_metadata()`。
-- `export_kernel_summary_csv()` 调用 `_populate_des_metadata()`。
-- `export_html()` 通过 `_json_script_payload()` 调用 `_populate_des_metadata()`。
-- `export_text_summary()` 自己不调用 `_populate_des_metadata()`。
-
-当前默认顺序中 JSON/HTML 在 text 之前，所以 `summary.txt` 有 DES 汇总；但如果用户只配置 `output_formats=["text"]`，或配置 `["text", "csv"]`，文本汇总可能不会包含 DES Engine / DES Memory 章节。
-
-**证据**
-
-- `trainer_runner.py:114-128`：导出顺序固定为 json、dot、chrome_trace、html、text、csv。
-- `export.py:643-666`：`_populate_des_metadata()` 直接写入 `result.metadata`。
-- `export.py:1802-2007`：`export_text_summary()` 只读取已有 metadata，不主动补齐 DES metadata。
-
-**影响**
-
-同一次仿真，改变 `output_formats` 会改变 `summary.txt` 内容。这不符合用户对“导出格式只影响输出文件，不影响指标计算”的预期。
-
-**设计原则判断**
-
-违反 Side-loaded/关注点分离：导出函数带有计算和状态修改副作用；也削弱导出结果可复现性。
-
-### P1. HTML 的 Predicted step time 与 DES step time 展示逻辑不一致
-
-**现象**
-
-当前 `trace.html` 首页显示：
+当前 summary：
 
 ```text
-Predicted step time: 0.0 µs
+Graph comm ops: 219
+  all_gather: 61
+  all_reduce: 19
+  recv: 24
+  reduce_scatter: 14
+  send: 24
+  wait: 77
+PP projected events: 48
+  recv: 24
+  send: 24
 ```
 
-但 `simulation_result.json` / `summary.txt` 中 DES 结果为：
+当前 HTML 首页也拆分为：
 
 ```text
-E2E step time (DES): 40.810 s
+Graph comm ops: 219
+PP projected events: 48
 ```
 
-**证据**
+这比上一版只显示 `Communication events: 48` 更符合捕获数据。
 
-- `export.py:1047-1048`：HTML 的 `Predicted step time` 只读 `metadata["cost_model"]["e2e_step_time_us"]`。
-- `export.py:1051-1072`：DES 卡片只在任意 node 有 `des_start_time_us` 时显示。
-- `des_engine.py:337-442`：DES 汇总支持从 schedule events 计算，即使 node 没有 DES 时间。
-- `trace.html:38`：当前页面显示 `Predicted step time = 0.0 µs`。
-- `summary.txt:69-80`：当前文本汇总有 DES step time 40.810 s。
+## 重点问题：schedule swimlane 前四个 rank 异常
 
-**影响**
+### 现象
 
-首页性能指标与文本/JSON 不一致。用户打开 HTML 时会以为性能预测没有运行。
-
-**设计原则判断**
-
-违反“捕获忠实”的展示层一致性：DES 已经产出，但 HTML 没有按同一口径展示。
-
-### P1. HTML 的 Schedule events 数量混合了不同来源
-
-**现象**
-
-`summary.txt` 显示训练调度事件为 6336；HTML 首页卡片显示 `Schedule events = 6384`。
-
-**证据**
-
-- `export.py:971-990`：`_schedule_events_for_html()` 将 `result.schedule.events`、`fsdp_events`、`pp_events`、`comm_events` 合并为 HTML schedule events。
-- `export.py:1138`：HTML 卡片直接显示合并后的 `len(schedule_events)`。
-- `summary.txt:37`：训练调度事件为 6336。
-- `trace.html:32`：HTML 显示 6384，正好是 6336 + 48 个 `result.comm_events`。
-
-**影响**
-
-“Schedule events” 标签不准确。它实际是“可视化泳道事件数”，不是纯训练调度事件数。
-
-**设计原则判断**
-
-属于导出语义问题：不是计算错误，但输出标签和数据来源不一致。
-
-### P1. 大图 HTML 数据存在截断，但标记不完整
-
-**现象**
-
-当 graph node 数超过 10000 时，HTML payload 会走压缩路径：
-
-- schedule event 的 `op_node_ids` 超过 100 会截断，并设置 `op_node_ids_truncated=True`。
-- `memory_events` 只保留前 1000 条，但没有同等的 `truncated` / `original_count` 标记。
-- compute graph 会按 PP stage 相似性压缩。
-
-**证据**
-
-- `export.py:795-820`：大图 HTML payload 压缩、截断 schedule op ids、只导出前 1000 个 memory events。
-- 当前样例：JSON 有 121814 个 memory events，但 HTML payload 最多只含 1000 个。
-
-**影响**
-
-HTML 作为可视化摘要是合理的，但页面和 metadata 没有清楚说明“哪些数据被截断、原始数量是多少”。下游用户如果误把 HTML 内嵌 JSON 当完整数据，会得出错误结论。
-
-**设计原则判断**
-
-不直接违反捕获忠实，但违反导出透明性。应明确区分“完整输出件”和“可视化摘要输出件”。
-
-### P1. DES Memory 的全局 peak 与 per-phase peak 不一致
-
-**现象**
-
-当前 DES memory 汇总：
+当前 `simulation_result.json` 中 8 个 rank 的 schedule event 总数是对称的：
 
 ```text
-Peak dynamic memory: 1.8 GiB
+rank 0-7: 每个 rank 87 events
+```
+
+但 PP comm event 的绑定和 duration 不对称：
+
+| event type | rank 0-3 | rank 4-7 |
+|---|---:|---:|
+| `pp_send_activation` | 16/event rank，全部有 `op_node_ids`，平均 2.015 us | 8/event rank，全部无 `op_node_ids`，平均 199.114 us |
+| `pp_recv_activation` | 8/event rank，全部有 `op_node_ids`，平均 2.658 us | 16/event rank，全部无 `op_node_ids`，平均 199.113 us |
+| `pp_send_gradient` | 8/event rank，全部有 `op_node_ids`，平均 2.329 us | 16/event rank，全部无 `op_node_ids`，平均 441.857 us |
+| `pp_recv_gradient` | 16/event rank，全部有 `op_node_ids`，平均 1.810 us | 8/event rank，全部无 `op_node_ids`，平均 441.857 us |
+
+因此用户在 HTML schedule swimlane 中看到的“前四个 rank 异常”，本质是**前四个 rank 与后四个 rank 使用了不同 duration 来源**。
+
+### 根因链路
+
+1. `trainer_runner.py` 只为 `rank == 0` 的 PP comm event 投影 `comm_p2p` OpNode：
+
+```python
+pp_events = [
+    e for e in schedule.events
+    if e.event_type in _PP_EVENT_MAP and e.rank == 0
+]
+```
+
+2. 当前 compute graph 中只有 48 个 `comm_p2p` 节点，全部属于 `pp_rank=0`，且只覆盖 `pp_stage=0` 和 `pp_stage=2`：
+
+```text
+comm_p2p nodes: 48
+by_pp_rank: {0: 48}
+by_stage: {0: 16, 2: 32}
+```
+
+3. `cost_model.link_schedule_to_graph()` 只按 `(phase, pp_stage, microbatch_idx)` / `(phase, pp_stage, None)` 绑定节点，不区分 rank。结果是：
+
+- rank 0-3 共享 pp_rank 0 的 stage 0/2 节点，因此有 `op_node_ids`。
+- rank 4-7 的 pp_rank 1 / stage 1 没有对应 `comm_p2p` 节点，因此 `op_node_ids=[]`。
+
+4. `des_engine.simulate_multi_rank_des()` 对两种 event 采用不同 duration 计算：
+
+- 有 `op_node_ids`：累计节点 `perf_result.total_time_us` 后按 `(event_type, rank, pp_stage)` 事件数拆分。
+- 无 `op_node_ids`：回退到 `phase_total / event_type_count`。
+
+这造成 rank 0-3 的 PP comm 是微秒级，而 rank 4-7 是百微秒级。
+
+5. HTML schedule swimlane 渲染逻辑只读取 `perf_cumulative_start_us` 和 `perf_total_time_us`：
+
+```javascript
+const start = ev.perf_cumulative_start_us || 0;
+const duration = ev.perf_total_time_us || 0;
+```
+
+因此 HTML 不是根因，只是把 JSON 中已经异常的 duration 画出来。
+
+### 设计原则判断
+
+该问题违反“捕获忠实”：
+
+- PP schedule 本身是多 rank 的；
+- 但导出前投影只为 `rank == 0` 建立 `comm_p2p` 节点；
+- 后续 DES 和 HTML 用不同 fallback 填补缺失 rank，导致可视化和性能指标不再忠实反映同一套调度数据。
+
+### 修复方向
+
+优先修复 `_project_pp_comm_from_schedule()` 的 rank 过滤逻辑：
+
+- 不应只过滤 `rank == 0`。
+- 应按 schedule event 的真实 `rank` / `pp_rank` / `pp_stage` 为所有 PP comm event 投影节点，或明确只投影代表 rank 并在 schedule linking / DES duration 中也按代表 rank 对称复用。
+- 修复后应重新生成输出，检查 rank 0-7 的同类 PP comm event 是否使用一致的 duration 来源。
+
+## 仍需处理的问题
+
+### P0. Exporter 内仍有 DES metadata 懒加载调用
+
+当前 `trainer_runner.py` 已在导出前执行：
+
+```python
+_populate_des_metadata(result)
+_inject_schedule_timing(_result_dict, result)
+```
+
+但 exporter 内仍有重复入口：
+
+- `export.py:68`：`export_json()` 调用 `_populate_des_metadata(result)`。
+- `export.py:183`：`export_kernel_summary_csv()` 调用 `_populate_des_metadata(result)`。
+- `export.py:797`：`_json_script_payload()` 调用 `_populate_des_metadata(result)`。
+
+虽然 `_populate_des_metadata()` 有：
+
+```python
+if "des_engine" in result.metadata:
+    return
+```
+
+但从设计上看 exporter 仍不是纯读取，和 `DESIGN_PROPOSAL_EXPORT_FIX_CN.md` 的“格式化输出纯读取”目标不完全一致。
+
+### P0. Summary 被 `_schedule_events_enriched` 撑大
+
+当前 `trainer_runner.py` 将 enriched schedule events 写入 metadata：
+
+```python
+result.metadata["_schedule_events_enriched"] = _result_dict["schedule"]["events"]
+```
+
+当前输出中：
+
+```text
+_schedule_events_enriched length: 696
+serialized bytes: 275776
+summary.txt size: 276 KB
+```
+
+`export_text_summary()` 的 Metadata 章节会打印除 `cost_model`、`des_engine`、`des_memory` 外的所有 metadata，因此整份 schedule event 列表被原样写入 `summary.txt`。这不是摘要信息，影响人工阅读，也让 summary 变成半结构化 dump。
+
+建议：
+
+- 不要把 `_schedule_events_enriched` 放进通用 metadata；
+- 或在 `export_text_summary()` 的 Metadata 章节过滤 `_schedule_events_enriched`；
+- 如果 HTML 需要 enriched schedule，应在 HTML payload 中局部生成，不污染全局 metadata。
+
+### P1. DES cards 仍未出现在 HTML 首页
+
+当前 `trace.html` 首页有 `Predicted step time: 36.194 ms`，但没有 DES cards：
+
+```text
+DES step time: 0 occurrences
+Compute utilization: 0 occurrences
+Peak DES memory: 0 occurrences
+```
+
+原因是 `export_html()` 的 `has_des` 只检查 compute graph nodes：
+
+```python
+has_des = any(
+    n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
+)
+```
+
+当前 DES 时间主要在 schedule events 上，compute graph nodes 没有 DES 时间：
+
+```text
+node_des_phase_ranges: {}
+schedule_phase_ranges.forward: [0.0, 36193.561]
+schedule_phase_ranges.backward: [4048.165, 36193.561]
+```
+
+建议让 HTML DES cards 与 `_populate_des_metadata()` 一样同时检查 schedule DES event，或直接以 `metadata["des_engine"]` 是否存在为准。
+
+### P1. DES Memory per-phase dynamic peak 仍为 0
+
+当前 DES memory：
+
+```text
+Peak dynamic memory: 1.0 MiB
 Per-phase forward dynamic: 0 B
 Per-phase backward dynamic: 0 B
 ```
 
-**证据**
+根因仍在 `compute_des_memory_timeline()` 的 phase range 构造：它只从 node DES time 推导 phase range；当前 node 没有 DES time，而 schedule events 有 DES time。因此全局 timeline 能看到动态 comm buffer 峰值，但 per-phase peak 取样不到对应时间区间。
 
-- `des_engine.py:652-689`：per-phase peak 通过 `phase_ranges` 中的时间区间筛选 timeline sample。
-- `summary.txt:85-92`：全局 dynamic peak 非零，但 forward/backward dynamic 都为 0。
-- 当前 JSON：`peak_dynamic_bytes=1879048192`，`phase_peak.forward.peak_dynamic_bytes=0`，`phase_peak.backward.peak_dynamic_bytes=0`。
+当前最大 dynamic sample：
 
-**影响**
+```text
+time_us: 3493.957
+dynamic_bytes: 1048576
+by_category: {"comm_buffer": 1048576}
+```
 
-用户无法判断动态峰值属于哪个阶段。当前结果可能表示动态通信 buffer 的生命周期落在 phase range 外，也可能是 phase range 构造没有覆盖 schedule-derived 时间。
+但 `phase_peak.forward.dynamic=0`、`phase_peak.backward.dynamic=0`。
 
-**设计原则判断**
+建议 `compute_des_memory_timeline()` 在 node DES time 缺失时，使用 schedule event DES ranges 构造 phase ranges。
 
-部分违反捕获忠实：全局数据被捕获/推导出来了，但按 phase 展示时丢失归属。
+### P1. `single_rank_step_time_us` 仍与 `e2e_step_time_us` 相同
 
-### P1. 导出前处理访问模型对象，核心导出管线不够模型无关
+当前 `des_engine.compute_des_utilization()` 返回：
 
-**现象**
+```python
+"e2e_step_time_us": round(e2e_step, 3),
+"single_rank_step_time_us": round(e2e_step, 3),
+```
 
-导出前的后处理阶段会访问模型对象：
+该字段名仍有歧义：在 multi-rank DES 下它并不是独立计算的单 rank step time，而是复制 E2E step time。建议改名或删除，避免输出误导。
 
-- `_project_pp_comm_from_schedule()` 通过 `_guess_hidden_dim(trainer.model_parts[0])` 推断 PP 激活 shape。
-- `_inject_synthetic_compute_anchors()` 通过 `_infer_num_layers(model_parts)` 和 `_guess_hidden_dim()` 注入合成 compute。
-- `attach_model_state_memory()` 直接使用 `trainer.model_parts` 做模型状态内存估算。
+### P2. HTML 仍依赖 CDN
 
-**证据**
-
-- `trainer_runner.py:250-261`：PP comm projection 使用 batch/seq/hidden，其中 hidden 来自模型反射。
-- `trainer_runner.py:335-451`：合成 compute anchor 注入。
-- `trainer_runner.py:453-494`：通过 `config.n_layers`、`layers`、参数名前缀、首个 `nn.Linear` 猜测模型结构。
-- `trainer_runner.py:722-729`：导出前调用 `attach_model_state_memory(result, trainer.model_parts, ...)`。
-
-**影响**
-
-导出结果中部分 shape/内存/compute lane 数据不再纯粹来自捕获图或声明 config，而依赖模型对象结构启发式。跨模型迁移时容易出现“能导出但含义偏差”的问题。
-
-**设计原则判断**
-
-违反“模型无关的核心”。`export.py` 本身较模型无关，但导出管线中的结果构造/补全逻辑已经暴露模型反射。
-
-### P2. Chrome trace 和 HTML 的 fallback schedule timing 是启发式估算
-
-**现象**
-
-若 schedule event 没有 DES start/finish，`_inject_schedule_timing()` 会把同一 phase 的总时间均分给该 phase 下的 schedule events，并按累计值生成起点。
-
-**证据**
-
-- `export.py:830-900`：无 DES event timing 时，使用 `per_event = phase_total / count` 和 `cumulative_per_phase`。
-- `export.py:903-925`：event type 到 phase 的映射也包含默认 forward fallback。
-
-**影响**
-
-这种 fallback 对可视化有用，但不应被解释为真实调度时序。当前函数注释只写“using DES results when available”，没有显式说明非 DES 情况是 phase-level 均分。
-
-**设计原则判断**
-
-部分违反“捕获忠实”的文档表达：代码实际含启发式时序，应在输出中标记来源。
-
-### P2. HTML 不是完全离线自包含
-
-**现象**
-
-HTML 数据内联，但图表库通过 CDN 加载：
+当前 `trace.html` 仍使用：
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
 ```
 
-**证据**
+这不影响本次 P0/P1 修复，但仍不适合离线归档或内网环境。
 
-- `export.py:1024-1029`：docstring 已说明 ECharts 从 CDN 加载，页面不是 fully offline。
-- `trace.html:7`：实际输出引用 jsdelivr CDN。
+### P2. 模型反射仍在通用 runner
 
-**影响**
+以下逻辑仍在通用 `trainer_runner.py`：
 
-离线环境、内网环境或归档报告打开时，交互图表不可用。
+- `_project_pp_comm_from_schedule()` 用 `_guess_hidden_dim(trainer.model_parts[0])` 推断 activation shape。
+- `_inject_synthetic_compute_anchors()` 用 `_infer_num_layers()` / `_guess_hidden_dim()` 注入 compute anchor。
+- `attach_model_state_memory()` 仍直接读取 `trainer.model_parts`。
 
-**设计原则判断**
-
-不直接违反四条核心训练原则，但影响输出件可交付性；如果设计文档描述“HTML 自包含”，则文档需要改成“数据自包含，渲染库非自包含”。
-
-### P2. 输出体积大，缺少分层/摘要输出策略
-
-**现象**
-
-当前单次输出约 821 MB，其中 `workload_graph.json`、`simulation_result.json`、`trace.json`、`compute_graph.dot` 合计约 786 MB。
-
-**影响**
-
-对 CI artifact、远程传输、浏览器加载、人工审阅都偏重。当前 HTML 做了压缩，但完整 JSON/DOT/trace 仍按全量输出。
-
-**设计原则判断**
-
-不违反核心原则，但影响“任意规模训练步分析”的可用性。大规模仿真需要明确 full / compact / summary-only 三类输出模式。
+该问题已经在方案中标为后续较大重构；本轮不应阻塞导出展示修复，但仍不完全符合“模型无关核心”原则。
 
 ## 建议整改优先级
 
-| 优先级 | 建议 | 目标 |
+| 优先级 | 建议 | 验收方式 |
 |---|---|---|
-| P0 | 在仿真后处理阶段统一生成 DES metadata，不放在具体 exporter 内懒加载。 | 消除 format 顺序依赖；让 `text` 单独导出也完整。 |
-| P0 | 修复 HTML Activation peak：从正确 metadata 层级读取，或在 metadata 中统一内存 summary schema。 | 避免首页内存指标错误。 |
-| P0 | 拆分通信指标：`Graph communication ops`、`Projected/raw comm events`、`Schedule visualization events` 分别展示。 | 避免通信数量误读。 |
-| P1 | HTML 首页优先展示 DES E2E step time；当 cost model summary 为 0 但 DES metadata 存在时，不显示 0.0 µs。 | 保持 HTML 与 summary/JSON 一致。 |
-| P1 | 为 HTML compact payload 增加 `truncation` metadata：原始数量、保留数量、截断字段。 | 避免把摘要数据误认为完整数据。 |
-| P1 | 修正或解释 DES Memory per-phase dynamic 为 0 的原因。 | 让内存峰值可归因。 |
-| P1 | 把 `_infer_num_layers()`、`_guess_hidden_dim()`、合成 compute anchor 的模型相关逻辑移出通用导出管线，改为模型子目录提供 metadata 或 adapter。 | 恢复模型无关核心边界。 |
-| P2 | 增加 `summary-only` / `compact-json` / gzip 输出选项，或默认压缩大型 JSON/DOT。 | 改善大规模输出可用性。 |
-| P2 | HTML 支持离线模式：内嵌 ECharts、使用本地 asset，或输出无网络 fallback 提示。 | 提升报告可交付性。 |
+| P0 | 修复 `_project_pp_comm_from_schedule()` 的 `rank == 0` 过滤或同步修正 schedule linking / DES duration 对代表 rank 的处理。 | 重新生成输出后，rank 0-7 同类 PP comm event 的 `op_node_ids` 绑定策略和 duration 来源一致。 |
+| P0 | 从 exporter 中移除 `_populate_des_metadata()` 懒加载调用。 | `export_json()`、`export_kernel_summary_csv()`、`_json_script_payload()` 不再修改 `SimulationResult`。 |
+| P0 | 不在文本 summary 中打印 `_schedule_events_enriched`。 | `summary.txt` 回到 KB 级摘要，不包含 696 条 event dump。 |
+| P1 | HTML DES cards 的 `has_des` 改为基于 `metadata["des_engine"]` 或 schedule DES event。 | HTML 首页出现 DES step time / utilization / peak DES memory 卡片。 |
+| P1 | DES memory phase peak 使用 schedule DES ranges 兜底。 | `Peak dynamic memory` 非零时，对应 phase 的 dynamic peak 不再全部为 0。 |
+| P1 | 澄清或移除 `single_rank_step_time_us`。 | 多 rank DES 输出中不再出现与 E2E 完全重复且命名误导的字段。 |
+| P2 | 保留 CDN 问题为可交付性优化。 | 离线打开 HTML 时有本地 ECharts 或明确 fallback。 |
+| P2 | 模型结构信息改由 metadata / adapter 提供。 | 通用 runner 不再通过模型反射猜测 hidden_dim / num_layers。 |
 
-## 审计判断
+## 二次审计判断
 
-导出逻辑不是“不可用”，当前输出的主干数据也是可校验的；问题在于**导出层混合了承载真实数据、补全推导、可视化摘要和指标计算副作用**。这会导致同一份结果在 JSON、summary、HTML 中出现不同口径，尤其是通信、性能时间和内存峰值。
+当前整改方向正确，且已修复上一轮最明显的展示错误；但 rank swimlane 异常暴露出更深一层的问题：**PP schedule 是多 rank 的，PP comm projection 却只为 rank 0 构造图节点**。这使 DES 和 HTML 在不同 rank 上混用了“节点真实耗时”和“phase fallback 均分耗时”，是当前最优先的准确性问题。
 
-下一步应优先把“仿真后处理/指标计算”和“格式化输出”分离：前者只运行一次并写入标准 metadata schema，后者只读取 schema 并明确标注完整输出或摘要输出。这样最符合 `DESIGN_CN.md` 中的捕获忠实、side-loaded 和模型无关核心原则。
+在修复该问题前，当前 schedule swimlane 不应作为多 rank PP 通信时序的可靠依据；可以用于查看事件顺序，但不适合用来判断不同 rank 的 PP 通信耗时差异。
