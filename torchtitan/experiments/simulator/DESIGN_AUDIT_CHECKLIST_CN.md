@@ -7,7 +7,7 @@
 
 | 类别 | 结论 | 主要问题 |
 |------|------|----------|
-| 设计原则 | 部分违背 | Side-loaded 与模型无关核心被核心模型文件改动、DeepSeek 特化逻辑、跨模型依赖削弱 |
+| 设计原则 | 部分违背 | 仿真器逻辑进入核心模型文件（token_dispatcher fake 路径）、跨模型依赖（llama4 apply_fsdp） |
 | 文档冗余/过期 | 已修复 | patch 数量、PP 通信注入名称、meta_device_patches docstring、HTML 自包含描述已统一 |
 | 文档有但代码未实现 | 已标注 | `mode`/`capture_joint_fx`/`max_seq_len`/`batch_size` 已标注"Reserved"；`Simulator` API 未实现(路线图) |
 | 代码死路径/不可达 | 已清理 | `_reapply_fsdp2_to_parts`、`schedule_generator.py`、`rewrite_runner.py` 已删除；gloo 不可达已记录 |

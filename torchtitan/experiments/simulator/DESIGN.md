@@ -1020,16 +1020,12 @@ parameter dimensions, not token counts).
 7. **Activation checkpointing disabled on meta.** AC mutation check raises on
    FakeTensors.
 8. **`apply_fsdp` imported from llama4.** Cross-model dependency.
-9. **DeepSeek-specific logic in `trainer.py`.** `expert_parallel_comm_backend`,
-   `fsdp_gradient_divide_factor`, `get_optional_mesh` patches, and model-name
-   string checks are DeepSeek-specific but live in the generic simulator wrapper.
-   Should be moved to a model adapter layer.
-10. **Simulator logic in core model files.** `token_dispatcher.py` has a
+9. **Simulator logic in core model files.** `token_dispatcher.py` has a
     `_is_fake` branch for forced load-balance. Annotated as simulator-only but
     not isolated to `experiments/simulator/`.
-11. **`collect_extension_metadata` defined but not called.** Extension packages
+10. **`collect_extension_metadata` defined but not called.** Extension packages
     cannot collect metadata during capture.
-12. **Config fields reserved but unimplemented.** `mode`, `capture_joint_fx`,
+11. **Config fields reserved but unimplemented.** `mode`, `capture_joint_fx`,
     `max_seq_len`, `batch_size` are defined but not consumed. Annotated as
     "Reserved for future use."
 

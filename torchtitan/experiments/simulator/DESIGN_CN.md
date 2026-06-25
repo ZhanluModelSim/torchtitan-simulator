@@ -947,13 +947,10 @@ FSDP2 all_gather/reduce_scatter），确切 token 计数不影响通信形状（
 6. **`mixed_precision_param` 在 meta 上强制为 fp32。** bfloat16 导致 DTensor dtype 不匹配。
 7. **激活检查点在 meta 上禁用。** AC 变更检查在 FakeTensor 上抛出。
 8. **`apply_fsdp` 从 llama4 导入。** 跨模型依赖。
-9. **DeepSeek 特化逻辑在 `trainer.py` 中。** `expert_parallel_comm_backend`、
-   `fsdp_gradient_divide_factor`、`get_optional_mesh` 补丁和模型名字符串判断是
-   DeepSeek 特定的，但位于通用仿真器 wrapper 中。应迁移到模型适配层。
-10. **仿真器逻辑在核心模型文件中。** `token_dispatcher.py` 有 `_is_fake` 强制负载均衡
+9. **仿真器逻辑在核心模型文件中。** `token_dispatcher.py` 有 `_is_fake` 强制负载均衡
     分支。已标注为 simulator-only 但未隔离到 `experiments/simulator/`。
-11. **`collect_extension_metadata` 已定义但未调用。** 扩展包在捕获阶段无法收集 metadata。
-12. **配置项已定义但未实现。** `mode`、`capture_joint_fx`、`max_seq_len`、`batch_size`
+10. **`collect_extension_metadata` 已定义但未调用。** 扩展包在捕获阶段无法收集 metadata。
+11. **配置项已定义但未实现。** `mode`、`capture_joint_fx`、`max_seq_len`、`batch_size`
     已定义但未被消费。已标注为"Reserved for future use。"
 
 ---
