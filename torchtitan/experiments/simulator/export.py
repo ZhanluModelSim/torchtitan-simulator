@@ -816,6 +816,13 @@ def _json_script_payload(result: SimulationResult) -> str:
             "schedule": schedule_data,
             "compute_graph": compressed_graph,
             "memory_events": [e.to_dict() for e in result.memory_events[:1000]],
+            "_truncation": {
+                "memory_events_original": len(result.memory_events),
+                "memory_events_kept": min(1000, len(result.memory_events)),
+                "graph_compressed": True,
+                "op_node_ids_max": 100,
+                "original_node_count": len(result.compute_graph.nodes),
+            },
         }
         return escape(json.dumps(compact, default=str), quote=False)
     data = result.to_dict()
@@ -878,6 +885,7 @@ def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> N
                 start, finish = des_event_map[eid]
                 ev_copy["perf_total_time_us"] = round(finish - start, 3)
                 ev_copy["perf_cumulative_start_us"] = round(start, 3)
+                ev_copy["timing_source"] = "des"
             else:
                 count = event_counts.get(phase, 1)
                 phase_total = phase_totals.get(phase, 0.0)
@@ -886,6 +894,7 @@ def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> N
                 ev_copy["perf_cumulative_start_us"] = round(
                     cumulative_per_phase.get(phase, 0.0), 3
                 )
+                ev_copy["timing_source"] = "phase_even_split"
                 cumulative_per_phase[phase] = (
                     cumulative_per_phase.get(phase, 0.0) + per_event
                 )
@@ -1045,7 +1054,12 @@ def export_html(
     fsdp_degree = memory_summary.get("fsdp_degree", 1)
     shard_factor = memory_summary.get("shard_factor", 1)
     cost_summary = result.metadata.get("cost_model", {}) or {}
+    # Fallback to DES e2e step time when cost_model summary is empty
     perf_grand_total_us = cost_summary.get("e2e_step_time_us", 0)
+    if not perf_grand_total_us:
+        perf_grand_total_us = result.metadata.get("des_engine", {}).get(
+            "e2e_step_time_us", 0
+        )
     data_payload = _json_script_payload(result)
     steps = sorted({_event_step(ev) for ev in schedule_events}) or [0]
     has_des = any(
@@ -1135,8 +1149,9 @@ def export_html(
     <section class="cards">
       <div class="card"><div class="num">{len(result.compute_graph.nodes)}</div><div>Operator nodes</div></div>
       <div class="card"><div class="num">{len(result.compute_graph.edges)}</div><div>Graph edges</div></div>
-      <div class="card"><div class="num">{len(schedule_events)}</div><div>Schedule events</div></div>
-      <div class="card"><div class="num">{len(result.comm_events)}</div><div>Communication events</div></div>
+      <div class="card"><div class="num">{len(schedule_events)}</div><div>Swimlane events</div></div>
+      <div class="card"><div class="num">{sum(1 for n in result.compute_graph.nodes.values() if n.op_type in ('comm_collective','comm_p2p'))}</div><div>Graph comm ops</div></div>
+      <div class="card"><div class="num">{len(result.comm_events)}</div><div>PP projected events</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(per_gpu_model_state))}</div><div>Per-GPU model state</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(whole_model_state))}</div><div>Whole-model state</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(peak_memory))}</div><div>Activation peak</div></div>
@@ -1844,8 +1859,17 @@ def export_text_summary(result: SimulationResult) -> str:
     for p, c in sorted(phase_counts.items()):
         lines.append(f"    {p:<22}: {c}")
 
-    section("Communication Events")
-    lines.append(f"  Total comm events: {len(result.comm_events)}")
+    section("Communication")
+    # Graph comm ops (from compute graph OpNodes)
+    graph_comm = [n for n in result.compute_graph.nodes.values()
+                 if n.op_type in ("comm_collective", "comm_p2p")]
+    lines.append(f"  Graph comm ops: {len(graph_comm)}")
+    from collections import Counter as _C
+    graph_comm_ops = _C(n.comm_op or n.op_name for n in graph_comm)
+    for op, c in sorted(graph_comm_ops.items()):
+        lines.append(f"    {op:<22}: {c}")
+    # PP projected events (from result.comm_events)
+    lines.append(f"  PP projected events: {len(result.comm_events)}")
     op_counts: dict[str, int] = {}
     for ev in result.comm_events:
         op = ev.get("op", "unknown")

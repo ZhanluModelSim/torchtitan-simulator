@@ -624,7 +624,7 @@ class TestExport(unittest.TestCase):
         result = self._make_result()
         summary = export_text_summary(result)
         assert "Compute Graph Summary" in summary
-        assert "Communication Events" in summary
+        assert "Communication" in summary
         assert "Memory Estimate" in summary
         assert "activation" in summary
         assert "Total ops" in summary

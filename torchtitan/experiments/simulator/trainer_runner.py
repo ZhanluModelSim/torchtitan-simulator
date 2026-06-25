@@ -618,6 +618,14 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
     data_iterator = trainer.batch_generator(trainer.dataloader)
 
+    # Override gradient_accumulation_steps to 1 for simulation. On meta device,
+    # each dispatched op creates Python objects (OpNode, TensorMeta, autograd
+    # Node ≈ 500 bytes/op). With 61 layers × 256 experts × 16 ga_steps, this
+    # would consume ~2.4 GB of Python object memory. One microbatch is
+    # sufficient to capture the compute graph and communication operators.
+    # PP schedule extraction uses pipeline_parallel_microbatch_size (not ga_steps).
+    trainer.gradient_accumulation_steps = 1
+
     # Pre-fetch batches outside of FakeTensorMode to avoid dataloader internal crashes
     batches = []
     for _ in range(trainer.gradient_accumulation_steps):
@@ -710,6 +718,9 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     )
     result.memory_events.extend(memory_events)
     result.metadata.update(memory_summary)
+    # Also write into the "memory" sub-dict so HTML/exporters that read
+    # metadata["memory"]["peak_live_bytes"] find the value.
+    result.metadata.setdefault("memory", {}).update(memory_summary)
 
     attach_model_state_memory(
         result,
@@ -719,6 +730,20 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         else None,
         parallelism_config=trainer.config.parallelism,
     )
+
+    # --- Unified metric computation (before export, format-order-independent) ---
+    # Populate DES metadata once here so all exporters (including text-only)
+    # can read it without lazy-loading side effects.
+    from .export import _populate_des_metadata, _inject_schedule_timing
+
+    _populate_des_metadata(result)
+    # Inject schedule timing into result.metadata so DES memory timeline
+    # and text summary can use it regardless of which formats are exported.
+    _result_dict = result.to_dict()
+    _inject_schedule_timing(_result_dict, result)
+    result.metadata["perf_schedule"] = _result_dict.get("perf_schedule", {})
+    if "schedule" in _result_dict and "events" in _result_dict["schedule"]:
+        result.metadata["_schedule_events_enriched"] = _result_dict["schedule"]["events"]
 
     postprocess_extension_result(result, trainer, sim_opts)
     _export_result(result, sim_opts.output_dir, sim_opts.output_formats)
