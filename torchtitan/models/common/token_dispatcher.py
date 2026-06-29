@@ -245,64 +245,83 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
                 x, top_scores, selected_experts_indices
             )
 
-        # TODO: Extract this local reordering block (histc, argsort, score
-        # application) into a shared helper — it's duplicated in
-        # LocalTokenDispatcher.dispatch.
-        # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
-        num_tokens_per_expert = torch.bincount(
-            selected_experts_indices.view(-1).long(),
-            minlength=self.num_experts,
+        # ------------------------------------------------------------------
+        # Simulator-only: forced load-balance path for meta / fake-tensor.
+        #
+        # This branch is activated only when FakeTensors are detected (meta
+        # device simulation). It is NOT used in real training. See
+        # torchtitan/experiments/simulator/DESIGN.md §20.6 for rationale.
+        # ------------------------------------------------------------------
+        _is_fake = any(
+            isinstance(t, torch.Tensor) and hasattr(t, "fake_mode")
+            for t in (x, top_scores, selected_experts_indices)
         )
 
+        num_tokens = x.shape[0]
+        total_routed = num_tokens * self.top_k
+        num_local_experts = (self.num_experts + ep_size - 1) // ep_size
+        padded_num_experts = num_local_experts * ep_size
+
         # Reorder the token indices to match the order of the experts
-        # token_indices_experts_sorted shape (bs*slen*top_k,)
         token_indices_experts_sorted = torch.argsort(
             selected_experts_indices.view(-1), stable=True
         )
-
         top_scores_experts_sorted = top_scores.view(-1)[token_indices_experts_sorted]
         token_indices_experts_sorted = token_indices_experts_sorted // self.top_k
-
-        # shape (bs*slen*top_k, dim)
         routed_input = x[token_indices_experts_sorted]
 
-        # Apply scores before expert computation if configured
         if self.score_before_experts:
             routed_input = (
                 routed_input.to(torch.float32)
                 * top_scores_experts_sorted.reshape(-1, 1)
             ).to(x.dtype)
 
-        # generate the input splits and output splits for all-to-all
-        with torch.no_grad():
-            num_tokens_per_expert_group = all_to_all_single(
-                num_tokens_per_expert,
-                None,
-                None,
-                group=self.ep_mesh,
+        if _is_fake:
+            # Forced load-balance: uniform token distribution across EP ranks.
+            tokens_per_rank = total_routed // ep_size
+            input_splits_list = [tokens_per_rank] * ep_size
+            output_splits_list = [tokens_per_rank] * ep_size
+
+            # Uniform num_tokens_per_expert (all equal, non-zero).
+            tpe = tokens_per_rank // num_local_experts if num_local_experts > 0 else 0
+            num_tokens_per_expert_group = torch.full(
+                (padded_num_experts,),
+                tpe,
+                dtype=torch.long,
+                device=x.device,
             )
-            # Need to wait explicitly because it is used by a triton kernel later
-            # which doesn't realize that AsyncCollectiveTensor needs unwrapping
-            num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
-                num_tokens_per_expert_group
+        else:
+            # Real path: bincount + all_to_all for actual token counts.
+            num_tokens_per_expert = torch.bincount(
+                selected_experts_indices.view(-1).long(),
+                minlength=self.num_experts,
             )
-            # non_blocking=True is safe in eager, but under torch.compile the
-            # async D2H transfer can race with the subsequent .tolist()/.item()
-            # calls, producing stale values and failing unbacked-symint guards.
-            non_blocking = not torch.compiler.is_compiling()
-            input_splits = (
-                num_tokens_per_expert.view(ep_size, -1)
-                .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=non_blocking)
-            )
-            # NOTE: this would incur a device-to-host sync
-            output_splits = (
-                num_tokens_per_expert_group.view(ep_size, -1)
-                .sum(dim=1)
-                .to(torch.device("cpu"), non_blocking=False)
-            )
-            input_splits_list = input_splits.tolist()
-            output_splits_list = output_splits.tolist()
+            if num_tokens_per_expert.numel() < padded_num_experts:
+                num_tokens_per_expert = F.pad(
+                    num_tokens_per_expert,
+                    (0, padded_num_experts - num_tokens_per_expert.numel()),
+                )
+
+            with torch.no_grad():
+                num_tokens_per_expert_group = all_to_all_single(
+                    num_tokens_per_expert, None, None, group=self.ep_mesh,
+                )
+                num_tokens_per_expert_group = torch.ops._c10d_functional.wait_tensor(
+                    num_tokens_per_expert_group
+                )
+                non_blocking = not torch.compiler.is_compiling()
+                input_splits = (
+                    num_tokens_per_expert.view(ep_size, -1)
+                    .sum(dim=1)
+                    .to(torch.device("cpu"), non_blocking=non_blocking)
+                )
+                output_splits = (
+                    num_tokens_per_expert_group.view(ep_size, -1)
+                    .sum(dim=1)
+                    .to(torch.device("cpu"), non_blocking=False)
+                )
+                input_splits_list = input_splits.tolist()
+                output_splits_list = output_splits.tolist()
 
         # All-to-all dispatch tokens to EP ranks
         routed_input = all_to_all_single_autograd(
@@ -312,24 +331,30 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
             self.ep_mesh,
         )
 
-        # Reorder from rank-major to expert-major via _permute.
-        #
-        # num_tokens_per_expert_group layout after all-to-all:
-        #   (e0,r0), (e1,r0), ..., (e0,r1), (e1,r1), ...  (rank-major)
-        # _permute reshuffles to:
-        #   (e0,r0), (e0,r1), ..., (e1,r0), (e1,r1), ...  (expert-major)
-        num_local_experts = num_tokens_per_expert_group.shape[0] // ep_size
-        (
-            input_shape,
-            routed_input,
-            permuted_indices,
-            num_tokens_per_expert_group,
-        ) = self._permute(
-            routed_input,
-            num_tokens_per_expert_group,
-            ep_size,
-            num_local_experts,
-        )
+        if _is_fake:
+            # Simplified _permute for uniform distribution: identity permutation.
+            # With forced load-balance, rank-major == expert-major (every
+            # segment has the same length), so no reordering is needed.
+            input_shape = routed_input.shape
+            permuted_indices = torch.arange(
+                routed_input.shape[0], device=x.device
+            )
+            # num_tokens_per_expert_local (sum across ranks per expert)
+            num_tokens_per_expert_local = num_tokens_per_expert_group.view(
+                ep_size, num_local_experts
+            ).sum(0)
+        else:
+            (
+                input_shape,
+                routed_input,
+                permuted_indices,
+                num_tokens_per_expert_local,
+            ) = self._permute(
+                routed_input,
+                num_tokens_per_expert_group,
+                ep_size,
+                num_local_experts,
+            )
 
         metadata = AllToAllDispatchMetadata(
             token_indices_experts_sorted=token_indices_experts_sorted,
@@ -340,7 +365,7 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
             output_splits=output_splits_list,
             original_num_tokens=original_num_tokens,
         )
-        return routed_input, num_tokens_per_expert_group, metadata
+        return routed_input, num_tokens_per_expert_local, metadata
 
     def _permute(
         self, routed_input, num_tokens_per_expert_group, ep_size, num_local_experts
@@ -421,10 +446,16 @@ class AllToAllTokenDispatcher(LocalTokenDispatcher):
         if self.ep_mesh is None:
             return super().combine(routed_output, metadata, x, shared_experts)
 
-        # Reverse expert-major reordering
-        routed_output = self._unpermute(
-            routed_output, metadata.input_shape, metadata.permuted_indices
-        )
+        _is_fake = hasattr(routed_output, "fake_mode")
+
+        # Reverse expert-major reordering.
+        # On meta (fake path), dispatch used identity permutation, so
+        # _unpermute is a no-op — skip it to avoid in-place index assignment
+        # which triggers "tensor cached during AC has been mutated".
+        if not _is_fake:
+            routed_output = self._unpermute(
+                routed_output, metadata.input_shape, metadata.permuted_indices
+            )
         # All-to-all combine: returns AsyncCollectiveTensor — the a2a runs
         # on the NCCL stream and won't block until the tensor is accessed.
         routed_output = all_to_all_single_autograd(

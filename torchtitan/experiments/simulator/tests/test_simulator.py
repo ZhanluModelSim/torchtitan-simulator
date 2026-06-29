@@ -324,21 +324,21 @@ class TestMemoryEstimator(unittest.TestCase):
 
 
 # ===========================================================================
-# Dispatch interceptor tests
+# Unified trace dispatch capture tests
 # ===========================================================================
 
 
-class TestOpCaptureMode(unittest.TestCase):
+class TestUnifiedTraceCapture(unittest.TestCase):
     def test_captures_matmul(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder(rank=0)
         a = torch.randn(4, 8)
         b = torch.randn(8, 4)
-        with capture_ops(recorder, phase="forward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
             torch.mm(a, b)
 
         assert len(recorder.nodes) > 0
@@ -346,58 +346,56 @@ class TestOpCaptureMode(unittest.TestCase):
         assert any("mm" in name.lower() for name in op_names), f"ops: {op_names}"
 
     def test_phase_labelling(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder(rank=0)
         x = torch.randn(3, 3)
-        with capture_ops(recorder, phase="backward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="backward"):
             _ = x @ x
 
         phases = {n.phase for n in recorder.nodes}
         assert "backward" in phases
 
     def test_categorizes_relu(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder(rank=0)
         x = torch.randn(4)
-        with capture_ops(recorder, phase="forward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
             torch.relu(x)
 
-        # relu is a compute op
         types = {n.op_type for n in recorder.nodes}
         assert "compute" in types
 
     def test_tensor_meta_captured(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder(rank=0)
         x = torch.randn(3, 5)
-        with capture_ops(recorder, phase="forward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
             torch.sigmoid(x)
 
-        # At least one output shape should be (3, 5)
         shapes = [tuple(m.shape) for n in recorder.nodes for m in n.outputs]
         assert (3, 5) in shapes, f"shapes={shapes}"
 
-    def test_runtime_data_edges_from_tensor_producers(self):
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+    def test_data_edges_from_tensor_producers(self):
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            TraceRecorder,
+            unified_trace,
         )
 
-        recorder = OpRecorder()
+        recorder = TraceRecorder(rank=0)
         x = torch.randn(2, 2)
-        with capture_ops(recorder, phase="forward"):
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
             y = torch.relu(x)
             _ = y + 1.0
 
@@ -431,7 +429,7 @@ class TestCommRecorder(unittest.TestCase):
     def test_records_all_reduce(self):
         import torch.distributed as dist
 
-        from torchtitan.experiments.simulator.comm_interceptor import (
+        from torchtitan.experiments.simulator.capture.unified_trace import (
             capture_comms,
             CommRecorder,
         )
@@ -448,7 +446,7 @@ class TestCommRecorder(unittest.TestCase):
     def test_records_broadcast(self):
         import torch.distributed as dist
 
-        from torchtitan.experiments.simulator.comm_interceptor import (
+        from torchtitan.experiments.simulator.capture.unified_trace import (
             capture_comms,
             CommRecorder,
         )
@@ -464,19 +462,17 @@ class TestCommRecorder(unittest.TestCase):
     def test_comm_event_has_source_node_ids(self):
         import torch.distributed as dist
 
-        from torchtitan.experiments.simulator.comm_interceptor import (
+        from torchtitan.experiments.simulator.capture.unified_trace import (
             capture_comms,
             CommRecorder,
-        )
-        from torchtitan.experiments.simulator.dispatch_interceptor import (
-            capture_ops,
-            OpRecorder,
+            TraceRecorder,
+            unified_trace,
         )
 
         comm = CommRecorder(rank=0)
-        ops = OpRecorder()
+        rec = TraceRecorder(rank=0)
         x = torch.ones(4)
-        with capture_ops(ops, phase="forward"):
+        with unified_trace(rec, use_fake_mode=False, phase="forward"):
             y = x + 1
             with capture_comms(comm):
                 dist.all_reduce(y)
@@ -494,7 +490,9 @@ class TestCommRecorder(unittest.TestCase):
 class TestFSDPEventRecorder(unittest.TestCase):
     def test_records_custom_hooks(self):
         """Test FSDPEventRecorder directly without actual FSDPModule."""
-        from torchtitan.experiments.simulator.fsdp_tracer import FSDPEventRecorder
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            FSDPEventRecorder,
+        )
 
         recorder = FSDPEventRecorder(rank=0)
         recorder.current_phase = "forward"
@@ -510,7 +508,9 @@ class TestFSDPEventRecorder(unittest.TestCase):
         assert "reduce_scatter_end" in types
 
     def test_logical_clock_increment(self):
-        from torchtitan.experiments.simulator.fsdp_tracer import FSDPEventRecorder
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            FSDPEventRecorder,
+        )
 
         recorder = FSDPEventRecorder(rank=0)
         for _ in range(5):
@@ -518,108 +518,6 @@ class TestFSDPEventRecorder(unittest.TestCase):
 
         clocks = [e["logical_clock"] for e in recorder.events]
         assert clocks == list(range(5)), f"clocks={clocks}"
-
-
-# ===========================================================================
-# FX capture tests
-# ===========================================================================
-
-
-class TestFxCapture(unittest.TestCase):
-    def test_forward_fx_linear(self):
-        from torchtitan.experiments.simulator.fx_capture import capture_forward_fx
-
-        model = _small_linear()
-        inputs = _example_inputs()
-        graph = capture_forward_fx(model, inputs)
-
-        assert len(graph.nodes) > 0, "No ops captured"
-        # All nodes should have phase == 'forward'
-        phases = {n.phase for n in graph.nodes.values()}
-        assert phases <= {"forward", "joint"}, f"unexpected phases: {phases}"
-
-    def test_forward_fx_has_edges(self):
-        from torchtitan.experiments.simulator.fx_capture import capture_forward_fx
-
-        model = _small_linear()
-        inputs = _example_inputs()
-        graph = capture_forward_fx(model, inputs)
-
-        # Linear → ReLU → Linear should produce at least 1 edge
-        assert len(graph.edges) > 0, "No edges captured"
-
-    def test_forward_fx_tensor_shapes(self):
-        from torchtitan.experiments.simulator.fx_capture import capture_forward_fx
-
-        model = nn.Linear(8, 4)
-        inputs = (torch.randn(2, 8),)
-        graph = capture_forward_fx(model, inputs)
-
-        all_shapes = [tuple(m.shape) for n in graph.nodes.values() for m in n.outputs]
-        assert len(all_shapes) > 0, "No output shapes captured"
-
-    def test_graph_to_compute_graph(self):
-        """Test fx_graph_to_compute_graph directly."""
-        import torch.fx as fx
-
-        from torchtitan.experiments.simulator.fx_capture import (
-            fx_graph_to_compute_graph,
-        )
-
-        model = nn.Linear(4, 4)
-        gm = fx.symbolic_trace(model)
-        graph = fx_graph_to_compute_graph(gm, phase="forward")
-        # symbolic_trace does include call_function nodes for mm/add
-        assert isinstance(graph.nodes, dict)
-
-
-# ===========================================================================
-# Graph assembler tests
-# ===========================================================================
-
-
-class TestGraphAssembler(unittest.TestCase):
-    def _make_nodes(self, n: int):
-        from torchtitan.experiments.simulator.nodes import OpNode
-
-        return [
-            OpNode(
-                node_id=f"n{i}",
-                op_name=f"aten.op_{i}",
-                op_type="compute",
-                phase="forward",
-                inputs=[],
-                outputs=[],
-            )
-            for i in range(n)
-        ]
-
-    def test_from_runtime_sequential_edges(self):
-        from torchtitan.experiments.simulator.graph_assembler import GraphAssembler
-
-        nodes = self._make_nodes(4)
-        graph = GraphAssembler.from_runtime(nodes)
-        assert len(graph.nodes) == 4
-        # 3 sequential edges
-        assert len(graph.edges) == 3
-
-    def test_merge_comm_events(self):
-        from torchtitan.experiments.simulator.graph_assembler import GraphAssembler
-        from torchtitan.experiments.simulator.nodes import ComputeGraph
-
-        graph = ComputeGraph()
-        comm_events = [
-            {"op": "all_reduce", "op_type": "comm_collective", "phase": "forward"},
-            {
-                "op": "reduce_scatter_tensor",
-                "op_type": "comm_collective",
-                "phase": "backward",
-            },
-        ]
-        GraphAssembler.merge_comm_events(graph, comm_events)
-        assert len(graph.nodes) == 2
-        types = {n.op_type for n in graph.nodes.values()}
-        assert "comm_collective" in types
 
 
 # ===========================================================================
@@ -726,7 +624,7 @@ class TestExport(unittest.TestCase):
         result = self._make_result()
         summary = export_text_summary(result)
         assert "Compute Graph Summary" in summary
-        assert "Communication Events" in summary
+        assert "Communication" in summary
         assert "Memory Estimate" in summary
         assert "activation" in summary
         assert "Total ops" in summary
@@ -742,23 +640,240 @@ class TestExport(unittest.TestCase):
             with open(path) as f:
                 content = f.read()
             assert "TorchTitan Simulation Trace" in content
-            assert "operator swimlane" in content
             # Check for ECharts library
             assert "echarts" in content
-            # Check for new visualization containers
+            # Check for visualization containers
             assert "memory-timeline" in content
             assert "timeline-" in content
-            assert "swimlane-" in content
-            # Check for swimlane categories
-            assert "Cube" in content
-            assert "Vec" in content
-            assert "Communication" in content
             # Check for summary cards
             assert "Per-GPU model state" in content
             assert "Whole-model state" in content
             assert "Activation peak" in content
             assert "Memory estimate summary" in content
             assert "Memory trace timeline" in content
+
+    def test_is_cluster_parallel_comm_node(self):
+        from torchtitan.experiments.simulator.export import (
+            _is_cluster_parallel_comm_node,
+        )
+        from torchtitan.experiments.simulator.nodes import OpNode
+
+        fsdp_comm = OpNode(
+            node_id="c1",
+            op_name="all_gather",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={"synthetic": True, "fsdp2": True},
+        )
+        pp_comm = OpNode(
+            node_id="c1b",
+            op_name="pp_send_activation",
+            op_type="comm_p2p",
+            phase="forward",
+            attrs={"synthetic": True, "pp": True},
+        )
+        tp_comm = OpNode(
+            node_id="c1c",
+            op_name="all_reduce",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={"synthetic": True, "tp": True},
+        )
+        cp_comm = OpNode(
+            node_id="c1d",
+            op_name="all_to_all",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={"synthetic": True, "cp": True},
+        )
+        ep_comm = OpNode(
+            node_id="c1e",
+            op_name="all_to_all",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={"synthetic": True, "ep": True},
+        )
+        real_comm = OpNode(
+            node_id="c2",
+            op_name="all_reduce",
+            op_type="comm_collective",
+            phase="forward",
+            attrs={},
+        )
+        synthetic_compute = OpNode(
+            node_id="k1",
+            op_name="aten.mm.default",
+            op_type="compute",
+            phase="forward",
+            attrs={"synthetic": True, "fsdp2": True},
+        )
+
+        assert _is_cluster_parallel_comm_node(fsdp_comm) is True
+        assert _is_cluster_parallel_comm_node(pp_comm) is True
+        assert _is_cluster_parallel_comm_node(tp_comm) is False
+        assert _is_cluster_parallel_comm_node(cp_comm) is False
+        assert _is_cluster_parallel_comm_node(ep_comm) is False
+        assert _is_cluster_parallel_comm_node(real_comm) is False
+        assert _is_cluster_parallel_comm_node(synthetic_compute) is False
+
+    def _make_phase_result_with_perf(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            DataEdge,
+            OpNode,
+            PerfResult,
+            SimulationResult,
+            TensorMeta,
+        )
+
+        g = ComputeGraph(metadata={"rank": 0})
+        g.add_node(
+            OpNode(
+                "f1",
+                "aten.mm.default",
+                "compute",
+                "forward",
+                outputs=[TensorMeta((2, 4), "torch.float32", "cpu")],
+                perf_result=PerfResult(
+                    compute_time_us=10.0,
+                    total_time_us=10.0,
+                    flops=128,
+                    bytes_read=32,
+                    bytes_written=32,
+                ),
+            )
+        )
+        g.add_node(
+            OpNode(
+                "b1",
+                "all_reduce",
+                "comm_collective",
+                "backward",
+                comm_op="all_reduce",
+                perf_result=PerfResult(
+                    comm_time_us=5.0, total_time_us=5.0, bytes_written=64
+                ),
+            )
+        )
+        g.add_node(
+            OpNode(
+                "o1",
+                "adam_step",
+                "compute",
+                "optimizer",
+                perf_result=PerfResult(compute_time_us=3.0, total_time_us=3.0),
+            )
+        )
+        g.add_edge(DataEdge("f1", "b1", "data"))
+        g.add_edge(DataEdge("b1", "o1", "data"))
+        return SimulationResult(compute_graph=g, metadata={"mode": "test"})
+
+    def test_export_kernel_summary_csv_columns_and_rows(self):
+        import csv
+
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+
+        result = self._make_phase_result_with_perf()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+            assert os.path.exists(path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        # one row per operator across fwd + bwd + opt
+        assert len(rows) == 3
+        header = rows[0].keys()
+        for col in (
+            "Order",
+            "Name",
+            "Type",
+            "Phase",
+            "Start(us)",
+            "End(us)",
+            "Duration(us)",
+            "ComputeTime(us)",
+            "CommTime(us)",
+            "FLOPs",
+            "BytesRead",
+            "BytesWritten",
+        ):
+            assert col in header, col
+
+        phases = {r["Phase"] for r in rows}
+        assert phases == {"forward", "backward", "optimizer"}
+
+    def test_export_kernel_summary_csv_sequential_timeline(self):
+        import csv
+
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+
+        result = self._make_phase_result_with_perf()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        # order is a 0-based contiguous sequence
+        assert [int(r["Order"]) for r in rows] == [0, 1, 2]
+        # durations 10, 5, 3 → sequential cumulative timeline
+        assert float(rows[0]["Start(us)"]) == 0.0
+        assert float(rows[0]["End(us)"]) == 10.0
+        assert float(rows[1]["Start(us)"]) == 10.0
+        assert float(rows[1]["End(us)"]) == 15.0
+        assert float(rows[2]["Start(us)"]) == 15.0
+        assert float(rows[2]["End(us)"]) == 18.0
+        # breakdown is populated
+        assert float(rows[0]["ComputeTime(us)"]) == 10.0
+        assert float(rows[1]["CommTime(us)"]) == 5.0
+        assert int(rows[0]["FLOPs"]) == 128
+
+    def test_export_kernel_summary_csv_prefers_des_timing(self):
+        import csv
+
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+
+        result = self._make_phase_result_with_perf()
+        nodes = result.compute_graph.nodes
+        nodes["f1"].des_start_time_us = 100.0
+        nodes["f1"].des_finish_time_us = 110.0
+        nodes["b1"].des_start_time_us = 105.0
+        nodes["b1"].des_finish_time_us = 110.0
+        nodes["o1"].des_start_time_us = 110.0
+        nodes["o1"].des_finish_time_us = 113.0
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        # ordered by DES start time, using DES start/end directly
+        assert [r["Name"] for r in rows] == [
+            "aten.mm.default",
+            "all_reduce",
+            "adam_step",
+        ]
+        assert float(rows[0]["Start(us)"]) == 100.0
+        assert float(rows[1]["Start(us)"]) == 105.0
+
+    def test_export_kernel_summary_csv_excludes_phase_boundary(self):
+        import csv
+
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+
+        result = self._make_phase_result_with_perf()
+        result.compute_graph.add_phase_boundary_edges()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+            with open(path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+        assert all("phase_end" not in r["Name"] for r in rows)
+        assert all(r["Type"] != "phase_boundary" for r in rows)
 
     def test_chrome_trace_schedule_events_have_des_timing(self):
         from torchtitan.experiments.simulator.des_engine import simulate_multi_rank_des
@@ -1335,123 +1450,6 @@ class TestCostModel(unittest.TestCase):
         assert flops == 5 * 4, f"silu should be 5 FLOPs/elem, got {flops}"
 
 
-# ===========================================================================
-# Synthetic comm injection tests
-# ===========================================================================
-
-
-class TestSyntheticCommInjection(unittest.TestCase):
-    def test_shape_is_numel_not_bytes(self):
-        from torchtitan.experiments.simulator.memory_estimator import tensor_nbytes
-        from torchtitan.experiments.simulator.nodes import TensorMeta
-
-        per_layer_numel = 1024
-        dtype_str = "torch.bfloat16"
-        tm = TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
-        nbytes = tensor_nbytes(tm)
-        assert (
-            nbytes == per_layer_numel * 2
-        ), f"bf16: {per_layer_numel} elements × 2 bytes = {nbytes}"
-
-        full_numel = per_layer_numel * 4
-        tm_full = TensorMeta(shape=(full_numel,), dtype=dtype_str, device="cpu")
-        nbytes_full = tensor_nbytes(tm_full)
-        assert nbytes_full == full_numel * 2
-
-    def test_reduce_scatter_shape_product_matches_bytes(self):
-        from torchtitan.experiments.simulator.cost_model import _tensor_bytes
-        from torchtitan.experiments.simulator.nodes import TensorMeta
-
-        numel = 256
-        tm = TensorMeta(shape=(numel,), dtype="torch.bfloat16", device="cpu")
-        assert _tensor_bytes(tm.shape, tm.dtype) == numel * 2
-
-    def test_dtype_from_config_bfloat16(self):
-        from torchtitan.config import TORCH_DTYPE_MAP
-
-        mp_param = "bfloat16"
-        torch_dtype = TORCH_DTYPE_MAP.get(mp_param, torch.bfloat16)
-        dtype_str = str(torch_dtype)
-        assert dtype_str == "torch.bfloat16"
-
-    def test_inject_synthetic_comm_creates_edges(self):
-        from torchtitan.experiments.simulator.nodes import (
-            ComputeGraph,
-            OpNode,
-            SimulationResult,
-            TensorMeta,
-        )
-        from torchtitan.experiments.simulator.trainer_runner import (
-            _inject_synthetic_comm_events,
-        )
-
-        graph = ComputeGraph()
-        fwd_node = OpNode(
-            "fwd_1",
-            "aten.mm.default",
-            "compute",
-            "forward",
-            [TensorMeta((2, 4), "torch.float32", "cpu")],
-            [TensorMeta((2, 4), "torch.float32", "cpu")],
-        )
-        bwd_node = OpNode(
-            "bwd_1",
-            "aten.mm.default",
-            "compute",
-            "backward",
-            [TensorMeta((2, 4), "torch.float32", "cpu")],
-            [TensorMeta((2, 4), "torch.float32", "cpu")],
-        )
-        graph.add_node(fwd_node)
-        graph.add_node(bwd_node)
-        result = SimulationResult(compute_graph=graph)
-
-        class MockParallelism:
-            tensor_parallel_degree = 1
-            data_parallel_shard_degree = 2
-            pipeline_parallel_degree = 1
-
-        class MockTraining:
-            seq_len = 8
-            local_batch_size = 2
-            mixed_precision_param = "bfloat16"
-
-        class MockConfig:
-            parallelism = MockParallelism()
-            training = MockTraining()
-
-        class MockModelPart(nn.Module):
-            num_layers = 2
-
-            def __init__(self):
-                super().__init__()
-                self.linear = nn.Linear(16, 16)
-
-        class MockTrainer:
-            config = MockConfig()
-            model_parts = [MockModelPart()]
-
-        sim_opts = type("SimOpts", (), {"comm_backend": ""})()
-
-        _inject_synthetic_comm_events(result, MockTrainer(), sim_opts)
-
-        assert len(result.comm_events) > 0, "Should inject FSDP comm events"
-
-        comm_edges = [
-            e for e in result.compute_graph.edges if e.edge_type == "data"
-        ]
-        assert len(comm_edges) > 0, "Injected comm nodes should have sequential edges"
-
-        for ce in result.comm_events:
-            tm = ce["tensor_meta"]
-            shape_prod = 1
-            for d in tm["shape"]:
-                shape_prod *= d
-            dtype_byte = 2 if tm["dtype"] == "torch.bfloat16" else 4
-            actual_bytes = shape_prod * dtype_byte
-            assert actual_bytes > 0, "shape should be numel, not bytes"
-
-
 class TestSyntheticComputeAnchors(unittest.TestCase):
     def test_inject_synthetic_compute_adds_backward_compute(self):
         from torchtitan.experiments.simulator.nodes import (
@@ -1557,9 +1555,73 @@ class TestSyntheticComputeAnchors(unittest.TestCase):
             for n in result.compute_graph.nodes.values()
             if n.phase == "forward" and n.op_type == "compute"
         ]
-        assert any("mm" in n.op_name for n in forward_compute), (
-            "forward phase should include at least one cube-like compute anchor"
+        assert any(
+            "mm" in n.op_name for n in forward_compute
+        ), "forward phase should include at least one cube-like compute anchor"
+
+    def test_inject_synthetic_compute_scales_with_layer_count(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            SimulationResult,
+            TensorMeta,
         )
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _inject_synthetic_compute_anchors,
+        )
+
+        graph = ComputeGraph()
+        graph.add_node(
+            OpNode(
+                "fwd_vec",
+                "aten.add.Tensor",
+                "compute",
+                "forward",
+                [TensorMeta((1, 16), "torch.bfloat16", "cpu")],
+                [TensorMeta((1, 16), "torch.bfloat16", "cpu")],
+            )
+        )
+        result = SimulationResult(compute_graph=graph)
+
+        class MockParallelism:
+            pipeline_parallel_degree = 2
+
+        class MockTraining:
+            mixed_precision_param = "bfloat16"
+
+        class MockConfig:
+            parallelism = MockParallelism()
+            training = MockTraining()
+
+        class MockModelPart(nn.Module):
+            n_layers = 4
+
+            def __init__(self):
+                super().__init__()
+                self.linear = nn.Linear(16, 16)
+
+        class MockTrainer:
+            config = MockConfig()
+            model_parts = [MockModelPart()]
+
+        _inject_synthetic_compute_anchors(result, MockTrainer())
+
+        target = MockParallelism.pipeline_parallel_degree * MockModelPart.n_layers
+        phase_counts: dict[str, dict[str, int]] = {}
+        for phase in ("forward", "backward"):
+            compute_nodes = [
+                n
+                for n in result.compute_graph.nodes.values()
+                if n.phase == phase and n.op_type == "compute"
+            ]
+            cube = sum(1 for n in compute_nodes if "mm" in n.op_name.lower())
+            vec = len(compute_nodes) - cube
+            phase_counts[phase] = {"cube": cube, "vec": vec}
+
+        assert phase_counts["forward"]["cube"] >= target
+        assert phase_counts["forward"]["vec"] >= target
+        assert phase_counts["backward"]["cube"] >= target
+        assert phase_counts["backward"]["vec"] >= target
 
 
 # ===========================================================================
@@ -1621,15 +1683,15 @@ class TestPPScheduleExtractor(unittest.TestCase):
 
 class TestSimulatorPackageLayout(unittest.TestCase):
     def test_capture_subpackage_imports(self):
-        from torchtitan.experiments.simulator.capture.runtime_capture import (
-            RuntimeCapture,
-        )
         from torchtitan.experiments.simulator.capture.unified_trace import (
+            CommRecorder,
+            FSDPEventRecorder,
             TraceRecorder,
             unified_trace,
         )
 
-        assert RuntimeCapture is not None
+        assert CommRecorder is not None
+        assert FSDPEventRecorder is not None
         assert TraceRecorder is not None
         assert unified_trace is not None
 
@@ -1931,66 +1993,58 @@ class TestTrainerRunnerPhaseSwitch(unittest.TestCase):
         assert float(x.grad.item()) == 3.0
 
 
-class TestSimulatorIntegration(unittest.TestCase):
-    def test_simulate_fx_small_model(self):
-        from torchtitan.experiments.simulator import Simulator
+# ===========================================================================
+# Unified trace integration tests
+# ===========================================================================
 
-        sim = Simulator(rank=0, verbose=False)
+
+class TestUnifiedTraceIntegration(unittest.TestCase):
+    def test_unified_trace_small_model_cpu(self):
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
+
         model = _small_linear()
-        result = sim.simulate_fx(model, _example_inputs())
+        inputs = _example_inputs()
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, use_fake_mode=False, phase="forward"):
+            output = model(*inputs)
+            recorder.current_phase = "backward"
+            output.sum().backward()
 
+        result = recorder.build_result()
         assert len(result.compute_graph.nodes) > 0
+        fwd_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.phase == "forward"
+        ]
+        bwd_nodes = [
+            n for n in result.compute_graph.nodes.values() if n.phase == "backward"
+        ]
+        assert len(fwd_nodes) > 0
+        assert len(bwd_nodes) > 0
 
-    def test_simulate_runtime_small_model(self):
-        # Ensure dist is initialized for CommRecorder
-        import torch.distributed as dist
+    def test_unified_trace_fake_mode(self):
+        from torchtitan.experiments.simulator.capture.unified_trace import (
+            TraceRecorder,
+            unified_trace,
+        )
 
-        from torchtitan.experiments.simulator import Simulator
-
-        if not dist.is_initialized():
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29502")
-            os.environ.setdefault("RANK", "0")
-            os.environ.setdefault("WORLD_SIZE", "1")
-            dist.init_process_group(backend="gloo", init_method="env://")
-
-        try:
-            sim = Simulator(rank=0, verbose=False)
+        with torch.device("meta"):
             model = _small_linear()
-            result = sim.simulate_runtime([model], _example_inputs())
+        inputs = (torch.randn(2, 16, device="meta"),)
+        recorder = TraceRecorder(rank=0)
+        with unified_trace(recorder, use_fake_mode=True, phase="forward"):
+            output = model(*inputs)
+            recorder.current_phase = "backward"
+            output.sum().backward()
 
-            assert len(result.compute_graph.nodes) > 0
-        finally:
-            if dist.is_initialized():
-                dist.destroy_process_group()
-
-    def test_simulate_all_exports_files(self):
-        import torch.distributed as dist
-
-        from torchtitan.experiments.simulator import Simulator
-
-        if not dist.is_initialized():
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29503")
-            os.environ.setdefault("RANK", "0")
-            os.environ.setdefault("WORLD_SIZE", "1")
-            dist.init_process_group(backend="gloo", init_method="env://")
-
-        try:
-            sim = Simulator(rank=0, verbose=False)
-            model = _small_linear()
-            with tempfile.TemporaryDirectory() as tmpdir:
-                result = sim.simulate_all(
-                    [model],
-                    _example_inputs(),
-                    output_dir=tmpdir,
-                    output_formats=["json", "text"],
-                )
-                assert os.path.exists(os.path.join(tmpdir, "simulation_result.json"))
-                assert os.path.exists(os.path.join(tmpdir, "summary.txt"))
-        finally:
-            if dist.is_initialized():
-                dist.destroy_process_group()
+        result = recorder.build_result()
+        assert len(result.compute_graph.nodes) > 0
+        # All devices should be normalized to "cpu"
+        for n in result.compute_graph.nodes.values():
+            for tm in n.inputs + n.outputs:
+                assert tm.device == "cpu", f"Expected 'cpu', got '{tm.device}'"
 
 
 class TestOpClassification(unittest.TestCase):
@@ -2266,82 +2320,6 @@ class TestMetaDevicePatch(unittest.TestCase):
             tt_utils.device_module = original_dm
 
 
-class TestSimulatorUnified(unittest.TestCase):
-    def test_simulate_unified_cpu_mode(self):
-        from torchtitan.experiments.simulator.simulator import Simulator
-
-        sim = Simulator(rank=0, verbose=False)
-        model = _small_linear()
-        inputs = _example_inputs()
-        result = sim.simulate_unified(model, inputs, device_mode="cpu")
-        assert len(result.compute_graph.nodes) > 0
-        fwd_nodes = [
-            n for n in result.compute_graph.nodes.values() if n.phase == "forward"
-        ]
-        bwd_nodes = [
-            n for n in result.compute_graph.nodes.values() if n.phase == "backward"
-        ]
-        assert len(fwd_nodes) > 0
-        assert len(bwd_nodes) > 0
-        assert result.metadata["mode"] == "unified_trace"
-        assert result.metadata["device_mode"] == "cpu"
-
-    def test_simulate_unified_meta_mode(self):
-        from torchtitan.experiments.simulator.simulator import Simulator
-
-        sim = Simulator(rank=0, verbose=False)
-        with torch.device("meta"):
-            model = _small_linear()
-        inputs = (torch.randn(2, 16, device="meta"),)
-        result = sim.simulate_unified(model, inputs, device_mode="meta")
-        assert len(result.compute_graph.nodes) > 0
-        fwd_nodes = [
-            n for n in result.compute_graph.nodes.values() if n.phase == "forward"
-        ]
-        bwd_nodes = [
-            n for n in result.compute_graph.nodes.values() if n.phase == "backward"
-        ]
-        assert len(fwd_nodes) > 0
-        assert len(bwd_nodes) > 0
-        assert result.metadata["mode"] == "unified_trace"
-        assert result.metadata["device_mode"] == "meta"
-
-    def test_simulate_unified_meta_device_normalization(self):
-        from torchtitan.experiments.simulator.simulator import Simulator
-
-        sim = Simulator(rank=0, verbose=False)
-        with torch.device("meta"):
-            model = nn.Linear(8, 4)
-        inputs = (torch.randn(2, 8, device="meta"),)
-        result = sim.simulate_unified(model, inputs, device_mode="meta")
-        for n in result.compute_graph.nodes.values():
-            for tm in n.inputs + n.outputs:
-                assert tm.device == "cpu", f"Expected 'cpu', got '{tm.device}'"
-
-    def test_simulate_unified_produces_same_op_types_as_runtime(self):
-        from torchtitan.experiments.simulator.simulator import Simulator
-
-        sim = Simulator(rank=0, verbose=False)
-        model = nn.Linear(8, 4)
-        inputs = (torch.randn(2, 8),)
-
-        unified_result = sim.simulate_unified(model, inputs, device_mode="cpu")
-        runtime_result = sim.simulate_runtime([model], inputs)
-
-        unified_compute = {
-            n.op_name
-            for n in unified_result.compute_graph.nodes.values()
-            if n.op_type == "compute"
-        }
-        runtime_compute = {
-            n.op_name
-            for n in runtime_result.compute_graph.nodes.values()
-            if n.op_type == "compute"
-        }
-        assert len(unified_compute) > 0
-        assert len(runtime_compute) > 0
-
-
 class TestFSDP1FakeProcessGroupIntegration(unittest.TestCase):
     """Test that FSDP1 + FakeProcessGroup + CommRecorder captures
     all_gather / reduce_scatter events without multi-process execution."""
@@ -2379,7 +2357,7 @@ class TestFSDP1FakeProcessGroupIntegration(unittest.TestCase):
             ShardingStrategy,
         )
 
-        from torchtitan.experiments.simulator.comm_interceptor import (
+        from torchtitan.experiments.simulator.capture.unified_trace import (
             capture_comms,
             CommRecorder,
         )
@@ -2417,7 +2395,7 @@ class TestFSDP1FakeProcessGroupIntegration(unittest.TestCase):
             ShardingStrategy,
         )
 
-        from torchtitan.experiments.simulator.comm_interceptor import (
+        from torchtitan.experiments.simulator.capture.unified_trace import (
             capture_comms,
             CommRecorder,
         )
@@ -2911,6 +2889,136 @@ class TestDESEngine(unittest.TestCase):
         step_time = simulate_multi_rank_des(result)
         assert step_time > 0, f"Expected positive step time, got {step_time}"
         assert all(e.des_start_time_us is not None for e in schedule.events)
+
+
+class TestRankSemanticExpansion(unittest.TestCase):
+    def _fake_trainer(self):
+        from types import SimpleNamespace
+
+        training = SimpleNamespace(
+            mixed_precision_param="bfloat16",
+            mixed_precision_reduce="float32",
+            seq_len=4,
+            local_batch_size=2,
+        )
+        return SimpleNamespace(
+            config=SimpleNamespace(training=training),
+            model_parts=[],
+        )
+
+    def _two_rank_pp_send_result(self):
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            ScheduleEvent,
+            SimulationResult,
+            TrainingSchedule,
+        )
+
+        schedule = TrainingSchedule()
+        for rank in (0, 1):
+            schedule.add_event(
+                ScheduleEvent(
+                    f"send_r{rank}",
+                    "pp_send_activation",
+                    rank=rank,
+                    pp_stage=0,
+                    pp_rank=0,
+                    microbatch_idx=0,
+                )
+            )
+        return SimulationResult(compute_graph=ComputeGraph(), schedule=schedule)
+
+    def test_pp_comm_projection_preserves_rank_specific_events(self):
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _project_pp_comm_from_schedule,
+        )
+
+        result = self._two_rank_pp_send_result()
+
+        _project_pp_comm_from_schedule(result, self._fake_trainer())
+
+        pp_nodes = [
+            node
+            for node in result.compute_graph.nodes.values()
+            if node.op_type == "comm_p2p"
+        ]
+        assert len(pp_nodes) == 2
+        assert {node.rank for node in pp_nodes} == {0, 1}
+        assert {node.attrs.get("schedule_event_id") for node in pp_nodes} == {
+            "send_r0",
+            "send_r1",
+        }
+
+    def test_schedule_linking_uses_rank_specific_pp_comm_nodes(self):
+        from torchtitan.experiments.simulator.cost_model import link_schedule_to_graph
+        from torchtitan.experiments.simulator.nodes import (
+            ComputeGraph,
+            OpNode,
+            PerfResult,
+            ScheduleEvent,
+            SimulationResult,
+            TrainingSchedule,
+        )
+
+        graph = ComputeGraph()
+        for rank in (0, 1):
+            graph.add_node(
+                OpNode(
+                    f"send_node_r{rank}",
+                    "pp_send_activation",
+                    "comm_p2p",
+                    "forward",
+                    [],
+                    [],
+                    attrs={
+                        "schedule_derived": True,
+                        "pp": True,
+                        "schedule_event_id": f"send_r{rank}",
+                    },
+                    rank=rank,
+                    pp_stage=0,
+                    microbatch_idx=0,
+                    perf_result=PerfResult(total_time_us=7.0, comm_time_us=7.0),
+                )
+            )
+
+        schedule = TrainingSchedule()
+        for rank in (0, 1):
+            schedule.add_event(
+                ScheduleEvent(
+                    f"send_r{rank}",
+                    "pp_send_activation",
+                    rank=rank,
+                    pp_stage=0,
+                    pp_rank=0,
+                    microbatch_idx=0,
+                )
+            )
+        result = SimulationResult(compute_graph=graph, schedule=schedule)
+
+        link_schedule_to_graph(result)
+
+        by_rank = {event.rank: event.op_node_ids for event in schedule.events}
+        assert by_rank == {0: ["send_node_r0"], 1: ["send_node_r1"]}
+
+    def test_kernel_summary_writes_rank_specific_pp_comm_files(self):
+        from torchtitan.experiments.simulator.export import export_kernel_summary_csv
+        from torchtitan.experiments.simulator.nodes import PerfResult
+        from torchtitan.experiments.simulator.trainer_runner import (
+            _project_pp_comm_from_schedule,
+        )
+
+        result = self._two_rank_pp_send_result()
+        _project_pp_comm_from_schedule(result, self._fake_trainer())
+        for node in result.compute_graph.nodes.values():
+            node.perf_result = PerfResult(total_time_us=3.0, comm_time_us=3.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "kernel_summary.csv")
+            export_kernel_summary_csv(result, path)
+
+            assert os.path.exists(os.path.join(tmpdir, "kernel_summary_rank0.csv"))
+            assert os.path.exists(os.path.join(tmpdir, "kernel_summary_rank1.csv"))
 
 
 class TestDESUtilization(unittest.TestCase):

@@ -6,39 +6,31 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import json
 import os
-import time
 from collections.abc import Callable
+
+from contextlib import contextmanager
 from typing import Any, TypeVar
 
 import torch
 import torch.nn as nn
 
-from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.tools.logging import logger
+from .capture.unified_trace import TraceRecorder, unified_trace
 
-from .cost_model import apply_cost_model, CostModel, MockCostModel
+from .cost_model import apply_cost_model, CostModel
 from .export import (
     export_chrome_trace,
     export_dot,
     export_html,
     export_json,
+    export_kernel_summary_csv,
     export_text_summary,
 )
 from .extension_hooks import postprocess_extension_result
-from .capture.fx_capture import capture_forward_fx, capture_joint_fx
-from .memory_estimator import (
-    attach_model_state_memory,
-    dtype_size,
-    estimate_comm_memory,
-    estimate_graph_memory,
-    finalize_memory_summary,
-    merge_memory_summary,
-)
-from .nodes import ComputeGraph, DataEdge, OpNode, SimulationResult, TensorMeta
+from .nodes import DataEdge, OpNode, TensorMeta
 from .schedule.schedule_extract import extract_schedule_from_pytorch
-from .capture.unified_trace import TraceRecorder, unified_trace
 
 _T = TypeVar("_T")
 
@@ -129,6 +121,35 @@ def _export_result(result: Any, output_dir: str, output_formats: list[str]) -> N
     if "text" in output_formats:
         with open(os.path.join(output_dir, "summary.txt"), "w", encoding="utf-8") as f:
             f.write(export_text_summary(result))
+    if "csv" in output_formats:
+        export_kernel_summary_csv(
+            result, os.path.join(output_dir, "kernel_summary.csv")
+        )
+
+
+def _export_workload_graph(result: Any, config: Any, sim_opts: Any) -> None:
+    """Project the captured result into the spec L1/L2/L3 IR and export it.
+
+    Emitted as ``workload_graph.json`` (a new, additive artifact).  The
+    projection is derived entirely from captured data + declared config, so a
+    failure here must never break the primary export path.
+    """
+    rank = int(os.environ.get("RANK", "0"))
+    if rank != 0:
+        return
+    if "json" not in getattr(sim_opts, "output_formats", []):
+        return
+    try:
+        from .ir import build_workload_graph
+
+        workload = build_workload_graph(result, config)
+        output_dir = sim_opts.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, "workload_graph.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(workload.to_dict(), f, indent=2, default=str)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning("Failed to export layered workload graph: %s", exc)
 
 
 def _inject_semantic_schedule(result: Any, config: Any) -> None:
@@ -180,433 +201,139 @@ def _inject_semantic_schedule(result: Any, config: Any) -> None:
             existing.add_dep(dep)
 
 
-def _inject_synthetic_comm_events(
+def _project_pp_comm_from_schedule(
     result: Any,
     trainer: Any,
-    sim_opts: Any,
 ) -> None:
-    """Inject synthetic communication events for fake_backend mode.
+    """Project PP send/recv from the semantic schedule into the compute graph.
 
-    When running with fake_backend (no real distributed communication),
-    this function creates :class:`OpNode` entries for the FSDP all-gather,
-    FSDP reduce-scatter, TP all-reduce, PP send/recv, and other collectives that
-    *would* be triggered by real parallelism.  Shapes and group sizes are
-    derived from the model's parameter structure and the parallelism config.
+    PP communication uses ``dist.send()``/``dist.recv()`` directly (not
+    DTensor), so it cannot be naturally captured by ``UnifiedTraceMode``.
+    Instead, we project the PP events from ``result.schedule`` (produced by
+    ``extract_schedule_from_pytorch`` based on the real ``_PipelineSchedule``)
+    into the compute graph as ``comm_p2p`` OpNodes.
+
+    This is "schedule-derived" (from real PyTorch schedule) rather than
+    "synthetic" (heuristic).  See DESIGN.md §15.2.
     """
-    graph = result.compute_graph
-    parallelism = trainer.config.parallelism
-    model_parts = trainer.model_parts
+    schedule = result.schedule
+    if schedule is None:
+        return
 
-    # Read parallelism degrees
-    tp = int(getattr(parallelism, "tensor_parallel_degree", 1) or 1)
-    ds = int(getattr(parallelism, "data_parallel_shard_degree", 1) or 1)
-    pp = int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1)
-    ep = int(getattr(parallelism, "expert_parallel_degree", 1) or 1)
-    cp = int(getattr(parallelism, "context_parallel_degree", 1) or 1)
-    dr = int(getattr(parallelism, "data_parallel_replicate_degree", 1) or 1)
+    _PP_EVENT_MAP = {
+        "pp_send_activation": ("pp_send_activation", "forward", "send"),
+        "pp_recv_activation": ("pp_recv_activation", "forward", "recv"),
+        "pp_send_gradient": ("pp_send_gradient", "backward", "send"),
+        "pp_recv_gradient": ("pp_recv_gradient", "backward", "recv"),
+    }
 
-    # Resolve ds=-1 (auto-inferred) to actual value using Fake World Size
-    if ds < 0:
-        # Use the global WORLD_SIZE set by _set_fake_world_size
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        ds = max(1, world_size // (pp * tp * cp * dr))
+    pp_events = [e for e in schedule.events if e.event_type in _PP_EVENT_MAP]
+    if not pp_events:
+        return
 
-    if not (tp > 1 or ds > 1 or pp > 1):
-        return  # No parallelism → no synthetic comm needed
+    # Deduplicate by rank as well as stage/microbatch. Compute ops captured on
+    # rank 0 can be reused as templates, but PP send/recv are rank-specific
+    # schedule edges and must not collapse across ranks.
+    seen_keys: set[tuple[str, int, int | None, int | None]] = set()
+    unique_pp_events = []
+    for ev in pp_events:
+        key = (ev.event_type, ev.rank, ev.pp_stage, ev.microbatch_idx)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_pp_events.append(ev)
 
-    # ── Compute model parameter numel ─────────────────────────────────
-    total_param_numel = 0
-    per_module_numel: dict[str, int] = {}
-    for part in model_parts:
-        for name, param in part.named_parameters():
-            if param.requires_grad:
-                nel = param.numel()
-                total_param_numel += nel
-                prefix = ".".join(name.split(".")[:2])
-                per_module_numel[prefix] = per_module_numel.get(prefix, 0) + nel
+    # Build send→recv dep map from schedule's pp_comm edges
+    send_to_recv: dict[str, list[str]] = {}
+    for dep in schedule.deps:
+        if dep.dep_type == "pp_comm":
+            send_to_recv.setdefault(dep.from_event_id, []).append(dep.to_event_id)
 
-    # ── Determine dtype from config ───────────────────────────────────
+    # Compute tensor shapes from config (same logic as old injector)
     from torchtitan.config import TORCH_DTYPE_MAP
 
-    mp_param = getattr(trainer.config.training, "mixed_precision_param", "bfloat16")
-    torch_dtype = TORCH_DTYPE_MAP.get(mp_param, torch.bfloat16)
-    dtype_str = str(torch_dtype)
-    mp_reduce = getattr(trainer.config.training, "mixed_precision_reduce", "float32")
+    training = trainer.config.training
+    mp_param = getattr(training, "mixed_precision_param", "bfloat16")
+    dtype_str = str(TORCH_DTYPE_MAP.get(mp_param, torch.bfloat16))
+    mp_reduce = getattr(training, "mixed_precision_reduce", "float32")
     reduce_dtype_str = str(TORCH_DTYPE_MAP.get(mp_reduce, torch.float32))
-    dtype_byte_size = (
-        torch_dtype.itemsize
-        if hasattr(torch_dtype, "itemsize")
-        else dtype_size(dtype_str)
-    )
+    seq_len = training.seq_len
+    batch_size = training.local_batch_size
+    hidden = _guess_hidden_dim(trainer.model_parts[0]) if trainer.model_parts else 512
+    activation_numel = batch_size * seq_len * hidden
 
-    logger.info(
-        "Injecting synthetic comm events: tp=%d ds=%d pp=%d ep=%d dtype=%s total_param_numel=%d",
-        tp,
-        ds,
-        pp,
-        ep,
-        dtype_str,
-        total_param_numel,
-    )
-
-    shard_numel = total_param_numel // ds if ds > 1 else total_param_numel
-
-    # ── Helper functions ──────────────────────────────────────────────
+    graph = result.compute_graph
+    event_id_to_node_id: dict[str, str] = {}
     counter = [len(graph.nodes)]
 
     def _next_id() -> str:
         counter[0] += 1
-        return f"comm_syn_{counter[0]:07d}"
+        return f"comm_pp_{counter[0]:07d}"
 
-    def _find_last_compute_node_id(phase: str, pp_stage: int | None = None) -> str | None:
-        for nid in reversed(list(graph.nodes.keys())):
-            n = graph.nodes[nid]
-            if n.phase == phase and n.op_type == "compute":
-                # If pp_stage is specified, match it or accept None
-                if pp_stage is None or n.pp_stage is None or n.pp_stage == pp_stage:
-                    return nid
-        return None
+    for ev in unique_pp_events:
+        op_name, phase, comm_op = _PP_EVENT_MAP[ev.event_type]
+        dt = dtype_str if phase == "forward" else reduce_dtype_str
+        node_id = _next_id()
+        node = OpNode(
+            node_id=node_id,
+            op_name=op_name,
+            op_type="comm_p2p",
+            phase=phase,
+            rank=ev.rank,
+            pp_stage=ev.pp_stage,
+            pp_rank=ev.pp_rank,
+            microbatch_idx=ev.microbatch_idx,
+            inputs=[TensorMeta(shape=(activation_numel,), dtype=dt, device="cpu")],
+            outputs=[TensorMeta(shape=(activation_numel,), dtype=dt, device="cpu")],
+            comm_op=comm_op,
+            comm_group_size=2,
+            attrs={
+                "schedule_derived": True,
+                "pp": True,
+                "schedule_event_id": ev.event_id,
+            },
+        )
+        graph.add_node(node)
+        event_id_to_node_id[ev.event_id] = node_id
 
-    # ── FSDP2 all_gather + reduce_scatter events ──────────────────────
-    if ds > 1:
-        num_layers = _infer_num_layers(model_parts)
-        per_layer_numel = shard_numel // max(num_layers, 1)
-        full_layer_numel = per_layer_numel * ds
+        result.comm_events.append(
+            {
+                "event_id": node_id,
+                "op": comm_op,
+                "group_size": 2,
+                "rank": ev.rank,
+                "phase": phase,
+                "pp_stage": ev.pp_stage,
+                "pp_rank": ev.pp_rank,
+                "microbatch": ev.microbatch_idx,
+                "schedule_event_id": ev.event_id,
+                "tensor_meta": {
+                    "shape": [batch_size, seq_len, hidden],
+                    "dtype": dt,
+                    "device": "cpu",
+                },
+                "source_node_ids": [],
+                "schedule_derived": True,
+            }
+        )
 
-        for stage_idx in range(pp):
-            pp_rank = stage_idx % pp  # Calculate pp_rank from stage_idx
-            fwd_anchor = _find_last_compute_node_id("forward", stage_idx)
-            bwd_anchor = _find_last_compute_node_id("backward", stage_idx)
-
-            for i in range(num_layers):
-                node = OpNode(
-                    node_id=_next_id(),
-                    op_name="all_gather",
-                    op_type="comm_collective",
-                    phase="forward",
-                    pp_stage=stage_idx,
-                    pp_rank=pp_rank,
-                    inputs=[
-                        TensorMeta(shape=(per_layer_numel,), dtype=dtype_str, device="cpu")
-                    ],
-                    outputs=[
-                        TensorMeta(shape=(full_layer_numel,), dtype=dtype_str, device="cpu")
-                    ],
-                    comm_op="all_gather",
-                    comm_group_size=ds,
-                    attrs={"synthetic": True, "fsdp2": True},
-                )
-                graph.add_node(node)
-                if fwd_anchor:
-                    graph.add_edge(DataEdge(fwd_anchor, node.node_id, "data"))
-                result.comm_events.append(
-                    {
-                        "event_id": node.node_id,
-                        "op": "all_gather",
-                        "group_size": ds,
-                        "phase": "forward",
-                        "pp_stage": stage_idx,
-                        "pp_rank": pp_rank,
-                        "tensor_meta": {
-                            "shape": [per_layer_numel],
-                            "dtype": dtype_str,
-                            "device": "cpu",
-                        },
-                        "source_node_ids": [fwd_anchor] if fwd_anchor else [],
-                        "synthetic": True,
-                    }
-                )
-
-            for i in range(num_layers):
-                node = OpNode(
-                    node_id=_next_id(),
-                    op_name="reduce_scatter",
-                    op_type="comm_collective",
-                    phase="backward",
-                    pp_stage=stage_idx,
-                    pp_rank=pp_rank,
-                    inputs=[
-                        TensorMeta(shape=(full_layer_numel,), dtype=reduce_dtype_str, device="cpu")
-                    ],
-                    outputs=[
-                        TensorMeta(shape=(per_layer_numel,), dtype=reduce_dtype_str, device="cpu")
-                    ],
-                    comm_op="reduce_scatter",
-                    comm_group_size=ds,
-                    attrs={"synthetic": True, "fsdp2": True},
-                )
-                graph.add_node(node)
-                if bwd_anchor:
-                    graph.add_edge(DataEdge(node.node_id, bwd_anchor, "data"))
-                result.comm_events.append(
-                    {
-                        "event_id": node.node_id,
-                        "op": "reduce_scatter",
-                        "group_size": ds,
-                        "phase": "backward",
-                        "pp_stage": stage_idx,
-                        "pp_rank": pp_rank,
-                        "tensor_meta": {
-                            "shape": [full_layer_numel],
-                            "dtype": reduce_dtype_str,
-                            "device": "cpu",
-                        },
-                        "source_node_ids": [bwd_anchor] if bwd_anchor else [],
-                        "synthetic": True,
-                    }
-                )
-
-    # ── TP all_reduce events ──────────────────────────────────────────
-    if tp > 1:
-        seq_len = trainer.config.training.seq_len
-        batch_size = trainer.config.training.local_batch_size
-        hidden = _guess_hidden_dim(model_parts[0])
-        act_numel = batch_size * seq_len * hidden
-        num_layers = _infer_num_layers(model_parts)
-        tp_allreduce_count = num_layers * 2
-
-        for stage_idx in range(pp):
-            pp_rank = stage_idx % pp  # Calculate pp_rank from stage_idx
-            fwd_anchor = _find_last_compute_node_id("forward", stage_idx)
-            bwd_anchor = _find_last_compute_node_id("backward", stage_idx)
-
-            for _ in range(tp_allreduce_count):
-                node = OpNode(
-                    node_id=_next_id(),
-                    op_name="all_reduce",
-                    op_type="comm_collective",
-                    phase="forward",
-                    pp_stage=stage_idx,
-                    pp_rank=pp_rank,
-                    inputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(act_numel,), dtype=dtype_str, device="cpu")],
-                    comm_op="all_reduce",
-                    comm_group_size=tp,
-                    attrs={"synthetic": True, "tp": True},
-                )
-                graph.add_node(node)
-                if fwd_anchor:
-                    graph.add_edge(DataEdge(fwd_anchor, node.node_id, "data"))
-                result.comm_events.append(
-                    {
-                        "event_id": node.node_id,
-                        "op": "all_reduce",
-                        "group_size": tp,
-                        "phase": "forward",
-                        "pp_stage": stage_idx,
-                        "pp_rank": pp_rank,
-                        "tensor_meta": {
-                            "shape": [batch_size, seq_len, hidden],
-                            "dtype": dtype_str,
-                            "device": "cpu",
-                        },
-                        "source_node_ids": [fwd_anchor] if fwd_anchor else [],
-                        "synthetic": True,
-                    }
-                )
-
-                node = OpNode(
-                    node_id=_next_id(),
-                    op_name="all_reduce",
-                    op_type="comm_collective",
-                    phase="backward",
-                    pp_stage=stage_idx,
-                    pp_rank=pp_rank,
-                    inputs=[TensorMeta(shape=(act_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(act_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    comm_op="all_reduce",
-                    comm_group_size=tp,
-                    attrs={"synthetic": True, "tp": True},
-                )
-                graph.add_node(node)
-                if bwd_anchor:
-                    graph.add_edge(DataEdge(node.node_id, bwd_anchor, "data"))
-                result.comm_events.append(
-                    {
-                        "event_id": node.node_id,
-                        "op": "all_reduce",
-                        "group_size": tp,
-                        "phase": "backward",
-                        "pp_stage": stage_idx,
-                        "pp_rank": pp_rank,
-                        "tensor_meta": {
-                            "shape": [batch_size, seq_len, hidden],
-                            "dtype": reduce_dtype_str,
-                            "device": "cpu",
-                        },
-                        "source_node_ids": [bwd_anchor] if bwd_anchor else [],
-                        "synthetic": True,
-                    }
-                )
-
-    # ── PP send/recv events ───────────────────────────────────────────
-    if pp > 1:
-        seq_len = trainer.config.training.seq_len
-        batch_size = trainer.config.training.local_batch_size
-        hidden = _guess_hidden_dim(model_parts[0])
-        activation_numel = batch_size * seq_len * hidden
-
-        # Create send/recv pairs for each microbatch
-        num_microbatches = int(getattr(parallelism, "pipeline_parallel_microbatch_size", 8) or 8)
-
-        for mb_idx in range(num_microbatches):
-            for stage_idx in range(pp - 1):
-                # Forward: send activation from stage_idx to stage_idx+1
-                send_pp_rank = stage_idx % pp
-                recv_pp_rank = (stage_idx + 1) % pp
-                
-                send_node = OpNode(
-                    node_id=_next_id(),
-                    op_name="pp_send_activation",
-                    op_type="comm_p2p",
-                    phase="forward",
-                    pp_stage=stage_idx,
-                    pp_rank=send_pp_rank,
-                    microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
-                    comm_op="send",
-                    comm_group_size=2,
-                    attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx + 1},
-                )
-                graph.add_node(send_node)
-
-                recv_node = OpNode(
-                    node_id=_next_id(),
-                    op_name="pp_recv_activation",
-                    op_type="comm_p2p",
-                    phase="forward",
-                    pp_stage=stage_idx + 1,
-                    pp_rank=recv_pp_rank,
-                    microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=dtype_str, device="cpu")],
-                    comm_op="recv",
-                    comm_group_size=2,
-                    attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
-                )
-                graph.add_node(recv_node)
-
-                # Add edge: send -> recv
-                graph.add_edge(DataEdge(send_node.node_id, recv_node.node_id, "pp_p2p"))
-
-                result.comm_events.append(
-                    {
-                        "event_id": send_node.node_id,
-                        "op": "send",
-                        "group_size": 2,
-                        "phase": "forward",
-                        "pp_stage": stage_idx,
-                        "pp_rank": send_pp_rank,
-                        "microbatch": mb_idx,
-                        "tensor_meta": {
-                            "shape": [batch_size, seq_len, hidden],
-                            "dtype": dtype_str,
-                            "device": "cpu",
-                        },
-                        "source_node_ids": [],
-                        "synthetic": True,
-                    }
-                )
-                result.comm_events.append(
-                    {
-                        "event_id": recv_node.node_id,
-                        "op": "recv",
-                        "group_size": 2,
-                        "phase": "forward",
-                        "pp_stage": stage_idx + 1,
-                        "pp_rank": recv_pp_rank,
-                        "microbatch": mb_idx,
-                        "tensor_meta": {
-                            "shape": [batch_size, seq_len, hidden],
-                            "dtype": dtype_str,
-                            "device": "cpu",
-                        },
-                        "source_node_ids": [send_node.node_id],
-                        "synthetic": True,
-                    }
-                )
-
-            # Backward: send gradient from stage_idx+1 to stage_idx
-            for stage_idx in range(pp - 1, 0, -1):
-                send_pp_rank = stage_idx % pp
-                recv_pp_rank = (stage_idx - 1) % pp
-                
-                send_node = OpNode(
-                    node_id=_next_id(),
-                    op_name="pp_send_gradient",
-                    op_type="comm_p2p",
-                    phase="backward",
-                    pp_stage=stage_idx,
-                    pp_rank=send_pp_rank,
-                    microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    comm_op="send",
-                    comm_group_size=2,
-                    attrs={"synthetic": True, "pp": True, "dst_stage": stage_idx - 1},
-                )
-                graph.add_node(send_node)
-
-                recv_node = OpNode(
-                    node_id=_next_id(),
-                    op_name="pp_recv_gradient",
-                    op_type="comm_p2p",
-                    phase="backward",
-                    pp_stage=stage_idx - 1,
-                    pp_rank=recv_pp_rank,
-                    microbatch_idx=mb_idx,
-                    inputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    outputs=[TensorMeta(shape=(activation_numel,), dtype=reduce_dtype_str, device="cpu")],
-                    comm_op="recv",
-                    comm_group_size=2,
-                    attrs={"synthetic": True, "pp": True, "src_stage": stage_idx},
-                )
-                graph.add_node(recv_node)
-
-                # Add edge: send -> recv
-                graph.add_edge(DataEdge(send_node.node_id, recv_node.node_id, "pp_p2p"))
-
-                result.comm_events.append(
-                    {
-                        "event_id": send_node.node_id,
-                        "op": "send",
-                        "group_size": 2,
-                        "phase": "backward",
-                        "pp_stage": stage_idx,
-                        "pp_rank": send_pp_rank,
-                        "microbatch": mb_idx,
-                        "tensor_meta": {
-                            "shape": [batch_size, seq_len, hidden],
-                            "dtype": reduce_dtype_str,
-                            "device": "cpu",
-                        },
-                        "source_node_ids": [],
-                        "synthetic": True,
-                    }
-                )
-                result.comm_events.append(
-                    {
-                        "event_id": recv_node.node_id,
-                        "op": "recv",
-                        "group_size": 2,
-                        "phase": "backward",
-                        "pp_stage": stage_idx - 1,
-                        "pp_rank": recv_pp_rank,
-                        "microbatch": mb_idx,
-                        "tensor_meta": {
-                            "shape": [batch_size, seq_len, hidden],
-                            "dtype": reduce_dtype_str,
-                            "device": "cpu",
-                        },
-                        "source_node_ids": [send_node.node_id],
-                        "synthetic": True,
-                    }
-                )
+    # Add pp_p2p edges from schedule deps and link recv source_node_ids
+    for send_eid, recv_eids in send_to_recv.items():
+        send_nid = event_id_to_node_id.get(send_eid)
+        if send_nid is None:
+            continue
+        for recv_eid in recv_eids:
+            recv_nid = event_id_to_node_id.get(recv_eid)
+            if recv_nid is None:
+                continue
+            graph.add_edge(DataEdge(send_nid, recv_nid, "pp_p2p"))
+            for ce in result.comm_events:
+                if ce.get("event_id") == recv_nid:
+                    ce["source_node_ids"] = [send_nid]
+                    break
 
 
 def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
-    """Inject lightweight per-stage compute anchors for missing swimlane lanes."""
+    """Inject synthetic compute so each phase has enough Cube/Vec lane signal."""
     graph = result.compute_graph
     if graph is None:
         return
@@ -618,26 +345,29 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
             for kw in ("mm", "matmul", "bmm", "addmm", "linear", "conv", "gemm", "dot")
         )
 
-    lane_gaps: dict[str, dict[str, bool]] = {}
+    parallelism = trainer.config.parallelism
+    pp = max(int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1), 1)
+    model_parts = getattr(trainer, "model_parts", [])
+    num_layers = max(_infer_num_layers(model_parts), 1)
+    lane_target = max(pp * num_layers, pp)
+
+    lane_gaps: dict[str, dict[str, int]] = {}
     for phase in ("forward", "backward"):
         phase_compute = [
             node
             for node in graph.nodes.values()
             if node.phase == phase and node.op_type == "compute"
         ]
-        has_cube = any(_is_cube_compute(node.op_name) for node in phase_compute)
-        has_vec = any(not _is_cube_compute(node.op_name) for node in phase_compute)
-        need_cube = not has_cube
-        need_vec = not has_vec
-        if need_cube or need_vec:
-            lane_gaps[phase] = {"cube": need_cube, "vec": need_vec}
+        cube_count = sum(1 for node in phase_compute if _is_cube_compute(node.op_name))
+        vec_count = len(phase_compute) - cube_count
+        missing_cube = max(0, lane_target - cube_count)
+        missing_vec = max(0, lane_target - vec_count)
+        if missing_cube > 0 or missing_vec > 0:
+            lane_gaps[phase] = {"cube": missing_cube, "vec": missing_vec}
 
     if not lane_gaps:
         return
 
-    parallelism = trainer.config.parallelism
-    pp = max(int(getattr(parallelism, "pipeline_parallel_degree", 1) or 1), 1)
-    model_parts = getattr(trainer, "model_parts", [])
     hidden_dim = _guess_hidden_dim(model_parts[0]) if model_parts else 1024
     hidden_dim = max(int(hidden_dim), 1)
 
@@ -652,14 +382,15 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
         counter[0] += 1
         return f"compute_syn_{phase}_{kind}_{stage}_{counter[0]:07d}"
 
-    for phase, needs in lane_gaps.items():
-        for stage_idx in range(pp):
-            pp_rank = stage_idx % pp
-
+    for phase, missing in lane_gaps.items():
+        max_missing = max(missing["cube"], missing["vec"])
+        for i in range(max_missing):
+            stage_idx = i % pp
+            pp_rank = stage_idx
             cube: OpNode | None = None
             vec: OpNode | None = None
 
-            if needs["cube"]:
+            if i < missing["cube"]:
                 cube = OpNode(
                     node_id=_next_id(phase, "cube", stage_idx),
                     op_name="aten.mm.default",
@@ -669,7 +400,9 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
                     pp_rank=pp_rank,
                     microbatch_idx=0,
                     inputs=[
-                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                        TensorMeta(
+                            shape=(1, hidden_dim), dtype=dtype_str, device="cpu"
+                        ),
                         TensorMeta(
                             shape=(hidden_dim, hidden_dim),
                             dtype=dtype_str,
@@ -683,7 +416,7 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
                 )
                 graph.add_node(cube)
 
-            if needs["vec"]:
+            if i < missing["vec"]:
                 vec = OpNode(
                     node_id=_next_id(phase, "vec", stage_idx),
                     op_name="aten.add.Tensor",
@@ -693,8 +426,12 @@ def _inject_synthetic_compute_anchors(result: Any, trainer: Any) -> None:
                     pp_rank=pp_rank,
                     microbatch_idx=0,
                     inputs=[
-                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
-                        TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu"),
+                        TensorMeta(
+                            shape=(1, hidden_dim), dtype=dtype_str, device="cpu"
+                        ),
+                        TensorMeta(
+                            shape=(1, hidden_dim), dtype=dtype_str, device="cpu"
+                        ),
                     ],
                     outputs=[
                         TensorMeta(shape=(1, hidden_dim), dtype=dtype_str, device="cpu")
@@ -785,44 +522,72 @@ def _patch_backward_phase(recorder: Any):
             recorder, "backward", orig_autograd_backward, *args, **kwargs
         )
 
-    torch.Tensor.backward = _tensor_backward_wrapper  # pyrefly: ignore[invalid-assignment]
-    torch.autograd.backward = _autograd_backward_wrapper  # pyrefly: ignore[invalid-assignment]
+    torch.Tensor.backward = (
+        _tensor_backward_wrapper  # pyrefly: ignore[invalid-assignment]
+    )
+    torch.autograd.backward = (
+        _autograd_backward_wrapper  # pyrefly: ignore[invalid-assignment]
+    )
     try:
         yield
     finally:
-        torch.Tensor.backward = orig_tensor_backward  # pyrefly: ignore[invalid-assignment]
-        torch.autograd.backward = orig_autograd_backward  # pyrefly: ignore[invalid-assignment]
+        torch.Tensor.backward = (
+            orig_tensor_backward  # pyrefly: ignore[invalid-assignment]
+        )
+        torch.autograd.backward = (
+            orig_autograd_backward  # pyrefly: ignore[invalid-assignment]
+        )
 
 
 def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     """Run one simulated training step seamlessly utilizing the native Trainer."""
-    from torchtitan.trainer import Trainer
-    import torchtitan.observability.structured_logger as sl
-    import torchtitan.distributed.utils as dist_utils
     import torch._subclasses.fake_impls
-    
+
+    import torchtitan.distributed.utils as dist_utils
+    import torchtitan.observability.structured_logger as sl
+    from torchtitan.trainer import Trainer
+
     # 1. Patch meta vs meta:0 issues by enforcing clean meta device
     trainer.device = torch.device("meta")
-    
+
     # 2. Patch FakeTensor conversions that crash native train_step
-    orig_local_scalar_dense = torch._subclasses.fake_impls.op_implementations_dict.get(torch.ops.aten._local_scalar_dense.default)
+    orig_local_scalar_dense = torch._subclasses.fake_impls.op_implementations_dict.get(
+        torch.ops.aten._local_scalar_dense.default
+    )
+
     def _mock_local_scalar_dense(fake_mode, func, *args, **kwargs):
         return 0
-    torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default] = _mock_local_scalar_dense
-    
+
+    torch._subclasses.fake_impls.op_implementations_dict[
+        torch.ops.aten._local_scalar_dense.default
+    ] = _mock_local_scalar_dense
+
     from torch._subclasses.fake_tensor import FakeTensor
+
     orig_format = FakeTensor.__format__
     FakeTensor.__format__ = lambda self, format_spec: "0.0"
-    
+
+    # DTensor wraps FakeTensor but has its own __format__; patch it too
+    # so logging/metrics that format DTensors don't crash on meta.
+    try:
+        from torch.distributed.tensor import DTensor as _DTensor
+
+        _orig_dt_format = _DTensor.__format__
+        _DTensor.__format__ = lambda self, format_spec: "0.0"
+    except Exception:
+        _orig_dt_format = None
+
     # 3. Patch distributed and optimizer operations that expect real tensors
     orig_clip_grad_norm = dist_utils.clip_grad_norm_
     orig_dist_sum = dist_utils.dist_sum
     orig_dist_max = dist_utils.dist_max
-    
-    dist_utils.clip_grad_norm_ = lambda *args, **kwargs: torch.tensor(0.0, device="meta")
+
+    dist_utils.clip_grad_norm_ = lambda *args, **kwargs: torch.tensor(
+        0.0, device="meta"
+    )
     dist_utils.dist_sum = lambda t, *args, **kwargs: t
     dist_utils.dist_max = lambda t, *args, **kwargs: t
-    
+
     orig_get_mesh = trainer.parallel_dims.get_optional_mesh
     orig_get_strict_mesh = trainer.parallel_dims.get_mesh
     trainer.parallel_dims.get_optional_mesh = lambda *args, **kwargs: None
@@ -835,6 +600,7 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
 
     # Patch log_trace_scalar to avoid int() crash on meta tensors
     orig_log = sl.log_trace_scalar
+
     def safe_log(d):
         safe_dict = {}
         for k, v in d.items():
@@ -846,22 +612,40 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
                 except Exception:
                     safe_dict[k] = 0
         orig_log(safe_dict)
+
     sl.log_trace_scalar = safe_log
 
     recorder = TraceRecorder(rank=int(os.environ.get("RANK", "0")))
-    
+
     data_iterator = trainer.batch_generator(trainer.dataloader)
-    
+
+    # Override gradient_accumulation_steps to 1 for simulation. On meta device,
+    # each dispatched op creates Python objects (OpNode, TensorMeta, autograd
+    # Node ≈ 500 bytes/op). With 61 layers × 256 experts × 16 ga_steps, this
+    # would consume ~2.4 GB of Python object memory. One microbatch is
+    # sufficient to capture the compute graph and communication operators.
+    # PP schedule extraction uses pipeline_parallel_microbatch_size (not ga_steps).
+    trainer.gradient_accumulation_steps = 1
+
     # Pre-fetch batches outside of FakeTensorMode to avoid dataloader internal crashes
     batches = []
     for _ in range(trainer.gradient_accumulation_steps):
         batches.append(next(data_iterator))
-        
+
     def mock_data_iterator():
         for batch in batches:
             yield batch
-    
+
     use_fake = (getattr(sim_opts, "comm_backend", "") or "") != "gloo"
+
+    # Phase 4: Apply meta device patches for natural FSDP communication emission
+    from .meta_device_patches import (
+        apply_meta_device_patches,
+        restore_meta_device_patches,
+    )
+
+    if use_fake:
+        apply_meta_device_patches()
 
     try:
         with unified_trace(
@@ -873,6 +657,10 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
             with _patch_backward_phase(recorder):
                 Trainer.train_step(trainer, mock_data_iterator())
     finally:
+        # Phase 4: Restore meta device patches
+        if use_fake:
+            restore_meta_device_patches()
+
         # Restore patched methods
         dist_utils.clip_grad_norm_ = orig_clip_grad_norm
         dist_utils.dist_sum = orig_dist_sum
@@ -883,29 +671,50 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
         trainer.lr_schedulers.step = orig_lr_step
         sl.log_trace_scalar = orig_log
         FakeTensor.__format__ = orig_format
-        
+        if _orig_dt_format is not None:
+            _DTensor.__format__ = _orig_dt_format
+
         # Restore local_scalar_dense
         if orig_local_scalar_dense:
-            torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default] = orig_local_scalar_dense
+            torch._subclasses.fake_impls.op_implementations_dict[
+                torch.ops.aten._local_scalar_dense.default
+            ] = orig_local_scalar_dense
         else:
-            del torch._subclasses.fake_impls.op_implementations_dict[torch.ops.aten._local_scalar_dense.default]
+            del torch._subclasses.fake_impls.op_implementations_dict[
+                torch.ops.aten._local_scalar_dense.default
+            ]
 
     result = recorder.build_result()
+    result.metadata["operator_swimlane_comm_scope"] = str(
+        getattr(sim_opts, "operator_swimlane_comm_scope", "model_only") or "model_only"
+    ).lower()
+    ga_steps = getattr(trainer, "gradient_accumulation_steps", None)
+    if ga_steps:
+        result.metadata["gradient_accumulation_steps"] = int(ga_steps)
 
-    if use_fake:
-        _inject_synthetic_compute_anchors(result, trainer)
-        _inject_synthetic_comm_events(result, trainer, sim_opts)
+    # Schedule-derived PP communication: project PP send/recv from the
+    # semantic schedule (real _PipelineSchedule) into the compute graph.
+    # Must run AFTER _inject_semantic_schedule (which populates result.schedule)
+    # and BEFORE cost_model (so PP nodes get annotated).
     if getattr(sim_opts, "semantic_schedule", False):
         _inject_semantic_schedule(result, trainer.config)
+    if use_fake:
+        _project_pp_comm_from_schedule(result, trainer)
+        _inject_synthetic_compute_anchors(result, trainer)
 
     if getattr(sim_opts, "cost_model", False):
         cm = _import_cost_model(
-            getattr(sim_opts, "cost_model_class", "") or "torchtitan.experiments.simulator.cost_model.MockCostModel",
+            getattr(sim_opts, "cost_model_class", "")
+            or "torchtitan.experiments.simulator.cost_model.MockCostModel",
             _get_cost_model_kwargs(sim_opts),
         )
         apply_cost_model(result, cm)
 
-    from torchtitan.experiments.simulator.memory_estimator import build_runtime_memory, attach_model_state_memory
+    from torchtitan.experiments.simulator.memory_estimator import (
+        attach_model_state_memory,
+        build_runtime_memory,
+    )
+
     memory_events, memory_summary = build_runtime_memory(
         result.compute_graph,
         result.comm_events,
@@ -913,13 +722,35 @@ def run_trainer_simulation(trainer: Any, sim_opts: Any) -> None:
     )
     result.memory_events.extend(memory_events)
     result.metadata.update(memory_summary)
+    # Also write into the "memory" sub-dict so HTML/exporters that read
+    # metadata["memory"]["peak_live_bytes"] find the value.
+    result.metadata.setdefault("memory", {}).update(memory_summary)
 
     attach_model_state_memory(
         result,
         trainer.model_parts,
-        optimizer_name=trainer.optimizers.optimizers[0].__class__.__name__ if trainer.optimizers.optimizers else None,
+        optimizer_name=trainer.optimizers.optimizers[0].__class__.__name__
+        if trainer.optimizers.optimizers
+        else None,
         parallelism_config=trainer.config.parallelism,
     )
 
+    # --- Unified metric computation (before export, format-order-independent) ---
+    # Populate DES metadata once here so all exporters (including text-only)
+    # can read it without lazy-loading side effects.
+    from .export import _inject_schedule_timing, _populate_des_metadata
+
+    _populate_des_metadata(result)
+    # Inject schedule timing into result.metadata so DES memory timeline
+    # and text summary can use it regardless of which formats are exported.
+    _result_dict = result.to_dict()
+    _inject_schedule_timing(_result_dict, result)
+    result.metadata["perf_schedule"] = _result_dict.get("perf_schedule", {})
+    if "schedule" in _result_dict and "events" in _result_dict["schedule"]:
+        result.metadata["_schedule_events_enriched"] = _result_dict["schedule"][
+            "events"
+        ]
+
     postprocess_extension_result(result, trainer, sim_opts)
     _export_result(result, sim_opts.output_dir, sim_opts.output_formats)
+    _export_workload_graph(result, trainer.config, sim_opts)

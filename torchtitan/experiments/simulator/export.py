@@ -13,20 +13,23 @@ Supported formats
 * **JSON** — full structured dump, loadable back into Python dicts.
 * **DOT** — Graphviz dot format with colour-coded nodes by op type.
 * **Chrome Trace** — ``chrome://tracing`` compatible JSON for timeline views.
-* **HTML** — self-contained interactive visualization with expandable training
-  steps, swimlane schedules, and per-phase operator DAGs.
+* **HTML** — interactive visualization with expandable training
+  steps, schedule swimlanes, and memory trace. Data is embedded
+  inline; ECharts 5.4.3 is loaded from CDN (not fully offline).
 * **Text summary** — human-readable console output with statistics.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import os
+from collections import Counter
 from html import escape
 from pathlib import Path
 from typing import Any
 
-from .nodes import ComputeGraph, OpNode, SimulationResult, TrainingSchedule
+from .nodes import ComputeGraph, OpNode, SimulationResult
 
 # ---------------------------------------------------------------------------
 # Colour scheme for DOT export (by op_type)
@@ -63,7 +66,6 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
         path: Output file path (will be created / overwritten).
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    _populate_des_metadata(result)
     data = result.to_dict()
     _inject_schedule_timing(data, result)
     node_count = len(result.compute_graph.nodes)
@@ -73,6 +75,138 @@ def export_json(result: SimulationResult, path: str | os.PathLike) -> None:
     else:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Kernel-summary CSV export (CUDA / Ascend kernel_summary compatible)
+# ---------------------------------------------------------------------------
+
+_KERNEL_SUMMARY_HEADER = [
+    "Rank",
+    "Order",
+    "Name",
+    "Type",
+    "Phase",
+    "PPStage",
+    "MicrobatchIdx",
+    "Start(us)",
+    "End(us)",
+    "Duration(us)",
+    "ComputeTime(us)",
+    "CommTime(us)",
+    "FLOPs",
+    "BytesRead",
+    "BytesWritten",
+]
+
+
+def _kernel_summary_rows(result: SimulationResult) -> list[dict[str, Any]]:
+    """Build per-operator rows for the kernel-summary CSV.
+
+    One row per operator across forward + backward + optimizer phases.
+
+    Operators are ordered by their DES start time when a discrete-event
+    schedule has run; otherwise they keep capture order and are laid out on
+    a sequential cumulative timeline derived from per-op durations (so a
+    meaningful Start/End/Duration is always produced).  Phase-boundary
+    sentinel nodes are excluded.
+    """
+    nodes = [
+        n for n in result.compute_graph.nodes.values() if n.op_type != "phase_boundary"
+    ]
+
+    has_des = any(n.des_start_time_us is not None for n in nodes)
+    if has_des:
+        nodes = sorted(
+            nodes,
+            key=lambda n: (
+                n.des_start_time_us if n.des_start_time_us is not None else 0.0
+            ),
+        )
+
+    rows: list[dict[str, Any]] = []
+    cursor = 0.0
+    for order, node in enumerate(nodes):
+        perf = node.perf_result
+        duration = float(perf.total_time_us) if perf is not None else 0.0
+
+        if has_des and node.des_start_time_us is not None:
+            start = float(node.des_start_time_us)
+            end = (
+                float(node.des_finish_time_us)
+                if node.des_finish_time_us is not None
+                else start + duration
+            )
+        else:
+            start = cursor
+            end = cursor + duration
+            cursor = end
+
+        rows.append(
+            {
+                "Rank": node.rank,
+                "Order": order,
+                "Name": node.op_name,
+                "Type": node.op_type,
+                "Phase": node.phase,
+                "PPStage": node.pp_stage if node.pp_stage is not None else "",
+                "MicrobatchIdx": (
+                    node.microbatch_idx if node.microbatch_idx is not None else ""
+                ),
+                "Start(us)": round(start, 3),
+                "End(us)": round(end, 3),
+                "Duration(us)": round(duration, 3),
+                "ComputeTime(us)": round(perf.compute_time_us, 3) if perf else 0.0,
+                "CommTime(us)": round(perf.comm_time_us, 3) if perf else 0.0,
+                "FLOPs": perf.flops if perf else 0,
+                "BytesRead": perf.bytes_read if perf else 0,
+                "BytesWritten": perf.bytes_written if perf else 0,
+            }
+        )
+    return rows
+
+
+def export_kernel_summary_csv(
+    result: SimulationResult, path: str | os.PathLike
+) -> None:
+    """Write per-operator kernel trace CSVs, split by rank.
+
+    The layout mirrors CUDA (nsys) / Ascend (msprof) ``kernel_summary`` exports:
+    one row per operator with name, execution order, start/end time, duration,
+    and a per-op breakdown (compute vs. communication time, FLOPs, bytes).
+
+    Covers the full forward + backward + optimizer step.
+
+    Outputs:
+    - ``kernel_summary.csv`` — all ranks combined (with Rank column)
+    - ``kernel_summary_rank{N}.csv`` — one file per rank
+
+    Args:
+        result: The simulation result to serialize.
+        path: Output CSV file path (base path; per-rank files derive from it).
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    rows = _kernel_summary_rows(result)
+
+    # Combined CSV (all ranks, with Rank column)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_KERNEL_SUMMARY_HEADER)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    # Per-rank CSVs
+    base = str(path).rsplit(".", 1)[0]  # "kernel_summary" from "kernel_summary.csv"
+    rank_rows: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        r = row.get("Rank", 0)
+        rank_rows.setdefault(r, []).append(row)
+
+    for r, r_rows in sorted(rank_rows.items()):
+        rank_path = f"{base}_rank{r}.csv"
+        with open(rank_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_KERNEL_SUMMARY_HEADER)
+            writer.writeheader()
+            writer.writerows(r_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -555,31 +689,31 @@ def _populate_des_metadata(result: SimulationResult) -> None:
 
 def _compress_graph_by_stage_similarity(result: SimulationResult) -> dict[str, Any]:
     """Compress compute graph by detecting and merging similar PP stages.
-    
+
     For PP models with VPP, many stages have identical operation patterns.
     This function detects repeated stage groups and represents them as a
     single representative with a multiplier.
-    
+
     Returns a dict with:
     - nodes: compressed node list with stage ranges
     - edges: edges between compressed nodes
     - stage_groups: metadata about which stages were merged
     """
-    from collections import defaultdict, Counter
-    
+    from collections import Counter, defaultdict
+
     # Group nodes by (phase, pp_stage)
     groups = defaultdict(list)
     for node in result.compute_graph.nodes.values():
         key = (node.phase, node.pp_stage)
         groups[key].append(node)
-    
+
     # Analyze each group's signature (operation distribution)
     group_signatures = {}
     for key, nodes in groups.items():
         phase, stage = key
         if stage is None:
             continue  # Skip phase boundary nodes
-        
+
         # Create signature: sorted list of (op_name, count)
         op_counts = Counter(n.op_name for n in nodes)
         signature = tuple(sorted(op_counts.items()))
@@ -588,81 +722,85 @@ def _compress_graph_by_stage_similarity(result: SimulationResult) -> dict[str, A
             "node_count": len(nodes),
             "nodes": nodes,
         }
-    
+
     # Detect repeated stage groups
     # Group stages by (phase, signature)
     phase_stage_groups = defaultdict(list)
     for (phase, stage), info in group_signatures.items():
         phase_stage_groups[(phase, info["signature"])].append(stage)
-    
+
     # Build compressed representation
     compressed_nodes = []
     stage_groups = []
     kept_stages = set()
-    
+
     for (phase, signature), stages in phase_stage_groups.items():
         stages = sorted(stages)
-        
+
         # Find consecutive runs
         runs = []
         current_run = [stages[0]]
         for i in range(1, len(stages)):
-            if stages[i] == stages[i-1] + 1:
+            if stages[i] == stages[i - 1] + 1:
                 current_run.append(stages[i])
             else:
                 runs.append(current_run)
                 current_run = [stages[i]]
         runs.append(current_run)
-        
+
         # For each run, keep only the first stage as representative
         for run in runs:
             if len(run) == 1:
                 # Single stage, keep as-is
                 stage = run[0]
                 kept_stages.add((phase, stage))
-                stage_groups.append({
-                    "phase": phase,
-                    "stages": [stage],
-                    "count": 1,
-                    "representative": stage,
-                })
+                stage_groups.append(
+                    {
+                        "phase": phase,
+                        "stages": [stage],
+                        "count": 1,
+                        "representative": stage,
+                    }
+                )
             else:
                 # Multiple consecutive stages, keep first as representative
                 representative = run[0]
                 kept_stages.add((phase, representative))
-                stage_groups.append({
-                    "phase": phase,
-                    "stages": run,
-                    "count": len(run),
-                    "representative": representative,
-                })
-    
+                stage_groups.append(
+                    {
+                        "phase": phase,
+                        "stages": run,
+                        "count": len(run),
+                        "representative": representative,
+                    }
+                )
+
     # Also keep phase boundary nodes (stage=None)
     for key, nodes in groups.items():
         phase, stage = key
         if stage is None:
             kept_stages.add(key)
-    
+
     # Build compressed node list
     node_id_map = {}  # old_id -> new_id
     for (phase, stage) in kept_stages:
         nodes = groups[(phase, stage)]
         # Limit nodes per stage to keep JSON size manageable
         # Prioritize compute nodes over trivial ops
-        compute_nodes = [n for n in nodes if n.op_type == 'compute']
-        other_nodes = [n for n in nodes if n.op_type != 'compute']
+        compute_nodes = [n for n in nodes if n.op_type == "compute"]
+        other_nodes = [n for n in nodes if n.op_type != "compute"]
         limited_nodes = (compute_nodes[:200] + other_nodes[:50])[:250]
         for node in limited_nodes:
             node_dict = node.to_dict()
             node_id_map[node.node_id] = node.node_id
             compressed_nodes.append(node_dict)
-    
+
     # Build compressed edge list
     compressed_edges = []
     for edge in result.compute_graph.edges:
         if edge.src_node_id in node_id_map and edge.dst_node_id in node_id_map:
             compressed_edges.append(edge.to_dict())
-    
+
     return {
         "nodes": compressed_nodes,
         "edges": compressed_edges,
@@ -677,7 +815,6 @@ def _compress_graph_by_stage_similarity(result: SimulationResult) -> dict[str, A
 
 def _json_script_payload(result: SimulationResult) -> str:
     node_count = len(result.compute_graph.nodes)
-    _populate_des_metadata(result)
     if node_count > 10000:
         # For large graphs, compress by merging similar PP stages
         schedule_data = None
@@ -690,15 +827,22 @@ def _json_script_payload(result: SimulationResult) -> str:
         _inject_schedule_timing(
             {"schedule": schedule_data} if schedule_data else {}, result
         )
-        
+
         # Compress graph by stage similarity
         compressed_graph = _compress_graph_by_stage_similarity(result)
-        
+
         compact: dict[str, Any] = {
             "metadata": result.metadata,
             "schedule": schedule_data,
             "compute_graph": compressed_graph,
             "memory_events": [e.to_dict() for e in result.memory_events[:1000]],
+            "_truncation": {
+                "memory_events_original": len(result.memory_events),
+                "memory_events_kept": min(1000, len(result.memory_events)),
+                "graph_compressed": True,
+                "op_node_ids_max": 100,
+                "original_node_count": len(result.compute_graph.nodes),
+            },
         }
         return escape(json.dumps(compact, default=str), quote=False)
     data = result.to_dict()
@@ -761,6 +905,7 @@ def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> N
                 start, finish = des_event_map[eid]
                 ev_copy["perf_total_time_us"] = round(finish - start, 3)
                 ev_copy["perf_cumulative_start_us"] = round(start, 3)
+                ev_copy["timing_source"] = "des"
             else:
                 count = event_counts.get(phase, 1)
                 phase_total = phase_totals.get(phase, 0.0)
@@ -769,6 +914,7 @@ def _inject_schedule_timing(data: dict[str, Any], result: SimulationResult) -> N
                 ev_copy["perf_cumulative_start_us"] = round(
                     cumulative_per_phase.get(phase, 0.0), 3
                 )
+                ev_copy["timing_source"] = "phase_even_split"
                 cumulative_per_phase[phase] = (
                     cumulative_per_phase.get(phase, 0.0) + per_event
                 )
@@ -887,6 +1033,16 @@ def _short_op_name(name: str, max_len: int = 42) -> str:
     return name if len(name) <= max_len else name[: max_len - 1] + "…"
 
 
+def _is_cluster_parallel_comm_node(node: OpNode) -> bool:
+    """Return True for synthetic scheduling comm nodes (FSDP/PP/DP)."""
+    if node.op_type not in {"comm_collective", "comm_p2p"}:
+        return False
+    attrs = node.attrs or {}
+    if not attrs.get("synthetic", False):
+        return False
+    return any(attrs.get(key, False) for key in ("fsdp2", "pp", "dp"))
+
+
 def export_html(
     result: SimulationResult,
     path: str | os.PathLike,
@@ -895,11 +1051,10 @@ def export_html(
     max_dag_nodes_per_phase: int = 220,
 ) -> None:
     """
-    Write a self-contained HTML visualization using ECharts and AntV G6.
+    Write an interactive HTML visualization using ECharts.
 
-    Uses ECharts for timeline/swimlane visualization and AntV G6 for DAG
-    visualization. These libraries provide better performance and interactivity
-    compared to custom canvas rendering.
+    Data is embedded inline in the HTML. ECharts 5.4.3 is loaded from
+    CDN (``cdn.jsdelivr.net``); the page is not fully offline.
     """
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     schedule_events = _schedule_events_for_html(result)
@@ -908,6 +1063,11 @@ def export_html(
     if not phases:
         phases = ["unknown"]
     graph_summary = result.compute_graph.summary()
+    graph_comm_ops_count = sum(
+        1
+        for n in result.compute_graph.nodes.values()
+        if n.op_type in ("comm_collective", "comm_p2p")
+    )
     memory_summary = result.metadata.get("memory", {}) or {}
     peak_memory = memory_summary.get(
         "peak_live_bytes", memory_summary.get("graph_peak_live_bytes", 0)
@@ -919,11 +1079,23 @@ def export_html(
     fsdp_degree = memory_summary.get("fsdp_degree", 1)
     shard_factor = memory_summary.get("shard_factor", 1)
     cost_summary = result.metadata.get("cost_model", {}) or {}
+    # Fallback to DES e2e step time when cost_model summary is empty
     perf_grand_total_us = cost_summary.get("e2e_step_time_us", 0)
+    if not perf_grand_total_us:
+        perf_grand_total_us = result.metadata.get("des_engine", {}).get(
+            "e2e_step_time_us", 0
+        )
     data_payload = _json_script_payload(result)
     steps = sorted({_event_step(ev) for ev in schedule_events}) or [0]
-    has_des = any(
-        n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
+    has_des = (
+        "des_engine" in result.metadata
+        or any(
+            n.des_start_time_us is not None for n in result.compute_graph.nodes.values()
+        )
+        or (
+            result.schedule is not None
+            and any(ev.des_start_time_us is not None for ev in result.schedule.events)
+        )
     )
     des_cards = ""
     if has_des:
@@ -945,21 +1117,6 @@ def export_html(
       <div class="card"><div class="num">{contention}</div><div>Contended ops</div></div>
       <div class="card"><div class="num">{escape(peak_des_mem)}</div><div>Peak DES memory</div></div>"""
 
-    def _phase_sections_for_step(step: int) -> str:
-        step_prefix = f"step{step}_"
-        step_phases = [phase for phase in phases if phase.startswith(step_prefix)]
-        if not step_phases:
-            step_phases = phases
-        return "\n".join(
-            f"""
-            <details open>
-              <summary>{escape(phase)} operator swimlane (Cube / Vec / Communication)</summary>
-              <div id="swimlane-{step}-{escape(phase)}" style="width:100%;height:700px;background:#f8fafc;border-radius:8px;border:1px solid #e5e7eb;"></div>
-            </details>
-            """
-            for phase in step_phases
-        )
-
     event_ids_per_step: dict[int, set[str]] = {}
     for ev in schedule_events:
         step = _event_step(ev)
@@ -973,7 +1130,6 @@ def export_html(
             <summary>PP / FSDP2 / TP / DP / communication schedule swimlanes</summary>
             <div id="timeline-{step}" style="width:100%;height:600px;background:#f8fafc;border-radius:8px;"></div>
           </details>
-          {_phase_sections_for_step(step)}
         </details>
         """
         for step in steps
@@ -986,8 +1142,19 @@ def export_html(
   <title>{escape(title)}</title>
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
   <style>
-    :root {{ --bg:#0f172a; --panel:#111827; --text:#e5e7eb; --muted:#94a3b8; --border:#334155; }}
-    body {{ margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background:var(--bg); color:var(--text); }}
+    :root {{
+      --bg:#0f172a;
+      --panel:#111827;
+      --text:#e5e7eb;
+      --muted:#94a3b8;
+      --border:#334155;
+    }}
+    body {{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      background:var(--bg);
+      color:var(--text);
+    }}
     header {{ padding:24px 28px; background:#020617; border-bottom:1px solid var(--border); }}
     main {{ padding:20px 28px 60px; }}
     h1 {{ margin:0 0 8px; font-size:24px; }}
@@ -1003,14 +1170,15 @@ def export_html(
 <body>
   <header>
     <h1>{escape(title)}</h1>
-    <div class="muted">Hierarchical trace: train step → parallel schedule swimlanes → forward/backward operator dependency DAGs.</div>
+    <div class="muted">Hierarchical trace: train step → parallel schedule swimlanes.</div>
   </header>
   <main>
     <section class="cards">
       <div class="card"><div class="num">{len(result.compute_graph.nodes)}</div><div>Operator nodes</div></div>
       <div class="card"><div class="num">{len(result.compute_graph.edges)}</div><div>Graph edges</div></div>
-      <div class="card"><div class="num">{len(schedule_events)}</div><div>Schedule events</div></div>
-      <div class="card"><div class="num">{len(result.comm_events)}</div><div>Communication events</div></div>
+      <div class="card"><div class="num">{len(schedule_events)}</div><div>Swimlane events</div></div>
+      <div class="card"><div class="num">{graph_comm_ops_count}</div><div>Graph comm ops</div></div>
+      <div class="card"><div class="num">{len(result.comm_events)}</div><div>PP projected events</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(per_gpu_model_state))}</div><div>Per-GPU model state</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(whole_model_state))}</div><div>Whole-model state</div></div>
       <div class="card"><div class="num">{escape(_format_bytes(peak_memory))}</div><div>Activation peak</div></div>
@@ -1059,19 +1227,25 @@ def export_html(
     const desMemory = TRACE.metadata?.des_memory || {{}};
     const memoryTimeline = desMemory.timeline || [];
     const memoryMeta = TRACE.metadata?.memory || {{}};
-    
+
     // Extract parallelism info
     const tpDegree = memoryMeta.tp_degree || 1;
     const fsdpDegree = memoryMeta.fsdp_degree || 1;
     const shardFactor = memoryMeta.shard_factor || 1;
-    
+
     // Use DES timeline data: [time_us, total_bytes]
     const memoryData = memoryTimeline.map(s => [s.time_us, s.total_bytes]);
     const staticMemory = desMemory.static_memory_bytes || 0;
-    
+
     // Calculate whole-model static memory for reference
     const wholeModelStatic = staticMemory * shardFactor;
-    
+    const staticMemoryData = memoryData.length > 0
+      ? [[memoryData[0][0], staticMemory], [memoryData[memoryData.length - 1][0], staticMemory]]
+      : [];
+    const wholeModelStaticData = memoryData.length > 0
+      ? [[memoryData[0][0], wholeModelStatic], [memoryData[memoryData.length - 1][0], wholeModelStatic]]
+      : [];
+
     memoryChart.setOption({{
       tooltip: {{
         trigger: 'axis',
@@ -1132,7 +1306,7 @@ def export_html(
         {{
           name: 'Per-GPU Static',
           type: 'line',
-          data: memoryData.length > 0 ? [[memoryData[0][0], staticMemory], [memoryData[memoryData.length-1][0], staticMemory]] : [],
+          data: staticMemoryData,
           lineStyle: {{ width: 2, color: '#ef4444', type: 'dashed' }},
           itemStyle: {{ color: '#ef4444' }},
           showSymbol: false,
@@ -1141,7 +1315,7 @@ def export_html(
         {{
           name: 'Whole-Model Static',
           type: 'line',
-          data: memoryData.length > 0 ? [[memoryData[0][0], wholeModelStatic], [memoryData[memoryData.length-1][0], wholeModelStatic]] : [],
+          data: wholeModelStaticData,
           lineStyle: {{ width: 2, color: '#f59e0b', type: 'dotted' }},
           itemStyle: {{ color: '#f59e0b' }},
           showSymbol: false,
@@ -1164,12 +1338,15 @@ def export_html(
         const evStep = e.metadata?.step ?? e.step ?? 0;
         return parseInt(evStep) === {step};
       }});
-      
+
       if (events.length === 0) {{
-        document.getElementById('timeline-{step}').innerHTML = '<div style="padding:40px;text-align:center;color:#666;">No schedule events for this step</div>';
+        const timelineEl = document.getElementById('timeline-{step}');
+        timelineEl.innerHTML =
+          '<div style="padding:40px;text-align:center;color:#666;">' +
+          'No schedule events for this step</div>';
         return;
       }}
-      
+
       // Group events by rank
       const rankMap = {{}};
       events.forEach(ev => {{
@@ -1177,10 +1354,10 @@ def export_html(
         if (!rankMap[rank]) rankMap[rank] = [];
         rankMap[rank].push(ev);
       }});
-      
+
       const ranks = Object.keys(rankMap).sort((a, b) => parseInt(a) - parseInt(b));
       const seriesData = [];
-      
+
       // Color mapping for event types
       const colorMap = {{
         'forward': '#3b82f6',
@@ -1192,7 +1369,7 @@ def export_html(
         'fsdp': '#06b6d4',
         'default': '#6b7280'
       }};
-      
+
       function getEventColor(eventType) {{
         const type = (eventType || '').toLowerCase();
         if (type.includes('forward') || type.includes('fwd')) return colorMap.forward;
@@ -1204,13 +1381,13 @@ def export_html(
         if (type.includes('comm') || type.includes('all_') || type.includes('reduce')) return colorMap.comm;
         return colorMap.default;
       }}
-      
+
       ranks.forEach((rank, rankIdx) => {{
         rankMap[rank].forEach(ev => {{
           const start = ev.perf_cumulative_start_us || 0;
           const duration = ev.perf_total_time_us || 0;
           const end = start + duration;
-          
+
           seriesData.push({{
             name: ev.event_type,
             value: [rankIdx, start, end, duration],
@@ -1221,7 +1398,7 @@ def export_html(
           }});
         }});
       }});
-      
+
       chart.setOption({{
         tooltip: {{
           trigger: 'item',
@@ -1248,7 +1425,7 @@ def export_html(
           name: 'Time',
           nameLocation: 'middle',
           nameGap: 30,
-          axisLabel: {{ 
+          axisLabel: {{
             formatter: (val) => fmt(val),
             color: '#666'
           }},
@@ -1260,7 +1437,7 @@ def export_html(
           type: 'category',
           data: ranks.map(r => 'Rank ' + r),
           inverse: true,
-          axisLabel: {{ 
+          axisLabel: {{
             color: '#333',
             fontWeight: 'bold'
           }},
@@ -1277,7 +1454,7 @@ def export_html(
             const end = api.coord([api.value(2), rankIdx]);
             const height = api.size([0, 1])[1] * 0.7;
             const width = Math.max(2, end[0] - start[0]);
-            
+
             return {{
               type: 'rect',
               shape: {{
@@ -1308,344 +1485,10 @@ def export_html(
     }})();
     ''' for step in steps)}
 
-    // Initialize ECharts for operator swimlane visualization (Cube/Vec/Communication)
-    {chr(10).join(f'''
-    (function() {{
-      const containerId = 'swimlane-{step}-{phase}';
-      const container = document.getElementById(containerId);
-      if (!container) return;
-      
-      const phase = '{phase}';
-      const nodes = (TRACE.compute_graph?.nodes || []).filter(n => n.phase === phase);
-      const edges = (TRACE.compute_graph?.edges || []).filter(e => {{
-        const srcNode = nodes.find(n => n.node_id === e.src);
-        const dstNode = nodes.find(n => n.node_id === e.dst);
-        return srcNode && dstNode;
-      }});
-      
-      if (nodes.length === 0) {{
-        container.innerHTML = '<div style="padding:40px;text-align:center;color:#666;font-size:16px;">No operators in this phase</div>';
-        return;
-      }}
-      
-      // Classify operators into Compute (Cube/Vec) or Communication
-      // Cube and Vec share the same compute engine — they CANNOT run in parallel.
-      // Only Communication can overlap with Compute when no data dependency exists.
-      function classifyOperator(node) {{
-        const opName = (node.op_name || '').toLowerCase();
-        const opType = node.op_type || '';
-        
-        // Communication operations — runs on dedicated comm engine
-        if (opType === 'comm_collective' || opType === 'comm_p2p' || 
-            opName.includes('all_reduce') || opName.includes('all_gather') || 
-            opName.includes('reduce_scatter') || opName.includes('broadcast') ||
-            opName.includes('send') || opName.includes('recv')) {{
-          return 'Communication';
-        }}
-        
-        // Everything else runs on the shared compute engine
-        // (Cube: mm/matmul/conv; Vec: add/mul/relu/norm; memory; data_move)
-        return 'Compute';
-      }}
-      
-      // Sub-classify for display color only (does NOT affect scheduling)
-      function subClassify(node) {{
-        const opName = (node.op_name || '').toLowerCase();
-        if (opName.includes('mm') || opName.includes('matmul') || opName.includes('bmm') ||
-            opName.includes('addmm') || opName.includes('linear') || opName.includes('conv') ||
-            opName.includes('gemm') || opName.includes('dot')) {{
-          return 'Cube';
-        }}
-        return 'Vec';
-      }}
-      
-      // Build dependency graph
-      const nodeMap = new Map(nodes.map(n => [n.node_id, n]));
-      const inDegree = new Map(nodes.map(n => [n.node_id, 0]));
-      const adjList = new Map(nodes.map(n => [n.node_id, []]));
-      const reverseAdjList = new Map(nodes.map(n => [n.node_id, []]));
-      
-      edges.forEach(e => {{
-        if (inDegree.has(e.dst)) {{
-          inDegree.set(e.dst, inDegree.get(e.dst) + 1);
-        }}
-        if (adjList.has(e.src)) {{
-          adjList.get(e.src).push(e.dst);
-        }}
-        if (reverseAdjList.has(e.dst)) {{
-          reverseAdjList.get(e.dst).push(e.src);
-        }}
-      }});
-      
-      // Kahn's algorithm for topological sort
-      const queue = [];
-      inDegree.forEach((deg, nodeId) => {{
-        if (deg === 0) queue.push(nodeId);
-      }});
-      
-      const sorted = [];
-      while (queue.length > 0) {{
-        const nodeId = queue.shift();
-        sorted.push(nodeId);
-        (adjList.get(nodeId) || []).forEach(nextId => {{
-          const newDeg = inDegree.get(nextId) - 1;
-          inDegree.set(nextId, newDeg);
-          if (newDeg === 0) queue.push(nextId);
-        }});
-      }}
-      
-      // Add any remaining nodes (cycles or disconnected)
-      nodes.forEach(n => {{
-        if (!sorted.includes(n.node_id)) sorted.push(n.node_id);
-      }});
-      
-      // ── Two-resource DES scheduling ──────────────────────────────
-      // Compute engine: shared by Cube + Vec (serialized, no overlap)
-      // Comm engine:    dedicated to Communication (can overlap with Compute)
-      //
-      // For each operator in topological order:
-      //   1. depEndTime = max(end time of all data-dependency predecessors)
-      //   2. If Compute: start = max(depEndTime, computeLaneEndTime)
-      //      If Comm:    start = max(depEndTime, commLaneEndTime)
-      let computeLaneEndTime = 0;
-      let commLaneEndTime = 0;
-      const operatorTimes = new Map();
-      
-      sorted.forEach(nodeId => {{
-        const node = nodeMap.get(nodeId);
-        if (!node) return;
-        
-        const lane = classifyOperator(node);
-        const duration = node.perf_result?.total_time_us || 0;
-        const subType = lane === 'Compute' ? subClassify(node) : 'Communication';
-        
-        // Max end time of all data-dependency predecessors
-        let depEndTime = 0;
-        const dependencies = reverseAdjList.get(nodeId) || [];
-        dependencies.forEach(depId => {{
-          const depTime = operatorTimes.get(depId);
-          if (depTime && depTime.end > depEndTime) {{
-            depEndTime = depTime.end;
-          }}
-        }});
-        
-        let startTime;
-        if (lane === 'Compute') {{
-          // Compute engine is shared — must wait for both deps AND previous compute op
-          startTime = Math.max(depEndTime, computeLaneEndTime);
-          computeLaneEndTime = startTime + duration;
-        }} else {{
-          // Comm engine is independent — must wait for deps AND previous comm op
-          startTime = Math.max(depEndTime, commLaneEndTime);
-          commLaneEndTime = startTime + duration;
-        }}
-        const endTime = startTime + duration;
-        
-        operatorTimes.set(nodeId, {{
-          nodeId: node.node_id,
-          opName: (node.op_name || 'unknown').replace('aten.', '').replace('.default', ''),
-          opType: node.op_type,
-          subType: subType,
-          start: startTime,
-          end: endTime,
-          duration: duration,
-          lane: lane
-        }});
-      }});
-      
-      // Organize operators by display lane (Cube, Vec, Communication)
-      const displayLanes = {{ 'Cube': [], 'Vec': [], 'Communication': [] }};
-      operatorTimes.forEach((op) => {{
-        displayLanes[op.subType].push(op);
-      }});
-      
-      // Sort each lane by start time
-      Object.keys(displayLanes).forEach(laneName => {{
-        displayLanes[laneName].sort((a, b) => a.start - b.start);
-      }});
-      
-      // Prepare ECharts data
-      // Display lanes: Cube, Vec, Communication (for visual separation only)
-      // Scheduling: Cube+Vec share Compute engine, Comm is independent
-      const laneNames = ['Cube', 'Vec', 'Communication'];
-      const laneColors = {{
-        'Cube': '#3b82f6',
-        'Vec': '#10b981',
-        'Communication': '#f59e0b'
-      }};
-      
-      const seriesData = [];
-      let maxTime = 0;
-      
-      laneNames.forEach((laneName, laneIdx) => {{
-        displayLanes[laneName].forEach(op => {{
-          seriesData.push({{
-            name: op.opName,
-            value: [laneIdx, op.start, op.end, op.duration],
-            itemStyle: {{ color: laneColors[laneName] }},
-            op: op
-          }});
-          if (op.end > maxTime) maxTime = op.end;
-        }});
-      }});
-      
-      // Initialize ECharts
-      const chart = echarts.init(container);
-      chart.setOption({{
-        tooltip: {{
-          trigger: 'item',
-          formatter: function(params) {{
-            const op = params.data.op;
-            const deps = reverseAdjList.get(op.nodeId) || [];
-            const dependents = adjList.get(op.nodeId) || [];
-            const engine = op.lane === 'Compute' ? 'Compute Engine' : 'Comm Engine';
-            return `<div style="padding:10px;min-width:220px;">
-              <div style="font-weight:bold;font-size:14px;margin-bottom:8px;color:#1f2937;">${{op.opName}}</div>
-              <div style="color:#6b7280;font-size:12px;line-height:1.6;">
-                <div><b>Category:</b> ${{op.subType}} (${{engine}})</div>
-                <div><b>Type:</b> ${{op.opType}}</div>
-                <div><b>Start:</b> ${{fmt(op.start)}}</div>
-                <div><b>Duration:</b> ${{fmt(op.duration)}}</div>
-                <div><b>End:</b> ${{fmt(op.end)}}</div>
-                <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;">
-                  <b>Dependencies:</b> ${{deps.length}} ops<br/>
-                  <b>Dependents:</b> ${{dependents.length}} ops
-                </div>
-                <div style="margin-top:4px;font-family:monospace;font-size:11px;color:#9ca3af;">ID: ${{op.nodeId}}</div>
-              </div>
-            </div>`;
-          }}
-        }},
-        legend: {{
-          data: laneNames,
-          top: 10,
-          textStyle: {{ color: '#333', fontSize: 13 }},
-          itemWidth: 20,
-          itemHeight: 14
-        }},
-        grid: {{
-          left: '12%',
-          right: '8%',
-          top: '15%',
-          bottom: '18%'
-        }},
-        xAxis: {{
-          type: 'value',
-          name: 'Cumulative Time',
-          nameLocation: 'middle',
-          nameGap: 35,
-          nameTextStyle: {{ fontSize: 13, fontWeight: 'bold' }},
-          axisLabel: {{
-            formatter: (val) => fmt(val),
-            fontSize: 11
-          }},
-          splitLine: {{
-            lineStyle: {{ color: '#e5e7eb', type: 'dashed' }}
-          }},
-          max: maxTime
-        }},
-        yAxis: {{
-          type: 'category',
-          data: laneNames,
-          inverse: true,
-          axisLabel: {{
-            fontSize: 14,
-            fontWeight: 'bold',
-            color: '#1f2937'
-          }},
-          axisTick: {{ show: false }},
-          splitLine: {{
-            show: true,
-            lineStyle: {{ color: '#f3f4f6', width: 2 }}
-          }}
-        }},
-        series: [{{
-          type: 'custom',
-          renderItem: function(params, api) {{
-            const laneIdx = api.value(0);
-            const start = api.coord([api.value(1), laneIdx]);
-            const end = api.coord([api.value(2), laneIdx]);
-            const height = api.size([0, 1])[1] * 0.75;
-            const width = Math.max(2, end[0] - start[0]);
-            
-            return {{
-              type: 'rect',
-              shape: {{
-                x: start[0],
-                y: start[1] - height / 2,
-                width: width,
-                height: height,
-                r: 4
-              }},
-              style: api.style(),
-              emphasis: {{
-                style: {{
-                  shadowBlur: 12,
-                  shadowColor: 'rgba(0,0,0,0.3)',
-                  stroke: '#1f2937',
-                  lineWidth: 2
-                }}
-              }}
-            }};
-          }},
-          encode: {{ x: [1, 2], y: 0 }},
-          data: seriesData
-        }}],
-        dataZoom: [
-          {{ type: 'inside', xAxisIndex: 0, start: 0, end: 100 }},
-          {{ type: 'slider', xAxisIndex: 0, start: 0, end: 100, height: 25, bottom: 10 }}
-        ]
-      }});
-      
-      // Add statistics panel
-      const statsDiv = document.createElement('div');
-      statsDiv.style.cssText = 'position:absolute;top:10px;right:10px;background:rgba(255,255,255,0.95);padding:12px 16px;border-radius:8px;box-shadow:0 2px 12px rgba(0,0,0,0.1);font-size:12px;color:#374151;min-width:220px;';
-      
-      const cubeOps = displayLanes['Cube'].length;
-      const vecOps = displayLanes['Vec'].length;
-      const commOps = displayLanes['Communication'].length;
-      const totalOps = cubeOps + vecOps + commOps;
-      
-      // Calculate total compute time per engine
-      let computeTotalTime = 0;
-      let commTotalTime = 0;
-      operatorTimes.forEach(op => {{
-        if (op.lane === 'Compute') computeTotalTime += op.duration;
-        else commTotalTime += op.duration;
-      }});
-      
-      statsDiv.innerHTML = `
-        <div style="font-weight:bold;margin-bottom:8px;font-size:13px;">Execution Statistics</div>
-        <div style="line-height:1.8;">
-          <div><span style="color:${{laneColors.Cube}};">●</span> Cube: <b>${{cubeOps}}</b> (${{(cubeOps/totalOps*100).toFixed(1)}}%)</div>
-          <div><span style="color:${{laneColors.Vec}};">●</span> Vec: <b>${{vecOps}}</b> (${{(vecOps/totalOps*100).toFixed(1)}}%)</div>
-          <div><span style="color:${{laneColors.Communication}};">●</span> Comm: <b>${{commOps}}</b> (${{(commOps/totalOps*100).toFixed(1)}}%)</div>
-          <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;">
-            <b>Total:</b> ${{totalOps}} ops<br/>
-            <b>Critical path:</b> ${{fmt(maxTime)}}<br/>
-            <b>Compute engine:</b> ${{fmt(computeTotalTime)}}<br/>
-            <b>Comm engine:</b> ${{fmt(commTotalTime)}}
-          </div>
-          <div style="margin-top:6px;color:#6b7280;font-size:10px;line-height:1.4;">
-            Cube+Vec share the <b>Compute Engine</b> (serialized).<br/>
-            Communication runs on a separate <b>Comm Engine</b>.<br/>
-            Compute↔Comm overlap only when no data dependency.
-          </div>
-        </div>
-      `;
-      container.style.position = 'relative';
-      container.appendChild(statsDiv);
-      
-      // Handle resize
-      window.addEventListener('resize', () => chart.resize());
-    }})();
-    ''' for step in steps for phase in phases)}
-
     // Handle window resize
     window.addEventListener('resize', function() {{
       memoryChart.resize();
       {chr(10).join(f'echarts.getInstanceByDom(document.getElementById("timeline-{step}"))?.resize();' for step in steps)}
-      {chr(10).join(f'echarts.getInstanceByDom(document.getElementById("swimlane-{step}-{phase}"))?.resize();' for step in steps for phase in phases)}
     }});
   </script>
 </body>
@@ -1705,8 +1548,19 @@ def export_text_summary(result: SimulationResult) -> str:
     for p, c in sorted(phase_counts.items()):
         lines.append(f"    {p:<22}: {c}")
 
-    section("Communication Events")
-    lines.append(f"  Total comm events: {len(result.comm_events)}")
+    section("Communication")
+    # Graph comm ops (from compute graph OpNodes)
+    graph_comm = [
+        n
+        for n in result.compute_graph.nodes.values()
+        if n.op_type in ("comm_collective", "comm_p2p")
+    ]
+    lines.append(f"  Graph comm ops: {len(graph_comm)}")
+    graph_comm_ops = Counter(n.comm_op or n.op_name for n in graph_comm)
+    for op, c in sorted(graph_comm_ops.items()):
+        lines.append(f"    {op:<22}: {c}")
+    # PP projected events (from result.comm_events)
+    lines.append(f"  PP projected events: {len(result.comm_events)}")
     op_counts: dict[str, int] = {}
     for ev in result.comm_events:
         op = ev.get("op", "unknown")
@@ -1855,13 +1709,23 @@ def export_text_summary(result: SimulationResult) -> str:
             lines.append("")
             lines.append("  Per-phase peak memory:")
             for phase, data in sorted(phase_peak.items()):
-                lines.append(
-                    f"    {phase:<14}: peak={_format_bytes(data.get('peak_total_bytes', 0))}  dynamic={_format_bytes(data.get('peak_dynamic_bytes', 0))}"
-                )
+                peak = _format_bytes(data.get("peak_total_bytes", 0))
+                dynamic = _format_bytes(data.get("peak_dynamic_bytes", 0))
+                lines.append(f"    {phase:<14}: peak={peak}  dynamic={dynamic}")
 
     section("Metadata")
     for k, v in result.metadata.items():
-        if k in ("cost_model", "des_engine", "des_memory"):
+        if k in (
+            "cost_model",
+            "des_engine",
+            "des_memory",
+            "_schedule_events_enriched",
+            "perf_schedule",
+        ):
+            continue
+        # Skip large nested dicts/lists that would bloat the summary
+        if isinstance(v, (list, dict)) and len(str(v)) > 500:
+            lines.append(f"  {k}: <{len(v) if isinstance(v, list) else len(v)} items>")
             continue
         lines.append(f"  {k}: {v}")
 

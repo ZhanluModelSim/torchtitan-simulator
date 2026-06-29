@@ -129,6 +129,7 @@ class OpNode:
     outputs: list[TensorMeta] = field(default_factory=list)
     attrs: dict[str, Any] = field(default_factory=dict)
     # Parallel context annotations
+    rank: int = 0  # Global rank that captured/executed this op
     pp_rank: int | None = None
     pp_stage: int | None = None
     microbatch_idx: int | None = None
@@ -149,6 +150,7 @@ class OpNode:
             "inputs": [t.to_dict() for t in self.inputs],
             "outputs": [t.to_dict() for t in self.outputs],
             "attrs": self.attrs,
+            "rank": self.rank,
             "pp_rank": self.pp_rank,
             "pp_stage": self.pp_stage,
             "microbatch_idx": self.microbatch_idx,

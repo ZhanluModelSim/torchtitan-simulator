@@ -41,7 +41,7 @@ python -m torchtitan.experiments.simulator.run_simulate \
   --job.config_file ./train_configs/llama3_8b.toml \
   --simulate.mode all \
   --simulate.output_dir ./sim_out \
-  --simulate.output_format json,dot,chrome_trace,html,text
+  --simulate.output_format json,dot,chrome_trace,html,text,csv
 
 # 多进程 PP 模拟（torchrun）
 torchrun --nproc_per_node 4 \
@@ -57,7 +57,7 @@ CLI 参数：
 | --- | --- | --- |
 | `--simulate.mode` | `all` | `fx`（静态图）、`runtime`（运行时捕获）、`schedule`（PP 调度提取）、`all` |
 | `--simulate.output_dir` | `./simulator_output` | 输出目录 |
-| `--simulate.output_format` | `json,dot,chrome_trace,html,text` | 输出格式列表 |
+| `--simulate.output_format` | `json,dot,chrome_trace,html,text,csv` | 输出格式列表 |
 | `--simulate.max_seq_len` | `128` | 输入序列长度 |
 | `--simulate.batch_size` | `2` | 输入 batch size |
 
@@ -82,6 +82,50 @@ CLI 参数：
 | `trace.json` | Chrome Trace 格式（`chrome://tracing`），按 phase 分 thread，时间轴为逻辑顺序 |
 | `trace.html` | 自包含交互式 HTML：训练步骤层级、PP/FSDP/TP/DP 调度泳道、前向/反向算子 DAG、内存 timeline |
 | `summary.txt` | 人类可读的文本摘要：op 计数、通信统计、内存估算峰值 |
+| `kernel_summary.csv` | 逐算子 trace（forward+backward+optimizer），格式对齐 CUDA/CANN kernel_summary：算子名/顺序/起止时间/耗时/breakdown |
+| `workload_graph.json` | spec 分层 IR（L0 OpNode / L1 StepGraph / L2 ScheduleGraph / L3 WorkloadGraph）的投影结果 |
+
+### kernel_summary.csv 列说明
+
+逐算子一行，覆盖 forward + backward + optimizer step；有 DES 调度时按 DES 起始时间排序并取其 start/end，否则按捕获顺序在串行累积时间轴上铺排。
+
+| 列 | 含义 |
+| --- | --- |
+| `Order` | 算子顺序（0 起的序号） |
+| `Name` / `Type` / `Phase` | 算子名 / 算子类别 / 所属阶段 |
+| `PPStage` / `MicrobatchIdx` | PP stage 与微批次（如有） |
+| `Start(us)` / `End(us)` / `Duration(us)` | 起始时间 / 结束时间 / 耗时 |
+| `ComputeTime(us)` / `CommTime(us)` | breakdown：计算/通信耗时拆解 |
+| `FLOPs` / `BytesRead` / `BytesWritten` | breakdown：算力与访存量 |
+
+> 注：fake_backend 路径下 optimizer.step 被 patch 为 no-op，因此该步算子可能不被捕获（CSV 仅在捕获到 optimizer 算子时输出对应行）。
+
+### 分层 IR（L0–L3）
+
+对齐 `workload-model-platform/spec`，`simulator/ir/` 子包把已捕获的
+`SimulationResult` **投影**为四层 IR（不复刻 torchtitan 逻辑，全部派生自捕获数据 +
+声明式 config）：
+
+| 层 | 结构 | 来源 |
+| --- | --- | --- |
+| L0 | `SpecOpNode` | 捕获的 `OpNode` + 数据边，补 flops/comm_bytes/preds/succs |
+| L1 | `StepGraph` | 按捕获 `phase`（autograd/optimizer hook 派生）切出 fwd/bwd/opt 模板 |
+| L2 | `ScheduleGraph` | 捕获的 PP schedule 事件 + `config.parallelism` 声明并行度 |
+| L3 | `WorkloadGraph` | 迭代语义（steps/warmup/梯度累积）+ dataloader 数据流 |
+
+程序化使用：
+
+```python
+from torchtitan.experiments.simulator.ir import build_workload_graph
+workload = build_workload_graph(result, trainer.config)
+workload.to_dict()  # JSON-serializable 四层结构
+```
+
+`trace.html` 中前向/反向 operator swimlane 的通信口径由
+`simulation.operator_swimlane_comm_scope` 控制：
+
+- `model_only`（默认）：隐藏 synthetic 的 FSDP/PP/DP 调度通信，保留 TP/CP/EP 等模型内通信
+- `all`：显示所有通信（包含 synthetic 并行通信）
 
 ## 核心组件与数据流
 
@@ -123,6 +167,7 @@ CLI 参数：
 | `schedule/pp_schedule_extractor.py` | 从 PP schedule 提取语义事件和依赖 |
 | `capture/fx_capture.py` | 使用 make_fx + FakeTensorMode 静态捕获前向/联合图 |
 | `export.py` | 导出 JSON/DOT/Chrome Trace/HTML/Text |
+| `ir/` | spec 分层 IR 投影：op_node(L0)/step_graph(L1)/schedule_graph(L2)/workload_graph(L3)/builder |
 | `extension_hooks.py` | Duck-typed 钩子：collect_simulation_metadata / postprocess_simulation_result |
 | `nodes.py` | 数据模型：OpNode、DataEdge、ComputeGraph、MemoryEvent、SimulationResult 等 |
 
@@ -153,8 +198,9 @@ pytest torchtitan/experiments/simulator/tests/test_simulator.py -v
 SimulationTrainer.Config(
     simulation=SimulationConfig(
         output_dir="./simulator_output",
-        output_formats=["json", "dot", "chrome_trace", "html", "text"],
+        output_formats=["json", "dot", "chrome_trace", "html", "text", "csv"],
         capture_joint_fx=False,
+        operator_swimlane_comm_scope="model_only",
     ),
     parallelism=ParallelismConfig(
         pipeline_parallel_schedule="Interleaved1F1B",

@@ -4,7 +4,22 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from .runtime_capture import RuntimeCapture
-from .unified_trace import TraceRecorder, unified_trace
+from .unified_trace import (
+    CommRecorder,
+    FSDPEventRecorder,
+    TraceRecorder,
+    capture_comms,
+    capture_fsdp_events,
+    get_current_recorder,
+    unified_trace,
+)
 
-__all__ = ["RuntimeCapture", "TraceRecorder", "unified_trace"]
+__all__ = [
+    "CommRecorder",
+    "FSDPEventRecorder",
+    "TraceRecorder",
+    "capture_comms",
+    "capture_fsdp_events",
+    "get_current_recorder",
+    "unified_trace",
+]

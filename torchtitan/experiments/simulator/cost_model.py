@@ -65,7 +65,9 @@ _DEFAULT_MOCK_COMM_GB_PER_S = 50.0  # inter-node / NVLink bandwidth (GB/s)
 _DEFAULT_MOCK_COMM_LATENCY_US = 5.0  # fixed per-collective latency (µs)
 
 
-def _estimate_flops(node: OpNode, default_seq_len: int = 4096, dedup_set: set | None = None) -> int:
+def _estimate_flops(
+    node: OpNode, default_seq_len: int = 4096, dedup_set: set | None = None
+) -> int:
     """Heuristic FLOPs estimate from op name and input/output shapes.
 
     Uses lightweight rules for the most common ATen ops.  Returns 0 for ops
@@ -84,7 +86,7 @@ def _estimate_flops(node: OpNode, default_seq_len: int = 4096, dedup_set: set | 
     if any(kw in op for kw in ("mm", "matmul", "bmm", "baddbmm", "addmm", "linear")):
         left_idx = 1 if "addmm" in op else 0
         right_idx = 2 if "addmm" in op else 1
-        
+
         # D8 Fix: If dedup_set is provided, track inputs
         if dedup_set is not None:
             if len(in_shapes) > max(left_idx, right_idx):
@@ -133,8 +135,8 @@ def _estimate_flops(node: OpNode, default_seq_len: int = 4096, dedup_set: set | 
         if len(in_shapes) > 0:
             x_shape = in_shapes[0]
             # We don't have top_k explicitly here, but we can assume typical values or extract from node.
-            top_k = 4 # DeepSeek V4 Pro uses 4 for MoE? Wait, let's use 1 as fallback or get from in_shapes
-            # dispatch actually just routes tokens. The FLOPs are minimal for the routing itself, 
+            top_k = 4  # DeepSeek V4 Pro uses 4 for MoE? Wait, let's use 1 as fallback or get from in_shapes
+            # dispatch actually just routes tokens. The FLOPs are minimal for the routing itself,
             # but wait, dispatch/combine don't do the expert compute.
             # The expert compute is done by bmm or mm inside the expert layer.
             # DeepEP does ALL of it inside a fused kernel? Yes, DeepEP fuses dispatch + compute + combine?
@@ -142,7 +144,7 @@ def _estimate_flops(node: OpNode, default_seq_len: int = 4096, dedup_set: set | 
             # Let's add a fixed FLOP cost or check if experts compute is hidden.
             # The defect plan says: "deepep.dispatch/combine FLOPs ... top_k * hidden_dim * num_experts * batch_tokens * 2"
             # So I'll just add this formula.
-            return 2 * _numel(x_shape) * 8 * 4 # rough approx
+            return 2 * _numel(x_shape) * 8 * 4  # rough approx
         return 0
 
     # --- convolution ---
@@ -207,32 +209,34 @@ def _estimate_bytes(node: OpNode, default_seq_len: int = 4096) -> tuple[int, int
 def _estimate_comm_bytes(node: OpNode, default_seq_len: int = 4096) -> int:
     """Estimate bytes communicated by a collective or P2P op."""
     group_size = getattr(node, "comm_group_size", 1) or 1
-    
+
     if node.comm_op == "reduce_scatter":
         total = 0
         for inp in node.inputs:
             total += _tensor_bytes(inp.shape, inp.dtype, default_seq_len)
         ring_factor = (group_size - 1) / max(group_size, 1) if group_size > 1 else 1.0
         return int(total * ring_factor)
-        
+
     if node.comm_op == "all_gather":
         total = 0
         for out in node.outputs:
             total += _tensor_bytes(out.shape, out.dtype, default_seq_len)
         ring_factor = (group_size - 1) / max(group_size, 1) if group_size > 1 else 1.0
         return int(total * ring_factor)
-        
+
     total = 0
     for out in node.outputs:
         total += _tensor_bytes(out.shape, out.dtype, default_seq_len)
     if total == 0:
         for inp in node.inputs:
             total += _tensor_bytes(inp.shape, inp.dtype, default_seq_len)
-            
+
     if node.comm_op == "all_reduce":
-        ring_factor = 2 * (group_size - 1) / max(group_size, 1) if group_size > 1 else 1.0
+        ring_factor = (
+            2 * (group_size - 1) / max(group_size, 1) if group_size > 1 else 1.0
+        )
         return int(total * ring_factor)
-        
+
     return total
 
 
@@ -349,7 +353,6 @@ class CostModel:
 # ---------------------------------------------------------------------------
 
 
-
 class DimResolver:
     def __init__(self, model_config):
         self.dim_map = {}
@@ -358,11 +361,15 @@ class DimResolver:
                 "hidden_dim": getattr(model_config, "dim", 1024),
                 "seq_len": getattr(model_config, "max_seq_len", 4096),
                 "num_heads": getattr(model_config, "n_heads", 32),
-                "num_experts": getattr(getattr(model_config, "moe_args", None), "num_experts", 8),
+                "num_experts": getattr(
+                    getattr(model_config, "moe_args", None), "num_experts", 8
+                ),
                 "vocab_size": getattr(model_config, "vocab_size", 32000),
             }
 
-    def resolve(self, shape: tuple[Any, ...], default_seq_len: int = 4096) -> tuple[int, ...]:
+    def resolve(
+        self, shape: tuple[Any, ...], default_seq_len: int = 4096
+    ) -> tuple[int, ...]:
         resolved = []
         for d in shape:
             if isinstance(d, int) and d >= 0:
@@ -592,9 +599,18 @@ def link_schedule_to_graph(result: SimulationResult) -> None:
 
     # Build lookup: (phase, pp_stage, microbatch_idx) → list of node_ids
     node_lookup: dict[tuple[str, int | None, int | None], list[str]] = {}
+    rank_node_lookup: dict[tuple[str, int, int | None, int | None], list[str]] = {}
+    schedule_event_node_lookup: dict[str, list[str]] = {}
     for nid, node in graph.nodes.items():
         key = (node.phase, node.pp_stage, node.microbatch_idx)
         node_lookup.setdefault(key, []).append(nid)
+        rank_key = (node.phase, node.rank, node.pp_stage, node.microbatch_idx)
+        rank_node_lookup.setdefault(rank_key, []).append(nid)
+        schedule_event_id = (node.attrs or {}).get("schedule_event_id")
+        if schedule_event_id:
+            schedule_event_node_lookup.setdefault(str(schedule_event_id), []).append(
+                nid
+            )
 
     # Map coarse event_type to phase
     phase_map = {
@@ -608,6 +624,12 @@ def link_schedule_to_graph(result: SimulationResult) -> None:
         "fsdp2_reduce_scatter": "backward",
         "dp_gradient_sync": "backward",
         "optimizer_step": "optimizer",
+    }
+    pp_comm_event_types = {
+        "pp_send_activation",
+        "pp_recv_activation",
+        "pp_send_gradient",
+        "pp_recv_gradient",
     }
 
     # Compute total per-phase duration from perf_results
@@ -633,11 +655,18 @@ def link_schedule_to_graph(result: SimulationResult) -> None:
     for event in result.schedule.events:
         phase = phase_map.get(event.event_type, "unknown")
         lookup_key = (phase, event.pp_stage, event.microbatch_idx)
+        rank_lookup_key = (phase, event.rank, event.pp_stage, event.microbatch_idx)
 
         # Try exact match: (phase, pp_stage, microbatch_idx)
         exact_matches = node_lookup.get(lookup_key, [])
+        rank_exact_matches = rank_node_lookup.get(rank_lookup_key, [])
+        schedule_event_matches = schedule_event_node_lookup.get(event.event_id, [])
 
-        if exact_matches:
+        if schedule_event_matches:
+            event.op_node_ids = schedule_event_matches
+        elif event.event_type in pp_comm_event_types and rank_exact_matches:
+            event.op_node_ids = rank_exact_matches
+        elif exact_matches:
             event.op_node_ids = exact_matches
         elif event.microbatch_idx is not None and event.pp_stage is not None:
             # Events have concrete microbatch_idx and pp_stage but nodes
